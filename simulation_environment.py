@@ -1,0 +1,1168 @@
+#!/usr/bin/env python3
+"""
+Neural-Symbolic Trust-Based Sensor Fusion Simulation Environment
+
+This simulation environment replicates the multi-robot trust-based sensor fusion 
+approach from the original paper, designed to collect data for training neural 
+symbolic methods to replace hand-designed logical rules.
+
+Based on: "Trust-Based Assured Sensor Fusion in Distributed Aerial Autonomy"
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
+import random
+from scipy.stats import beta
+from scipy.spatial.distance import euclidean
+from scipy.optimize import linear_sum_assignment
+import json
+
+
+@dataclass
+class RobotState:
+    """Robot state including position, velocity, and sensor capabilities"""
+    id: int
+    position: np.ndarray  # [x, y, z]
+    velocity: np.ndarray  # [vx, vy, vz]
+    orientation: float    # heading angle
+    fov_range: float     # sensor range
+    fov_angle: float     # field of view angle (radians)
+    is_adversarial: bool = False  # Ground truth: is this robot adversarial?
+    trust_alpha: float = 1.0  # Beta distribution alpha parameter
+    trust_beta: float = 1.0   # Beta distribution beta parameter
+    
+    # Patrol pattern attributes
+    start_position: np.ndarray = None  # Home base position
+    goal_position: np.ndarray = None   # Current patrol goal
+    patrol_speed: float = 2.0          # Movement speed
+    is_returning_home: bool = False    # Direction of patrol
+    position_tolerance: float = 3.0    # Distance tolerance to consider goal reached
+
+
+@dataclass
+class Track:
+    """Object track with state and covariance"""
+    id: int
+    position: np.ndarray     # [x, y, z]
+    velocity: np.ndarray     # [vx, vy, vz]
+    covariance: np.ndarray   # state covariance matrix
+    confidence: float        # detection confidence
+    timestamp: float
+    source_robot: int
+    
+    # Track trust parameters (Beta distribution)
+    trust_alpha: float = 1.0  # Beta distribution alpha parameter
+    trust_beta: float = 1.0   # Beta distribution beta parameter
+
+
+@dataclass
+class GroundTruthObject:
+    """Ground truth object with dynamic movement"""
+    id: int
+    position: np.ndarray     # [x, y, z]
+    velocity: np.ndarray     # [vx, vy, vz]
+    object_type: str         # 'vehicle', 'person', etc.
+    movement_pattern: str    # 'linear', 'random_walk', 'circular', 'stationary'
+    spawn_time: float        # When object first appeared
+    lifespan: float          # How long object exists (-1 for permanent)
+    
+    # Movement parameters
+    base_speed: float = 1.0
+    turn_probability: float = 0.02  # For random walk
+    direction_change_time: float = 5.0  # For direction changes
+
+@dataclass
+class DataAggregator:
+    """Centralized data aggregator for weighted object state estimation"""
+    robots: List[RobotState]
+    tracks_by_robot: Dict[int, List[Track]]
+
+    # ---- NEW: persistent fused object store (object-level, not per-track) ----
+    # saved_objects: object_id -> {
+    #   'alpha': float, 'beta': float,
+    #   'last_position': np.ndarray, 'last_timestamp': float
+    # }
+    saved_objects: Dict[str, Dict] = None
+    _next_object_id: int = 0
+
+    def __post_init__(self):
+        if self.saved_objects is None:
+            self.saved_objects = {}
+
+    def _new_object_id(self) -> str:
+        oid = f"obj_{self._next_object_id}"
+        self._next_object_id += 1
+        return oid
+
+    def _match_saved_object(self, position: np.ndarray, threshold: float) -> Optional[str]:
+        """
+        Match a fused position to the nearest saved object within 'threshold'.
+        Returns object_id or None.
+        """
+        best_id = None
+        best_dist = float('inf')
+        for oid, rec in self.saved_objects.items():
+            last_pos = rec.get('last_position')
+            if last_pos is None:
+                continue
+            d = np.linalg.norm(position - last_pos)
+            if d <= threshold and d < best_dist:
+                best_dist = d
+                best_id = oid
+        return best_id
+
+    def _get_or_create_object(
+        self,
+        position: np.ndarray,
+        seed_alpha: float,
+        seed_beta: float,
+        timestamp: float,
+        match_threshold: float
+    ) -> Tuple[str, float, float]:
+        """
+        Return (object_id, alpha, beta) for the fused position.
+        Reuse saved α,β if we match an existing object; otherwise create a new one
+        and seed α,β from the provided seeds (typically the ego track).
+        """
+        oid = self._match_saved_object(position, threshold=match_threshold)
+        if oid is not None:
+            rec = self.saved_objects[oid]
+            # refresh pose/time
+            rec['last_position'] = position.copy()
+            rec['last_timestamp'] = timestamp
+            return oid, rec['alpha'], rec['beta']
+
+        # new object
+        oid = self._new_object_id()
+        self.saved_objects[oid] = {
+            'alpha': float(seed_alpha),
+            'beta': float(seed_beta),
+            'last_position': position.copy(),
+            'last_timestamp': timestamp
+        }
+        return oid, float(seed_alpha), float(seed_beta)
+
+    def compute_weighted_object_state(self, track_group: List[Track]) -> np.ndarray:
+        """Compute weighted object state estimate from multiple tracks based on agent and track trust"""
+        if not track_group:
+            return None
+
+        weights = []
+        positions = []
+
+        for track in track_group:
+            # Get robot that produced this track
+            source_robot = next((r for r in self.robots if r.id == track.source_robot), None)
+            if source_robot is None:
+                continue
+
+            # Agent trust and track trust (means)
+            agent_trust = source_robot.trust_alpha / (source_robot.trust_alpha + source_robot.trust_beta)
+            track_trust = track.trust_alpha / (track.trust_alpha + track.trust_beta)
+
+            weight = agent_trust * track_trust * track.confidence
+            weights.append(weight)
+            positions.append(track.position)
+
+        if not weights:
+            return None
+
+        weights = np.array(weights)
+        positions = np.array(positions)
+
+        weights = weights / np.sum(weights)
+        weighted_position = np.sum(positions * weights[:, np.newaxis], axis=0)
+        return weighted_position
+
+    def fuse_tracks_for_ego_robot(
+        self,
+        ego_robot_id: int,
+        fusion_threshold: float = 2.0,
+        trust_threshold: float = 0.4
+    ) -> List[Track]:
+        """
+        Fuse ego robot's tracks with nearby tracks from other robots, filtering by trust.
+
+        IMPORTANT (modified):
+        - If a fused observation (seen by >1 robots) is produced, we assign it to a
+          PERSISTENT OBJECT (object-level id), stored in self.saved_objects.
+        - We then REUSE that object's saved α,β in the fused Track returned for this step.
+        - We DO NOT force Track.id to the object id; the object identity is kept internally
+          in saved_objects. (This keeps your Track dataclass unchanged.)
+        """
+        ego_tracks = self.tracks_by_robot.get(ego_robot_id, [])
+        if not ego_tracks:
+            return []
+
+        fused_tracks = []
+
+        for ego_track in ego_tracks:
+            # Check ego track trust threshold
+            ego_track_trust = ego_track.trust_alpha / (ego_track.trust_alpha + ego_track.trust_beta)
+            if ego_track_trust < trust_threshold:
+                continue
+
+            # Collect nearby tracks from other robots that meet trust threshold
+            nearby_tracks = [ego_track]
+            for other_robot_id, other_tracks in self.tracks_by_robot.items():
+                if other_robot_id == ego_robot_id:
+                    continue
+                for other_track in other_tracks:
+                    track_trust = other_track.trust_alpha / (other_track.trust_alpha + other_track.trust_beta)
+                    if track_trust < trust_threshold:
+                        continue
+                    distance = np.linalg.norm(ego_track.position - other_track.position)
+                    if distance <= fusion_threshold:
+                        nearby_tracks.append(other_track)
+
+            if len(nearby_tracks) > 1:
+                # Fused observation (object seen by >1 robots)
+                fused_position = self.compute_weighted_object_state(nearby_tracks)
+                if fused_position is not None:
+                    # Persist at the OBJECT level and reuse its α,β
+                    object_id, obj_alpha, obj_beta = self._get_or_create_object(
+                        position=fused_position,
+                        seed_alpha=ego_track.trust_alpha,  # seed from ego when first created
+                        seed_beta=ego_track.trust_beta,
+                        timestamp=ego_track.timestamp,
+                        match_threshold=fusion_threshold
+                    )
+
+                    # Return a fused track that USES the saved object's α,β,
+                    # but we leave Track.id as-is (per your note).
+                    fused_track = Track(
+                        id=ego_track.id,                 # keep the track's own id
+                        position=fused_position,
+                        velocity=ego_track.velocity,     # simple choice
+                        covariance=ego_track.covariance,
+                        confidence=min(
+                            1.0, sum(t.confidence for t in nearby_tracks) / len(nearby_tracks)
+                        ),
+                        timestamp=ego_track.timestamp,
+                        source_robot=ego_robot_id,
+                        trust_alpha=obj_alpha,           # <- reuse OBJECT α
+                        trust_beta=obj_beta              # <- reuse OBJECT β
+                    )
+                    fused_tracks.append(fused_track)
+                else:
+                    # Fallback to original ego track
+                    fused_tracks.append(ego_track)
+            else:
+                # No multi-robot support: keep ego track (already passed trust threshold)
+                fused_tracks.append(ego_track)
+
+        return fused_tracks
+
+
+class TrustEstimator:
+    """Implements the original paper's trust estimation using assignment-based PSM generation"""
+    
+    def __init__(self, negative_bias: float = 10.0, negative_threshold: float = 0.3):
+        # Equation 6 parameters for negatively weighted updates
+        self.negative_bias = negative_bias  # B^c_n parameter
+        self.negative_threshold = negative_threshold  # T^c_n parameter
+    
+    def update_agent_trust(self, robot: RobotState, psms: List[Tuple[float, float]]) -> None:
+        """Update robot/agent trust using Beta distribution updates from paper equation (5) and (6)"""
+        for value, confidence in psms:
+            # Paper's equation (6): Negatively weighted updates
+            # ω_{j,k} = B^c_n if v_{j,k} < T^c_n, 1.0 otherwise
+            if value < self.negative_threshold:
+                weight = self.negative_bias
+            else:
+                weight = 1.0
+            
+            # Apply weighting to confidence for negative evidence
+            weighted_confidence = weight * confidence
+            
+            # Paper's equation (5) with equation (6) weighting: Beta-Bernoulli conjugate update
+            delta_alpha = confidence * value
+            delta_beta = weighted_confidence * (1 - value)
+            
+            robot.trust_alpha += delta_alpha
+            robot.trust_beta += delta_beta
+            
+            # Ensure alpha and beta stay positive
+            robot.trust_alpha = robot.trust_alpha
+            robot.trust_beta = robot.trust_beta
+    
+    def update_track_trust(self, track: Track, psms: List[Tuple[float, float]]) -> None:
+        """Update track trust using Beta distribution updates from paper equation (5) and (6)"""
+        for value, confidence in psms:
+            # Paper's equation (6): Negatively weighted updates
+            # ω_{j,k} = B^c_n if v_{j,k} < T^c_n, 1.0 otherwise
+            if value < self.negative_threshold:
+                weight = self.negative_bias
+            else:
+                weight = 1.0
+            
+            # Apply weighting to confidence for negative evidence
+            weighted_confidence = weight * confidence
+            
+            # Paper's equation (5) with equation (6) weighting: Beta-Bernoulli conjugate update
+            delta_alpha = confidence * value
+            delta_beta = weighted_confidence * (1 - value)
+            
+            track.trust_alpha += delta_alpha
+            track.trust_beta += delta_beta
+            
+            # Ensure alpha and beta stay positive
+            track.trust_alpha = max(0.1, track.trust_alpha)
+            track.trust_beta = max(0.1, track.trust_beta)
+    
+    def get_expected_trust(self, alpha: float, beta: float) -> float:
+        """Calculate expected value E[trust] = alpha / (alpha + beta)"""
+        return alpha / (alpha + beta)
+    
+    def get_trust_variance(self, alpha: float, beta: float) -> float:
+        """Calculate variance V[trust] = (alpha * beta) / ((alpha + beta)^2 * (alpha + beta + 1))"""
+        denominator = (alpha + beta) ** 2 * (alpha + beta + 1)
+        return (alpha * beta) / denominator
+
+
+class SimulationEnvironment:
+    """Multi-robot simulation environment for trust-based sensor fusion"""
+    
+    def __init__(self, num_robots: int = 5, num_targets: int = 10, 
+                 world_size: Tuple[float, float] = (100.0, 100.0),
+                 adversarial_ratio: float = 0.3):
+        self.num_robots = num_robots
+        self.num_targets = num_targets
+        self.world_size = world_size
+        self.adversarial_ratio = adversarial_ratio  # Fraction of robots that are adversarial
+        self.robots: List[RobotState] = []
+        self.ground_truth_objects: List[GroundTruthObject] = []  # Dynamic ground truth objects
+        self.tracks: Dict[int, List[Track]] = {}  # Robot ID -> list of tracks (filtered/merged)
+        self.raw_tracks: Dict[int, List[Track]] = {}  # Robot ID -> raw unfiltered tracks for PSM generation
+        self.time = 0.0
+        self.dt = 0.1  # 10Hz simulation rate
+        self.next_object_id = 0  # For generating unique object IDs
+        
+        # Track trust registry to maintain trust distributions over time
+        self.track_trust_registry: Dict[str, Tuple[float, float]] = {}  # track_id -> (alpha, beta)
+        
+        # Centralized data aggregator (per paper architecture)
+        self.data_aggregator: DataAggregator = None
+        
+        self._initialize_environment()
+    
+    def _initialize_environment(self):
+        """Initialize robots and targets in the environment"""
+        # Initialize robots at random positions
+        num_adversarial = int(self.num_robots * self.adversarial_ratio)
+        adversarial_ids = set(random.sample(range(self.num_robots), num_adversarial))
+        
+        for i in range(self.num_robots):
+            # Start position (home base)
+            start_pos = np.array([
+                random.uniform(5, self.world_size[0] - 5),
+                random.uniform(5, self.world_size[1] - 5),
+                random.uniform(15, 25)  # Altitude
+            ])
+            
+            # Generate random goal position for patrol
+            goal_pos = np.array([
+                random.uniform(5, self.world_size[0] - 5),
+                random.uniform(5, self.world_size[1] - 5),
+                start_pos[2]  # Keep same altitude
+            ])
+            
+            # Ensure goal is at least 15 units away from start for meaningful patrol
+            while np.linalg.norm(goal_pos[:2] - start_pos[:2]) < 15:
+                goal_pos = np.array([
+                    random.uniform(5, self.world_size[0] - 5),
+                    random.uniform(5, self.world_size[1] - 5),
+                    start_pos[2]
+                ])
+            
+            robot = RobotState(
+                id=i,
+                position=start_pos.copy(),
+                velocity=np.array([0.0, 0.0, 0.0]),  # Will be computed based on patrol
+                orientation=0.0,  # Will be computed based on direction
+                fov_range=20.0,
+                fov_angle=np.pi/3,  # 60 degrees
+                is_adversarial=(i in adversarial_ids),
+                start_position=start_pos,
+                goal_position=goal_pos,
+                patrol_speed=random.uniform(1.5, 2.5)
+            )
+            
+            # Initialize velocity and orientation toward goal
+            self._update_robot_navigation(robot)
+            
+            self.robots.append(robot)
+            self.tracks[i] = []
+            self.raw_tracks[i] = []
+        
+        # Initialize ground truth objects with various movement patterns
+        for i in range(self.num_targets):
+            obj = self._create_ground_truth_object(self.time)
+            self.ground_truth_objects.append(obj)
+        
+        # Initialize centralized data aggregator (for weighted state estimation only)
+        self.data_aggregator = DataAggregator(
+            robots=self.robots,
+            tracks_by_robot=self.tracks
+        )
+        
+        # Initialize trust estimator
+        self.trust_estimator = TrustEstimator(negative_bias=3.0, negative_threshold=0.5)
+    
+    def _create_ground_truth_object(self, spawn_time: float) -> GroundTruthObject:
+        """Create a new ground truth object with random properties"""
+        obj_id = self.next_object_id
+        self.next_object_id += 1
+        
+        # Random position
+        position = np.array([
+            random.uniform(5, self.world_size[0] - 5),
+            random.uniform(5, self.world_size[1] - 5),
+            0.0  # Ground level
+        ])
+        
+        # Choose movement pattern
+        movement_patterns = ['linear', 'random_walk', 'circular', 'stationary']
+        movement_pattern = random.choice(movement_patterns)
+        
+        # Set initial velocity based on movement pattern
+        base_speed = random.uniform(0.5, 2.5)
+        
+        if movement_pattern == 'linear':
+            # Random direction, constant velocity
+            angle = random.uniform(0, 2*np.pi)
+            velocity = np.array([
+                base_speed * np.cos(angle),
+                base_speed * np.sin(angle),
+                0.0
+            ])
+        elif movement_pattern == 'circular':
+            # Will be computed dynamically
+            velocity = np.array([base_speed, 0.0, 0.0])
+        else:  # random_walk or stationary
+            velocity = np.array([0.0, 0.0, 0.0])
+        
+        # Object type
+        object_types = ['vehicle', 'person', 'animal']
+        object_type = random.choice(object_types)
+        
+        # Lifespan (-1 for permanent, or random duration)
+        if random.random() < 0.7:  # 70% permanent objects
+            lifespan = -1
+        else:  # 30% temporary objects
+            lifespan = random.uniform(10, 30)  # 10-30 seconds
+        
+        return GroundTruthObject(
+            id=obj_id,
+            position=position,
+            velocity=velocity,
+            object_type=object_type,
+            movement_pattern=movement_pattern,
+            spawn_time=spawn_time,
+            lifespan=lifespan,
+            base_speed=base_speed,
+            turn_probability=random.uniform(0.01, 0.05),
+            direction_change_time=random.uniform(3, 8)
+        )
+    
+    def _update_ground_truth_objects(self):
+        """Update positions and states of all ground truth objects"""
+        objects_to_remove = []
+        
+        for obj in self.ground_truth_objects:
+            # Check if object should be removed (lifespan expired)
+            if obj.lifespan > 0 and (self.time - obj.spawn_time) > obj.lifespan:
+                objects_to_remove.append(obj)
+                continue
+            
+            # Update object based on movement pattern
+            if obj.movement_pattern == 'stationary':
+                # Stationary objects don't move
+                pass
+                
+            elif obj.movement_pattern == 'linear':
+                # Move in straight line, bounce off walls
+                new_pos = obj.position + obj.velocity * self.dt
+                
+                # Bounce off boundaries
+                if new_pos[0] <= 0 or new_pos[0] >= self.world_size[0]:
+                    obj.velocity[0] *= -1
+                if new_pos[1] <= 0 or new_pos[1] >= self.world_size[1]:
+                    obj.velocity[1] *= -1
+                
+                obj.position += obj.velocity * self.dt
+                obj.position[0] = np.clip(obj.position[0], 0, self.world_size[0])
+                obj.position[1] = np.clip(obj.position[1], 0, self.world_size[1])
+                
+            elif obj.movement_pattern == 'random_walk':
+                # Random walk with occasional direction changes
+                if random.random() < obj.turn_probability:
+                    # Change direction
+                    angle = random.uniform(0, 2*np.pi)
+                    obj.velocity = np.array([
+                        obj.base_speed * np.cos(angle),
+                        obj.base_speed * np.sin(angle),
+                        0.0
+                    ])
+                
+                # Move and handle boundaries
+                new_pos = obj.position + obj.velocity * self.dt
+                if (new_pos[0] <= 0 or new_pos[0] >= self.world_size[0] or 
+                    new_pos[1] <= 0 or new_pos[1] >= self.world_size[1]):
+                    # Turn around at boundaries
+                    angle = random.uniform(0, 2*np.pi)
+                    obj.velocity = np.array([
+                        obj.base_speed * np.cos(angle),
+                        obj.base_speed * np.sin(angle),
+                        0.0
+                    ])
+                
+                obj.position += obj.velocity * self.dt
+                obj.position[0] = np.clip(obj.position[0], 0, self.world_size[0])
+                obj.position[1] = np.clip(obj.position[1], 0, self.world_size[1])
+                
+            elif obj.movement_pattern == 'circular':
+                # Circular movement around center
+                center = np.array([self.world_size[0]/2, self.world_size[1]/2, 0.0])
+                radius = min(self.world_size) * 0.3
+                angular_velocity = obj.base_speed / radius
+                
+                angle = angular_velocity * (self.time - obj.spawn_time)
+                obj.position = center + radius * np.array([
+                    np.cos(angle), np.sin(angle), 0.0
+                ])
+        
+        # Remove expired objects
+        for obj in objects_to_remove:
+            self.ground_truth_objects.remove(obj)
+        
+        # Occasionally spawn new objects
+        if random.random() < 0.05:  # 5% chance per step
+            if len(self.ground_truth_objects) < self.num_targets * 2:  # Don't exceed 2x initial
+                new_obj = self._create_ground_truth_object(self.time)
+                self.ground_truth_objects.append(new_obj)
+    
+    def _update_robot_navigation(self, robot: RobotState):
+        """Update robot's velocity and orientation based on current patrol target"""
+        # Determine current target (goal or home)
+        if robot.is_returning_home:
+            target = robot.start_position
+        else:
+            target = robot.goal_position
+        
+        # Calculate direction vector
+        direction = target - robot.position
+        distance = np.linalg.norm(direction)
+        
+        if distance > robot.position_tolerance:
+            # Normalize direction and set velocity
+            direction_normalized = direction / distance
+            robot.velocity = direction_normalized * robot.patrol_speed
+            
+            # Update orientation to face movement direction
+            robot.orientation = np.arctan2(direction_normalized[1], direction_normalized[0])
+        else:
+            # Reached target, stop and switch direction
+            robot.velocity = np.array([0.0, 0.0, 0.0])
+            robot.is_returning_home = not robot.is_returning_home
+            
+            # Add small random pause at waypoints
+            if random.random() < 0.1:  # 10% chance to pause for one step
+                return
+            
+            # Immediately start moving toward new target
+            self._update_robot_navigation(robot)
+    
+    def is_in_fov(self, robot: RobotState, target_pos: np.ndarray) -> bool:
+        """Check if target is within robot's field of view"""
+        # Calculate relative position
+        rel_pos = target_pos - robot.position
+        distance = np.linalg.norm(rel_pos[:2])  # 2D distance
+        
+        if distance > robot.fov_range:
+            return False
+        
+        # Check angle constraint
+        target_angle = np.arctan2(rel_pos[1], rel_pos[0])
+        angle_diff = abs(target_angle - robot.orientation)
+        angle_diff = min(angle_diff, 2*np.pi - angle_diff)  # Wrap around
+        
+        return angle_diff <= robot.fov_angle / 2
+    
+    def generate_detections(self, robot: RobotState, noise_std: float = 1.0) -> List[Track]:
+        """Generate detections for a robot based on whether it's legitimate or adversarial"""
+        detections = []
+        track_id = 0
+        
+        if robot.is_adversarial:
+            # Adversarial robots can report false tracks or ignore existing ones
+            return self._generate_adversarial_detections(robot, track_id, noise_std)
+        else:
+            # Legitimate robots report all true tracks in FOV with minor noise
+            return self._generate_legitimate_detections(robot, track_id, noise_std)
+    
+    def _generate_legitimate_detections(self, robot: RobotState, track_id: int, 
+                                      noise_std: float) -> List[Track]:
+        """Generate perfect detections for legitimate robots (all true targets in FOV)"""
+        detections = []
+        
+        for gt_obj in self.ground_truth_objects:
+            if self.is_in_fov(robot, gt_obj.position):
+                # Legitimate robots always detect true targets with minimal noise
+                noisy_pos = gt_obj.position + np.random.normal(0, noise_std * 0.5, 3)  # Less noise
+                # Use actual object velocity with small noise
+                noisy_vel = gt_obj.velocity + np.random.normal(0, 0.2, 3)  # Minimal velocity noise
+                
+                # High confidence covariance for legitimate detections
+                covariance = np.eye(6) * (noise_std * 0.5)**2
+                
+                track_id_str = f"{robot.id}_{track_id}"
+                
+                # Get or initialize track trust from registry
+                if track_id_str in self.track_trust_registry:
+                    trust_alpha, trust_beta = self.track_trust_registry[track_id_str]
+                else:
+                    # Initialize with slight random variation to break symmetry
+                    trust_alpha = random.uniform(0.8, 1.2)
+                    trust_beta = random.uniform(0.8, 1.2)
+                    self.track_trust_registry[track_id_str] = (trust_alpha, trust_beta)
+                
+                track = Track(
+                    id=track_id_str,
+                    position=noisy_pos,
+                    velocity=noisy_vel,
+                    covariance=covariance,
+                    confidence=random.uniform(0.85, 0.98),  # High confidence
+                    timestamp=self.time,
+                    source_robot=robot.id,
+                    trust_alpha=trust_alpha,
+                    trust_beta=trust_beta
+                )
+                detections.append(track)
+                track_id += 1
+        
+        return detections
+    
+    def _generate_adversarial_detections(self, robot: RobotState, track_id: int, 
+                                       noise_std: float) -> List[Track]:
+        """Generate malicious detections for adversarial robots"""
+        detections = []
+        
+        # Adversarial behavior parameters
+        false_negative_rate = random.uniform(0.3, 0.7)  # Miss 30-70% of true targets
+        false_positive_rate = random.uniform(0.2, 0.5)  # Add 0.2-0.5 false targets per real object
+        position_corruption_std = noise_std * random.uniform(1.5, 3.0)  # Moderate corruption
+        
+        # First, collect all true objects in FOV
+        true_objects_in_fov = []
+        for gt_obj in self.ground_truth_objects:
+            if self.is_in_fov(robot, gt_obj.position):
+                true_objects_in_fov.append(gt_obj)
+        
+        # Generate detections for true objects (with false negatives)
+        for gt_obj in true_objects_in_fov:
+            # Implement false negative: randomly skip some true objects
+            if random.random() < false_negative_rate:
+                continue  # Skip this true object (false negative)
+            
+            # Add the true object with some corruption
+            if random.random() < 0.7:  # 70% chance to corrupt position
+                corruption = np.random.normal(0, position_corruption_std, 3)
+            else:
+                corruption = np.random.normal(0, noise_std * 0.8, 3)  # Less corruption sometimes
+            
+            noisy_pos = gt_obj.position + corruption
+            # Corrupt the velocity
+            noisy_vel = gt_obj.velocity + np.random.normal(0, 1.5, 3)  # Moderate velocity noise
+            
+            # Higher uncertainty for adversarial detections
+            covariance = np.eye(6) * (noise_std * 2)**2
+            
+            track_id_str = f"{robot.id}_{track_id}"
+            
+            # Get or initialize track trust from registry
+            if track_id_str in self.track_trust_registry:
+                trust_alpha, trust_beta = self.track_trust_registry[track_id_str]
+            else:
+                # Initialize with slight random variation to break symmetry
+                trust_alpha = random.uniform(0.8, 1.2)
+                trust_beta = random.uniform(0.8, 1.2)
+                self.track_trust_registry[track_id_str] = (trust_alpha, trust_beta)
+            
+            track = Track(
+                id=track_id_str,
+                position=noisy_pos,
+                velocity=noisy_vel,
+                covariance=covariance,
+                confidence=random.uniform(0.5, 0.9),  # Variable confidence
+                timestamp=self.time,
+                source_robot=robot.id,
+                trust_alpha=trust_alpha,
+                trust_beta=trust_beta
+            )
+            detections.append(track)
+            track_id += 1
+        
+        # Generate false positive detections (within FOV only)
+        num_false_positives = int(len(true_objects_in_fov) * false_positive_rate)
+        for _ in range(num_false_positives):
+            # Generate random position within FOV, avoiding real object positions
+            valid_position_found = False
+            attempts = 0
+            
+            while not valid_position_found and attempts < 10:
+                # Generate random position within FOV
+                angle = robot.orientation + random.uniform(-robot.fov_angle/2, robot.fov_angle/2)
+                distance = random.uniform(3, robot.fov_range)  # Start from 3 units to avoid robot position
+                
+                false_pos = robot.position + np.array([
+                    distance * np.cos(angle),
+                    distance * np.sin(angle),
+                    random.uniform(-5, 5)  # Random altitude
+                ])
+                
+                # Ensure false positive is not too close to any real object
+                too_close_to_real = False
+                for gt_obj in true_objects_in_fov:
+                    if np.linalg.norm(false_pos - gt_obj.position) < 3.0:  # Minimum separation
+                        too_close_to_real = True
+                        break
+                
+                if not too_close_to_real:
+                    valid_position_found = True
+                
+                attempts += 1
+            
+            if not valid_position_found:
+                continue  # Skip this false positive if can't find good position
+            
+            track_id_str = f"{robot.id}_{track_id}"
+            
+            # Get or initialize track trust from registry
+            if track_id_str in self.track_trust_registry:
+                trust_alpha, trust_beta = self.track_trust_registry[track_id_str]
+            else:
+                # Initialize with slight random variation to break symmetry
+                trust_alpha = random.uniform(0.8, 1.2)
+                trust_beta = random.uniform(0.8, 1.2)
+                self.track_trust_registry[track_id_str] = (trust_alpha, trust_beta)
+            
+            track = Track(
+                id=track_id_str,
+                position=false_pos,
+                velocity=np.random.normal(0, 2, 3),  # Random velocity
+                covariance=np.eye(6) * (noise_std * 3)**2,  # High uncertainty
+                confidence=random.uniform(0.4, 0.8),  # Lower confidence for false positives
+                timestamp=self.time,
+                source_robot=robot.id,
+                trust_alpha=trust_alpha,
+                trust_beta=trust_beta
+            )
+            detections.append(track)
+            track_id += 1
+        
+        return detections
+    
+    def merge_overlapping_tracks(self):
+        """Merge spatially overlapping tracks, keeping the one with highest mean trust"""
+        for robot_id in self.tracks:
+            robot_tracks = self.tracks[robot_id]
+            if len(robot_tracks) <= 1:
+                continue
+            
+            merged_tracks = []
+            remaining_tracks = robot_tracks.copy()
+            
+            while remaining_tracks:
+                # Take first track as reference
+                current_track = remaining_tracks.pop(0)
+                overlapping_tracks = [current_track]
+                
+                # Find all tracks that overlap with current track
+                i = 0
+                while i < len(remaining_tracks):
+                    other_track = remaining_tracks[i]
+                    distance = np.linalg.norm(current_track.position - other_track.position)
+                    
+                    if distance <= 1.5:  # Conservative threshold considering detection noise (~3σ)
+                        overlapping_tracks.append(remaining_tracks.pop(i))
+                    else:
+                        i += 1
+                
+                # If multiple overlapping tracks, keep the one with highest mean trust
+                if len(overlapping_tracks) > 1:
+                    best_track = None
+                    best_trust = -1
+                    
+                    for track in overlapping_tracks:
+                        track_trust = track.trust_alpha / (track.trust_alpha + track.trust_beta)
+                        if track_trust > best_trust:
+                            best_trust = track_trust
+                            best_track = track
+                    
+                    merged_tracks.append(best_track)
+                else:
+                    merged_tracks.append(current_track)
+            
+            self.tracks[robot_id] = merged_tracks
+    
+    def perform_assignment_based_trust_estimation(self) -> Dict[int, Dict]:
+        """Perform trust estimation using assignment-based PSM generation as per paper"""
+        trust_updates = {}
+        
+        # Store PSMs for each robot to be applied later
+        robot_psms = {robot.id: [] for robot in self.robots}
+        all_track_psms = {}
+        
+        # OUTER LOOP: For each ego robot, create ego fused tracks
+        for ego_robot in self.robots:
+            ego_tracks = self.tracks.get(ego_robot.id, [])
+            
+            # Create ego fused tracks by fusing ego tracks with nearby tracks from other robots
+            if not ego_tracks:
+                continue
+                
+            # Create ego robot's fused tracks
+            ego_fused_tracks = self.data_aggregator.fuse_tracks_for_ego_robot(ego_robot.id)
+            
+            if not ego_fused_tracks:
+                continue
+            
+            # INNER LOOP: For each proximal robot, compare its tracks with ego fused tracks
+            for proximal_robot in self.robots:
+                if proximal_robot.id == ego_robot.id:
+                    continue
+                    
+                # Use raw unfiltered tracks for proximal robot (important for trust evaluation)
+                proximal_tracks = self.raw_tracks.get(proximal_robot.id, [])
+                if not proximal_tracks:
+                    continue
+                
+                # Generate PSMs based on assignment between ego fused tracks and raw proximal tracks
+                self._generate_assignment_psms_paper_style(
+                    ego_fused_tracks, proximal_tracks, ego_robot, proximal_robot, 
+                    robot_psms, all_track_psms)
+        
+        # Apply collected PSMs to update robot trust
+        for robot in self.robots:
+            if robot_psms[robot.id]:
+                self.trust_estimator.update_agent_trust(robot, robot_psms[robot.id])
+            
+            # Update track trust for all tracks that have PSMs (use raw tracks)
+            robot_tracks = self.raw_tracks.get(robot.id, [])
+            for track in robot_tracks:
+                if track.id in all_track_psms:
+                    self.trust_estimator.update_track_trust(track, all_track_psms[track.id])
+                    # Update the trust registry with the new values
+                    self.track_trust_registry[track.id] = (track.trust_alpha, track.trust_beta)
+            
+            # ALWAYS include ALL robots in trust_updates to maintain continuous trust evolution
+            trust_updates[robot.id] = {
+                'alpha': robot.trust_alpha,
+                'beta': robot.trust_beta,
+                'mean_trust': robot.trust_alpha / (robot.trust_alpha + robot.trust_beta),
+                'num_agent_psms': len(robot_psms[robot.id]),
+                'track_trust_info': {
+                    track.id: {
+                        'alpha': track.trust_alpha,
+                        'beta': track.trust_beta,
+                        'mean_trust': track.trust_alpha / (track.trust_alpha + track.trust_beta),
+                        'num_psms': len(all_track_psms.get(track.id, []))
+                    }
+                    for track in robot_tracks
+                }
+            }
+        
+        return trust_updates
+    
+    def _generate_assignment_psms_paper_style(self, ego_fused_tracks: List[Track], proximal_tracks: List[Track],
+                                            ego_robot: RobotState, proximal_robot: RobotState,
+                                            robot_psms: Dict, all_track_psms: Dict):
+        """Generate PSMs using paper's exact two-loop structure with proper assignment logic"""
+        
+        # For each proximal track, determine if it matches any ego fused track
+        for proximal_track in proximal_tracks:
+            # Only evaluate proximal tracks that are within ego robot's FOV
+            if not self.is_in_fov(ego_robot, proximal_track.position):
+                continue
+            
+            # Find if this proximal track matches any ego fused track
+            matched_ego_fused_track = None
+            min_distance = float('inf')
+            
+            for ego_fused_track in ego_fused_tracks:
+                distance = np.linalg.norm(proximal_track.position - ego_fused_track.position)
+                if distance <= 2.0 and distance < min_distance:  # Same threshold as fusion
+                    matched_ego_fused_track = ego_fused_track
+                    min_distance = distance
+            
+            if matched_ego_fused_track is not None:
+                # MATCH: Proximal track matches ego fused track - positive evidence
+                self._generate_positive_psm_paper_style(matched_ego_fused_track, proximal_track, 
+                                                      proximal_robot, robot_psms, all_track_psms)
+            else:
+                # MISMATCH: Proximal track does NOT match any ego fused track but is in ego's FOV - negative evidence
+                self._generate_negative_psm_paper_style(proximal_track, proximal_robot, robot_psms, all_track_psms)
+    
+    def _generate_positive_psm_paper_style(self, ego_fused_track: Track, proximal_track: Track,
+                                         proximal_robot: RobotState, robot_psms: Dict, all_track_psms: Dict):
+        """Generate positive PSM when proximal track matches ego fused track"""
+        # Calculate ego fused track trust statistics (used in agent PSM)
+        ego_fused_track_expected_trust = self.trust_estimator.get_expected_trust(
+            ego_fused_track.trust_alpha, ego_fused_track.trust_beta)
+        ego_fused_track_trust_variance = self.trust_estimator.get_trust_variance(
+            ego_fused_track.trust_alpha, ego_fused_track.trust_beta)
+        
+        # Calculate agent trust statistics (used in track PSM)
+        agent_expected_trust = self.trust_estimator.get_expected_trust(
+            proximal_robot.trust_alpha, proximal_robot.trust_beta)
+        
+        # Agent PSM: value = E[ego_fused_track_trust], confidence = 1-V[ego_fused_track_trust] (positive)
+        agent_value = ego_fused_track_expected_trust
+        agent_confidence = 1.0 - ego_fused_track_trust_variance
+        robot_psms[proximal_robot.id].append((agent_value, agent_confidence))
+        
+        # Track PSM: value = 1 (match), confidence = E[agent_trust]
+        track_value = 1.0
+        track_confidence = agent_expected_trust
+        
+        if proximal_track.id not in all_track_psms:
+            all_track_psms[proximal_track.id] = []
+        all_track_psms[proximal_track.id].append((track_value, track_confidence))
+    
+    def _generate_negative_psm_paper_style(self, proximal_track: Track, proximal_robot: RobotState,
+                                         robot_psms: Dict, all_track_psms: Dict):
+        """Generate negative PSM when proximal track does not match any ego fused track but is in ego's FOV"""
+        # Calculate proximal track trust statistics (used in agent PSM)
+        proximal_track_expected_trust = self.trust_estimator.get_expected_trust(
+            proximal_track.trust_alpha, proximal_track.trust_beta)
+        proximal_track_trust_variance = self.trust_estimator.get_trust_variance(
+            proximal_track.trust_alpha, proximal_track.trust_beta)
+        
+        # Calculate agent trust statistics (used in track PSM)
+        agent_expected_trust = self.trust_estimator.get_expected_trust(
+            proximal_robot.trust_alpha, proximal_robot.trust_beta)
+        
+        # Agent PSM: value = 1 - E[proximal_track_trust], confidence = -(1 - V[proximal_track_trust]) (negative)
+        agent_value = 1.0 - proximal_track_expected_trust
+        agent_confidence = 1.0 - proximal_track_trust_variance 
+        robot_psms[proximal_robot.id].append((agent_value, agent_confidence))
+        
+        # Track PSM: value = 0 (no match/false positive), confidence = E[agent_trust]
+        track_value = 0.0
+        track_confidence = agent_expected_trust
+        
+        if proximal_track.id not in all_track_psms:
+            all_track_psms[proximal_track.id] = []
+        all_track_psms[proximal_track.id].append((track_value, track_confidence))
+    
+    def step(self) -> Dict:
+        """Execute one simulation step"""
+        # Update ground truth objects first
+        self._update_ground_truth_objects()
+        
+        # Update robot positions and navigation
+        for robot in self.robots:
+            # Update navigation first (sets velocity and orientation)
+            self._update_robot_navigation(robot)
+            
+            # Move robot based on current velocity
+            robot.position += robot.velocity * self.dt
+            
+            # Boundary conditions - bounce off walls if needed
+            if robot.position[0] < 0 or robot.position[0] > self.world_size[0]:
+                robot.velocity[0] *= -1
+                robot.position[0] = np.clip(robot.position[0], 0, self.world_size[0])
+            if robot.position[1] < 0 or robot.position[1] > self.world_size[1]:
+                robot.velocity[1] *= -1
+                robot.position[1] = np.clip(robot.position[1], 0, self.world_size[1])
+        
+        # Generate detections for each robot
+        for robot in self.robots:
+            raw_detections = self.generate_detections(robot)
+            self.raw_tracks[robot.id] = raw_detections  # Keep raw tracks for PSM generation
+            self.tracks[robot.id] = raw_detections.copy()  # Copy for filtering/merging
+        
+        # Merge overlapping tracks within each robot (keep highest trust)
+        self.merge_overlapping_tracks()
+        
+        # Update data aggregator with new tracks (for weighted estimation)
+        self.data_aggregator.tracks_by_robot = self.tracks
+        self.data_aggregator.robots = self.robots
+        
+        # Perform trust estimation using assignment-based PSMs
+        trust_updates = self.perform_assignment_based_trust_estimation()
+        
+        self.time += self.dt
+        
+        return {
+            'time': self.time,
+            'robot_states': [(r.id, r.position.tolist(), r.velocity.tolist(), r.is_adversarial) 
+                           for r in self.robots],
+            'tracks': {robot_id: [(t.id, t.position.tolist(), t.confidence, t.trust_alpha, t.trust_beta) 
+                                for t in tracks] 
+                      for robot_id, tracks in self.tracks.items()},
+            'trust_updates': trust_updates,
+            'ground_truth': {
+                'objects': [(obj.id, obj.position.tolist(), obj.velocity.tolist(), 
+                           obj.object_type, obj.movement_pattern) for obj in self.ground_truth_objects],
+                'adversarial_robots': [r.id for r in self.robots if r.is_adversarial],
+                'legitimate_robots': [r.id for r in self.robots if not r.is_adversarial],
+                'num_objects': len(self.ground_truth_objects)
+            }
+        }
+    
+    def collect_training_data(self, num_steps: int = 1000) -> List[Dict]:
+        """Collect training data for neural symbolic learning"""
+        training_data = []
+        
+        for _ in range(num_steps):
+            step_data = self.step()
+            training_data.append(step_data)
+        
+        return training_data
+    
+    
+    def save_data(self, data: List[Dict], filename: str):
+        """Save collected data to file"""
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"Saved {len(data)} simulation steps to {filename}")
+    
+    def visualize_current_state(self, save_path: Optional[str] = None):
+        """Visualize current simulation state"""
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Plot ground truth objects with different symbols based on movement pattern
+        if self.ground_truth_objects:
+            for obj in self.ground_truth_objects:
+                marker_map = {
+                    'stationary': 'x',
+                    'linear': 'v',
+                    'random_walk': 'd',
+                    'circular': 'o'
+                }
+                color_map = {
+                    'vehicle': 'red',
+                    'person': 'orange', 
+                    'animal': 'brown'
+                }
+                
+                marker = marker_map.get(obj.movement_pattern, 'x')
+                color = color_map.get(obj.object_type, 'red')
+                
+                ax.scatter(obj.position[0], obj.position[1], 
+                          c=color, marker=marker, s=100, alpha=0.8,
+                          label=f'GT {obj.object_type} ({obj.movement_pattern})' 
+                          if obj.id < 4 else "")  # Only label first few to avoid clutter
+        
+        # Plot robots and their tracks
+        colors = plt.cm.tab10(np.linspace(0, 1, len(self.robots)))
+        
+        for i, robot in enumerate(self.robots):
+            # Plot robot position with different markers for legitimate vs adversarial
+            trust_val = robot.trust_alpha/(robot.trust_alpha+robot.trust_beta)
+            robot_type = "ADV" if robot.is_adversarial else "LEG"
+            marker = '^' if robot.is_adversarial else 'o'
+            
+            ax.scatter(robot.position[0], robot.position[1], 
+                      c=[colors[i]], marker=marker, s=200, 
+                      label=f'Robot {robot.id} ({robot_type}, Trust: {trust_val:.2f})')
+            
+            # Plot patrol pattern (start and goal positions)
+            if robot.start_position is not None:
+                # Start position (home)
+                ax.scatter(robot.start_position[0], robot.start_position[1], 
+                          c=[colors[i]], marker='s', s=100, alpha=0.7)
+            
+            if robot.goal_position is not None:
+                # Goal position
+                ax.scatter(robot.goal_position[0], robot.goal_position[1], 
+                          c=[colors[i]], marker='*', s=150, alpha=0.7)
+                
+                # Draw patrol line
+                if robot.start_position is not None:
+                    ax.plot([robot.start_position[0], robot.goal_position[0]], 
+                           [robot.start_position[1], robot.goal_position[1]], 
+                           color=colors[i], linestyle='--', alpha=0.5)
+            
+            # Plot robot's field of view
+            angles = np.linspace(robot.orientation - robot.fov_angle/2,
+                               robot.orientation + robot.fov_angle/2, 20)
+            fov_x = robot.position[0] + robot.fov_range * np.cos(angles)
+            fov_y = robot.position[1] + robot.fov_range * np.sin(angles)
+            fov_alpha = 0.05 if robot.is_adversarial else 0.1
+            ax.fill(np.concatenate([[robot.position[0]], fov_x, [robot.position[0]]]),
+                   np.concatenate([[robot.position[1]], fov_y, [robot.position[1]]]),
+                   color=colors[i], alpha=fov_alpha)
+            
+            # Plot robot's track detections
+            if robot.id in self.tracks:
+                track_positions = np.array([t.position for t in self.tracks[robot.id]])
+                if len(track_positions) > 0:
+                    track_marker = 'x' if robot.is_adversarial else '+'
+                    ax.scatter(track_positions[:, 0], track_positions[:, 1], 
+                              c=[colors[i]], marker=track_marker, s=50, alpha=0.7)
+        
+        ax.set_xlim(0, self.world_size[0])
+        ax.set_ylim(0, self.world_size[1])
+        ax.set_xlabel('X Position')
+        ax.set_ylabel('Y Position')
+        ax.set_title(f'Multi-Robot Trust-Based Sensor Fusion - Dynamic Objects (t={self.time:.1f}s)\n'
+                    f'Objects: {len(self.ground_truth_objects)} | Robots: Squares=Start, Stars=Goals')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
+        else:
+            plt.show()
+
+
+def main():
+    """Main simulation runner"""
+    print("Initializing Neural-Symbolic Trust-Based Sensor Fusion Simulation")
+    
+    # Create simulation environment with smaller world and more communication
+    env = SimulationEnvironment(num_robots=5, num_targets=8, world_size=(50.0, 50.0))
+    
+    # Visualize initial state
+    env.visualize_current_state('initial_state.png')
+    
+    # Collect training data
+    print("Collecting training data...")
+    training_data = env.collect_training_data(num_steps=500)
+    
+    # Save training data
+    env.save_data(training_data, 'trust_simulation_data.json')
+    
+    # Visualize final state
+    env.visualize_current_state('final_state.png')
+    
+    # Print summary statistics
+    print("\nSimulation Summary:")
+    print(f"Total time steps: {len(training_data)}")
+    print(f"Final simulation time: {env.time:.1f} seconds")
+    
+    print("\nRobot Classifications (Ground Truth):")
+    legitimate_robots = [r for r in env.robots if not r.is_adversarial]
+    adversarial_robots = [r for r in env.robots if r.is_adversarial]
+    
+    print(f"Legitimate Robots: {[r.id for r in legitimate_robots]}")
+    print(f"Adversarial Robots: {[r.id for r in adversarial_robots]}")
+    
+    print("\nFinal Trust Levels vs Ground Truth:")
+    for robot in env.robots:
+        trust_mean = robot.trust_alpha / (robot.trust_alpha + robot.trust_beta)
+        robot_type = "ADVERSARIAL" if robot.is_adversarial else "LEGITIMATE"
+        print(f"Robot {robot.id} ({robot_type}): α={robot.trust_alpha:.2f}, β={robot.trust_beta:.2f}, "
+              f"Trust={trust_mean:.3f}")
+
+
+if __name__ == "__main__":
+    main()
