@@ -16,7 +16,7 @@ from typing import List, Dict, Tuple, Optional
 import random
 from scipy.stats import beta
 from scipy.spatial.distance import euclidean
-# from scipy.optimize import linear_sum_assignment  # No longer needed with simplified approach
+from scipy.optimize import linear_sum_assignment
 import json
 from collections import Counter
 
@@ -86,29 +86,6 @@ class DataAggregator:
     robots: List[RobotState]
     tracks_by_robot: Dict[int, List[Track]]
 
-    # Simple object trust store: object_id -> {'alpha': float, 'beta': float}
-    object_trust: Dict[str, Dict] = None
-
-    def __post_init__(self):
-        if self.object_trust is None:
-            self.object_trust = {}
-
-    def get_or_create_object_trust(self, object_id: str, seed_alpha: float = 1.0, seed_beta: float = 1.0) -> Tuple[float, float]:
-        """Get or create trust parameters for an object ID"""
-        if object_id not in self.object_trust:
-            self.object_trust[object_id] = {
-                'alpha': float(seed_alpha),
-                'beta': float(seed_beta)
-            }
-        return self.object_trust[object_id]['alpha'], self.object_trust[object_id]['beta']
-    
-    def update_object_trust(self, object_id: str, alpha: float, beta: float):
-        """Update trust parameters for an object"""
-        if object_id not in self.object_trust:
-            self.object_trust[object_id] = {}
-        self.object_trust[object_id]['alpha'] = alpha
-        self.object_trust[object_id]['beta'] = beta
-
     def select_object_id_from_group(self, group_tracks: List[Track]) -> Optional[str]:
         """Select object ID from group - simply use most common ID"""
         group_ids = [t.object_id for t in group_tracks if t.object_id]
@@ -126,13 +103,8 @@ class DataAggregator:
         object_id = self.select_object_id_from_group(group_tracks)
         
         if object_id:
-            # Get or create trust for this object
-            alpha, beta = self.get_or_create_object_trust(
-                object_id, 
-                seed_alpha=group_tracks[0].trust_alpha, 
-                seed_beta=group_tracks[0].trust_beta
-            )
-            return object_id, alpha, beta
+            # Use the trust from the first track in the group (they should be similar for same object)
+            return object_id, group_tracks[0].trust_alpha, group_tracks[0].trust_beta
         else:
             # Fallback - shouldn't happen with new approach
             return f"unknown_obj_{random.randint(1000, 9999)}", 1.0, 1.0
@@ -175,19 +147,25 @@ class DataAggregator:
         trust_threshold: float = 0.4
     ) -> List[Track]:
         """
-        Simplified fusion approach using direct object IDs:
-        1) Distance-based grouping of tracks within fusion threshold
-        2) Use object IDs directly from tracks (assigned during detection)
-        3) One fused track per object ID
+        Paper-compliant fusion approach:
+        1) First, fuse ego robot's tracks with proximal tracks weighted by agent trust
+        2) Create one fused track per detected object
+        3) Weight contributions by agent trust values
         """
-        ego_tracks = self.tracks_by_robot.get(ego_robot_id, [])
-        if not ego_tracks:
+        # Get ego robot and its object tracks
+        ego_robot = next((r for r in self.robots if r.id == ego_robot_id), None)
+        if ego_robot is None:
+            return []
+            
+        ego_object_tracks = self.tracks_by_robot.get(ego_robot_id, [])
+        if not ego_object_tracks:
             return []
 
         fused_tracks: List[Track] = []
         processed_object_ids = set()  # Ensure one track per object
 
-        for ego_track in ego_tracks:
+        # For each object detected by ego robot
+        for ego_track in ego_object_tracks:
             # Trust gate for ego track
             ego_trust = ego_track.trust_alpha / (ego_track.trust_alpha + ego_track.trust_beta)
             if ego_trust < trust_threshold:
@@ -197,44 +175,56 @@ class DataAggregator:
             if ego_track.object_id in processed_object_ids:
                 continue
 
-            # 1) Distance-based grouping with tracks of same object ID
-            group: List[Track] = [ego_track]
+            # 1) Find proximal tracks for same object (within distance threshold)
+            proximal_tracks_for_object: List[Track] = [ego_track]  # Start with ego track
+            
             for other_robot_id, other_tracks in self.tracks_by_robot.items():
                 if other_robot_id == ego_robot_id:
                     continue
+                    
+                # Get agent trust for this proximal robot
+                other_robot = next((r for r in self.robots if r.id == other_robot_id), None)
+                if other_robot is None:
+                    continue
+                    
+                agent_trust = other_robot.trust_alpha / (other_robot.trust_alpha + other_robot.trust_beta)
+                
+                # Find tracks from this robot for the same object
                 for ot in other_tracks:
-                    # Only group tracks with same object ID that are close enough
                     if (ot.object_id == ego_track.object_id and 
                         np.linalg.norm(ego_track.position - ot.position) <= fusion_threshold):
-                        t_trust = ot.trust_alpha / (ot.trust_alpha + ot.trust_beta)
-                        if t_trust >= trust_threshold:
-                            group.append(ot)
+                        track_trust = ot.trust_alpha / (ot.trust_alpha + ot.trust_beta)
+                        # Use agent trust as additional weight (as per paper)
+                        if agent_trust >= trust_threshold and track_trust >= trust_threshold:
+                            proximal_tracks_for_object.append(ot)
 
-            # 2) Compute fused state (position + velocity)
-            fused_pos, fused_vel = self.compute_weighted_object_state(group)
+            # 2) Compute agent-trust-weighted fused state
+            fused_pos, fused_vel = self.compute_weighted_object_state(proximal_tracks_for_object)
             if fused_pos is None or fused_vel is None:
                 # Fallback to ego track
                 fused_tracks.append(ego_track)
                 processed_object_ids.add(ego_track.object_id)
                 continue
 
-            # 3) Get object trust (create if needed)
-            object_id, obj_alpha, obj_beta = self.get_object_id_and_trust(group)
-            processed_object_ids.add(object_id)
+            # 3) Use ego robot's trust distribution for the fused track
+            obj_id = ego_track.object_id
+            # Fused track maintains ego robot's trust perspective for this object
+            obj_alpha, obj_beta = ego_track.trust_alpha, ego_track.trust_beta
+            processed_object_ids.add(obj_id)
 
-            # 4) Create fused track
-            track_id = f"{ego_robot_id}:{object_id}"
+            # 4) Create fused track with agent-trust weighting
+            track_id = f"{ego_robot_id}_fused_{obj_id}"
             fused_tracks.append(Track(
                 id=track_id,
                 position=fused_pos,
                 velocity=fused_vel,
                 covariance=ego_track.covariance,
-                confidence=min(1.0, sum(t.confidence for t in group) / len(group)),
+                confidence=min(1.0, sum(t.confidence for t in proximal_tracks_for_object) / len(proximal_tracks_for_object)),
                 timestamp=ego_track.timestamp,
                 source_robot=ego_robot_id,
                 trust_alpha=obj_alpha,
                 trust_beta=obj_beta,
-                object_id=object_id
+                object_id=obj_id
             ))
 
         return fused_tracks
@@ -319,6 +309,11 @@ class SimulationEnvironment:
         self.ground_truth_objects: List[GroundTruthObject] = []  # Dynamic ground truth objects
         self.tracks: Dict[int, List[Track]] = {}  # Robot ID -> list of tracks (filtered/merged)
         self.raw_tracks: Dict[int, List[Track]] = {}  # Robot ID -> raw unfiltered tracks for PSM generation
+        
+        # NEW: Per-robot object track management
+        self.robot_object_tracks: Dict[int, Dict[str, Track]] = {}  # robot_id -> {object_id: Track}
+        self.robot_object_trust: Dict[int, Dict[str, Tuple[float, float]]] = {}  # robot_id -> {object_id: (alpha, beta)}
+        
         self.time = 0.0
         self.dt = 0.1  # 10Hz simulation rate
         self.next_object_id = 0  # For generating unique object IDs
@@ -338,6 +333,10 @@ class SimulationEnvironment:
         adversarial_ids = set(random.sample(range(self.num_robots), num_adversarial))
         
         for i in range(self.num_robots):
+            # Initialize per-robot object tracking structures
+            self.robot_object_tracks[i] = {}
+            self.robot_object_trust[i] = {}
+            
             # Start position (home base)
             start_pos = np.array([
                 random.uniform(5, self.world_size[0] - 5),
@@ -401,37 +400,10 @@ class SimulationEnvironment:
         # Per-robot counter to mint new FP object ids
         self.fp_next_id_by_robot: Dict[int, int] = {r.id: 0 for r in self.robots} 
         # Initialize trust estimator
-        self.trust_estimator = TrustEstimator(negative_bias=3.0, negative_threshold=0.5)
+        self.trust_estimator = TrustEstimator(negative_bias=1.5, negative_threshold=0.5)  # Reduced negative bias
     
-    def _enforce_global_object_uniqueness(self):
-        """Enforce one track per object globally across all robots"""
-        # Collect all tracks with their object IDs
-        all_tracks_by_object = {}
-        
-        for robot_id, tracks in self.tracks.items():
-            for track in tracks:
-                if track.object_id not in all_tracks_by_object:
-                    all_tracks_by_object[track.object_id] = []
-                all_tracks_by_object[track.object_id].append((robot_id, track))
-        
-        # For each object, keep only the track from the robot with highest trust
-        for object_id, track_list in all_tracks_by_object.items():
-            if len(track_list) > 1:
-                # Multiple tracks for same object - keep the one from most trusted robot
-                best_robot_id, best_track = max(track_list, key=lambda x: self._get_robot_trust(x[0]))
-                
-                # Remove this object's tracks from all other robots
-                for robot_id, track in track_list:
-                    if robot_id != best_robot_id:
-                        # Remove track from robot's track list
-                        self.tracks[robot_id] = [t for t in self.tracks[robot_id] if t.object_id != object_id]
-    
-    def _get_robot_trust(self, robot_id: int) -> float:
-        """Get robot's current trust value"""
-        robot = next((r for r in self.robots if r.id == robot_id), None)
-        if robot:
-            return robot.trust_alpha / (robot.trust_alpha + robot.trust_beta)
-        return 0.0
+    # Removed _enforce_global_object_uniqueness - no longer needed with per-robot object tracking
+    # Each robot should maintain its own tracks for objects, allowing distributed trust estimation
     
     def _create_ground_truth_object(self, spawn_time: float) -> GroundTruthObject:
         """Create a new ground truth object with random properties"""
@@ -681,6 +653,8 @@ class SimulationEnvironment:
         
         for gt_obj in self.ground_truth_objects:
             if self.is_in_fov(robot, gt_obj.position):
+                object_id = f"gt_obj_{gt_obj.id}"
+                
                 # Legitimate robots always detect true targets with minimal noise
                 noisy_pos = gt_obj.position + np.random.normal(0, noise_std * 0.5, 3)  # Less noise
                 # Use actual object velocity with small noise
@@ -689,19 +663,20 @@ class SimulationEnvironment:
                 # High confidence covariance for legitimate detections
                 covariance = np.eye(6) * (noise_std * 0.5)**2
                 
-                object_track_key = f"{robot.id}_gt_obj_{gt_obj.id}"  # Persistent key for same robot-object pair
-                
-                # Get or initialize track trust from registry using object-based key
-                if object_track_key in self.track_trust_registry:
-                    trust_alpha, trust_beta = self.track_trust_registry[object_track_key]
+                # Get or initialize track trust for this robot-object pair
+                if object_id in self.robot_object_trust[robot.id]:
+                    trust_alpha, trust_beta = self.robot_object_trust[robot.id][object_id]
                 else:
                     # Initialize with neutral Beta(1,1) prior
                     trust_alpha = 1.0
                     trust_beta = 1.0
-                    self.track_trust_registry[object_track_key] = (trust_alpha, trust_beta)
+                    self.robot_object_trust[robot.id][object_id] = (trust_alpha, trust_beta)
+                
+                # Create persistent track ID for this robot-object pair
+                track_key = f"{robot.id}_{object_id}"
                 
                 track = Track(
-                    id=object_track_key,  # Use persistent object-based ID
+                    id=track_key,  # Use persistent robot-object-based ID
                     position=noisy_pos,
                     velocity=noisy_vel,
                     covariance=covariance,
@@ -710,8 +685,12 @@ class SimulationEnvironment:
                     source_robot=robot.id,
                     trust_alpha=trust_alpha,
                     trust_beta=trust_beta,
-                    object_id=f"gt_obj_{gt_obj.id}"  # Direct object ID from ground truth
+                    object_id=object_id  # Direct object ID from ground truth
                 )
+                
+                # Update the per-robot object track registry
+                self.robot_object_tracks[robot.id][object_id] = track
+                
                 detections.append(track)
                 track_id += 1
         
@@ -722,8 +701,8 @@ class SimulationEnvironment:
         tracks = []
 
         # Adversarial behavior parameters
-        false_negative_rate = 0.1
-        false_positive_rate = 0.5 # Fraction of true-in-FOV used to size FP set
+        false_negative_rate = 0.0
+        false_positive_rate = 0.2 # Fraction of true-in-FOV used to size FP set
         # Use same detection quality as legitimate robots
         position_noise_std = noise_std * 0.5  # Same as legitimate robots
         velocity_noise_std = 0.2              # Same as legitimate robots
@@ -735,19 +714,26 @@ class SimulationEnvironment:
         for gt_obj in true_objects_in_fov:
             if random.random() < false_negative_rate:
                 continue  # skip some true objects (FN)
+            
+            object_id = f"gt_obj_{gt_obj.id}"
+            
             # Use same noise levels as legitimate robots for GT object detections
             noisy_pos = gt_obj.position + np.random.normal(0, position_noise_std, 3)
             noisy_vel = gt_obj.velocity + np.random.normal(0, velocity_noise_std, 3)
             covariance = np.eye(6) * position_noise_std**2
-
-            object_track_key = f"{robot.id}_gt_obj_{gt_obj.id}"  # Persistent key for same robot-object pair
             
-            # Track trust init / reuse using object-based key
-            trust_alpha, trust_beta = self.track_trust_registry.get(object_track_key, (1.0, 1.0))
-            self.track_trust_registry.setdefault(object_track_key, (trust_alpha, trust_beta))
+            # Get or initialize track trust for this robot-object pair
+            if object_id in self.robot_object_trust[robot.id]:
+                trust_alpha, trust_beta = self.robot_object_trust[robot.id][object_id]
+            else:
+                trust_alpha = 1.0
+                trust_beta = 1.0
+                self.robot_object_trust[robot.id][object_id] = (trust_alpha, trust_beta)
 
-            tracks.append(Track(
-                id=object_track_key,  # Use persistent object-based ID
+            track_key = f"{robot.id}_{object_id}"
+            
+            track = Track(
+                id=track_key,  # Use persistent robot-object-based ID
                 position=noisy_pos,
                 velocity=noisy_vel,
                 covariance=covariance,
@@ -756,24 +742,43 @@ class SimulationEnvironment:
                 source_robot=robot.id,
                 trust_alpha=trust_alpha,
                 trust_beta=trust_beta,
-                object_id=f"gt_obj_{gt_obj.id}"  # Direct object ID from ground truth
-            ))
+                object_id=object_id  # Direct object ID from ground truth
+            )
+            
+            # Update the per-robot object track registry
+            self.robot_object_tracks[robot.id][object_id] = track
+            tracks.append(track)
             track_id += 1
 
         # --- PERSISTENT FALSE POSITIVES (FPs) ---
-        # Target FP "capacity" based on nearby truth; keep consistent across steps
-        target_num_fp = int(len(true_objects_in_fov) * false_positive_rate)
+        # Target number of FP objects that should be visible in FOV
+        target_num_fp_in_fov = int(len(true_objects_in_fov) * false_positive_rate)
 
         fp_store = self.fp_objects_by_robot[robot.id]
-        # Prune FPs that are far behind / unlikely: keep size near target_num_fp (+/- 1)
-        # (Simple policy: if too many FPs, drop random ones)
-        if len(fp_store) > target_num_fp + 1:
-            to_drop = random.sample(list(fp_store.keys()), len(fp_store) - (target_num_fp + 1))
+        
+        # Count FPs currently in FOV
+        fp_in_fov = [fp_id for fp_id, state in fp_store.items() 
+                     if self.is_in_fov(robot, state['position'])]
+        current_fp_in_fov = len(fp_in_fov)
+        
+        # Only prune excess FPs if we have too many total (keep some out-of-FOV for persistence)
+        max_total_fps = target_num_fp_in_fov + 3  # Allow some FPs to exist outside FOV
+        if len(fp_store) > max_total_fps:
+            # Prioritize removing FPs that are out of FOV first
+            fp_out_of_fov = [fp_id for fp_id, state in fp_store.items() 
+                            if not self.is_in_fov(robot, state['position'])]
+            to_drop = fp_out_of_fov[:len(fp_store) - max_total_fps]
+            
+            # If we still need to drop more, remove some in-FOV ones
+            if len(to_drop) < len(fp_store) - max_total_fps:
+                remaining_to_drop = len(fp_store) - max_total_fps - len(to_drop)
+                to_drop.extend(random.sample(fp_in_fov, min(remaining_to_drop, len(fp_in_fov))))
+            
             for oid in to_drop:
                 fp_store.pop(oid, None)
 
-        # Spawn new FP objects if needed
-        while len(fp_store) < target_num_fp:
+        # Spawn new FP objects to reach target number in FOV
+        while current_fp_in_fov < target_num_fp_in_fov:
             # Create an FP in robot FOV, not too close to existing GT in FOV
             attempts = 0
             new_pos = None
@@ -797,8 +802,9 @@ class SimulationEnvironment:
             fp_id = f"fp_{robot.id}_{self.fp_next_id_by_robot[robot.id]}"
             self.fp_next_id_by_robot[robot.id] += 1
             fp_store[fp_id] = {'position': new_pos, 'velocity': vel}
+            current_fp_in_fov += 1  # Update counter for the while loop
 
-        # Update FP dynamics, keep them mostly within FOV/world, and emit detections
+        # Update FP dynamics and emit detections for all FPs (both in and out of FOV)
         for fp_oid, state in list(fp_store.items()):
             pos = state['position']
             vel = state['velocity']
@@ -824,16 +830,21 @@ class SimulationEnvironment:
             state['position'] = pos
             state['velocity'] = vel
 
-            # Emit FP detection only if still in FOV
+            # Only emit detection if FP is in FOV (but keep the FP object for persistence)
             if not self.is_in_fov(robot, pos):
                 continue
 
-            # Use persistent FP object ID as track key for continuous trust
-            fp_track_key = f"{robot.id}_{fp_oid}"  # Persistent key for same robot-FP pair
-            trust_alpha, trust_beta = self.track_trust_registry.get(fp_track_key, (1.0, 1.0))
-            self.track_trust_registry.setdefault(fp_track_key, (trust_alpha, trust_beta))
+            # Get or initialize track trust for this robot-FP pair
+            if fp_oid in self.robot_object_trust[robot.id]:
+                trust_alpha, trust_beta = self.robot_object_trust[robot.id][fp_oid]
+            else:
+                trust_alpha = 1.0
+                trust_beta = 1.0
+                self.robot_object_trust[robot.id][fp_oid] = (trust_alpha, trust_beta)
 
-            tracks.append(Track(
+            fp_track_key = f"{robot.id}_{fp_oid}"
+            
+            track = Track(
                 id=fp_track_key,  # Use persistent FP-based ID
                 position=pos.copy(),  # Perfect accuracy - no measurement noise for fabricated objects
                 velocity=vel.copy(),  # Perfect accuracy - no measurement noise for fabricated objects  
@@ -844,54 +855,18 @@ class SimulationEnvironment:
                 trust_alpha=trust_alpha,
                 trust_beta=trust_beta,
                 object_id=fp_oid  # Persistent FP object ID maintained by adversary
-            ))
+            )
+            
+            # Update the per-robot object track registry
+            self.robot_object_tracks[robot.id][fp_oid] = track
+            tracks.append(track)
             track_id += 1
 
         return tracks
 
     
-    def merge_overlapping_tracks(self):
-        """Merge spatially overlapping tracks, keeping the one with highest mean trust"""
-        for robot_id in self.tracks:
-            robot_tracks = self.tracks[robot_id]
-            if len(robot_tracks) <= 1:
-                continue
-            
-            merged_tracks = []
-            remaining_tracks = robot_tracks.copy()
-            
-            while remaining_tracks:
-                # Take first track as reference
-                current_track = remaining_tracks.pop(0)
-                overlapping_tracks = [current_track]
-                
-                # Find all tracks that overlap with current track
-                i = 0
-                while i < len(remaining_tracks):
-                    other_track = remaining_tracks[i]
-                    distance = np.linalg.norm(current_track.position - other_track.position)
-                    
-                    if distance <= 1.5:  # Conservative threshold considering detection noise (~3σ)
-                        overlapping_tracks.append(remaining_tracks.pop(i))
-                    else:
-                        i += 1
-                
-                # If multiple overlapping tracks, keep the one with highest mean trust
-                if len(overlapping_tracks) > 1:
-                    best_track = None
-                    best_trust = -1
-                    
-                    for track in overlapping_tracks:
-                        track_trust = track.trust_alpha / (track.trust_alpha + track.trust_beta)
-                        if track_trust > best_trust:
-                            best_trust = track_trust
-                            best_track = track
-                    
-                    merged_tracks.append(best_track)
-                else:
-                    merged_tracks.append(current_track)
-            
-            self.tracks[robot_id] = merged_tracks
+    # Removed merge_overlapping_tracks - no longer needed with per-robot object tracking
+    # Each object maintains its own track per robot, preventing incorrect merging of nearby objects
     
     def perform_assignment_based_trust_estimation(self) -> Dict[int, Dict]:
         """Perform trust estimation using assignment-based PSM generation as per paper"""
@@ -903,31 +878,31 @@ class SimulationEnvironment:
         
         # OUTER LOOP: For each ego robot, create ego fused tracks
         for ego_robot in self.robots:
-            ego_tracks = self.tracks.get(ego_robot.id, [])
+            ego_robot_tracks = list(self.robot_object_tracks[ego_robot.id].values())
             
             # Create ego fused tracks by fusing ego tracks with nearby tracks from other robots
-            if not ego_tracks:
+            if not ego_robot_tracks:
                 continue
                 
-            # Create ego robot's fused tracks
+            # Create ego robot's fused tracks (weighted by agent trust as per paper)
             ego_fused_tracks = self.data_aggregator.fuse_tracks_for_ego_robot(ego_robot.id)
             
             if not ego_fused_tracks:
                 continue
             
-            # INNER LOOP: For each proximal robot, compare its tracks with ego fused tracks
+            # INNER LOOP: For each proximal robot, compare its raw tracks with ego fused tracks
             for proximal_robot in self.robots:
                 if proximal_robot.id == ego_robot.id:
                     continue
                     
-                # Use raw unfiltered tracks for proximal robot (important for trust evaluation)
-                proximal_tracks = self.raw_tracks.get(proximal_robot.id, [])
-                if not proximal_tracks:
+                # Use per-robot object tracks for proximal robot (important for trust evaluation)
+                proximal_robot_tracks = list(self.robot_object_tracks[proximal_robot.id].values())
+                if not proximal_robot_tracks:
                     continue
                 
-                # Generate PSMs based on assignment between ego fused tracks and raw proximal tracks
+                # Generate PSMs based on assignment between ego fused tracks and proximal robot tracks
                 self._generate_assignment_psms_paper_style(
-                    ego_fused_tracks, proximal_tracks, ego_robot, proximal_robot, 
+                    ego_fused_tracks, proximal_robot_tracks, ego_robot, proximal_robot, 
                     robot_psms, all_track_psms)
         
         # Apply collected PSMs to update robot trust
@@ -935,17 +910,17 @@ class SimulationEnvironment:
             if robot_psms[robot.id]:
                 self.trust_estimator.update_agent_trust(robot, robot_psms[robot.id])
             
-            # Update track trust for all tracks that have PSMs (use raw tracks)
-            robot_tracks = self.raw_tracks.get(robot.id, [])
-            for track in robot_tracks:
+            # Update track trust for all tracks that have PSMs (use per-robot object tracks)
+            for obj_id, track in self.robot_object_tracks[robot.id].items():
                 if track.id in all_track_psms:
                     self.trust_estimator.update_track_trust(track, all_track_psms[track.id])
-                    # Update the trust registry with the new values
+                    # Update the per-robot object trust registry with the new values
+                    self.robot_object_trust[robot.id][obj_id] = (track.trust_alpha, track.trust_beta)
+                    
+                    # Also update legacy registry for backward compatibility
                     self.track_trust_registry[track.id] = (track.trust_alpha, track.trust_beta)
                     
-                    # Propagate trust to object trust store if this track has an object_id
-                    if track.object_id:
-                        self.data_aggregator.update_object_trust(track.object_id, track.trust_alpha, track.trust_beta)
+                    # Trust is now maintained per-robot, per-object - no need for global object trust
             
             # ALWAYS include ALL robots in trust_updates to maintain continuous trust evolution
             trust_updates[robot.id] = {
@@ -958,9 +933,10 @@ class SimulationEnvironment:
                         'alpha': track.trust_alpha,
                         'beta': track.trust_beta,
                         'mean_trust': track.trust_alpha / (track.trust_alpha + track.trust_beta),
-                        'num_psms': len(all_track_psms.get(track.id, []))
+                        'num_psms': len(all_track_psms.get(track.id, [])),
+                        'object_id': track.object_id
                     }
-                    for track in robot_tracks
+                    for track in self.robot_object_tracks[robot.id].values()
                 }
             }
         
@@ -969,38 +945,61 @@ class SimulationEnvironment:
     def _generate_assignment_psms_paper_style(self, ego_fused_tracks: List[Track], proximal_tracks: List[Track],
                                             ego_robot: RobotState, proximal_robot: RobotState,
                                             robot_psms: Dict, all_track_psms: Dict):
-        """Generate PSMs using simplified object ID matching"""
+        """Generate PSMs using linear sum assignment as per paper"""
         
         if not ego_fused_tracks or not proximal_tracks:
             return
             
-        # Filter proximal tracks to those in ego robot's FOV
-        fov_proximal_tracks = [
-            track for track in proximal_tracks 
-            if self.is_in_fov(ego_robot, track.position)
-        ]
+        # Create cost matrix for assignment based on spatial distance
+        cost_matrix = self._compute_assignment_cost_matrix(ego_fused_tracks, proximal_tracks)
         
-        if not fov_proximal_tracks:
-            return
+        # Perform linear sum assignment (Hungarian algorithm)
+        ego_indices, proximal_indices = linear_sum_assignment(cost_matrix)
         
-        # Build set of ego object IDs for quick lookup
-        ego_object_ids = {track.object_id for track in ego_fused_tracks}
+        # Track which proximal tracks were assigned
+        assigned_proximal_indices = set(proximal_indices)
         
-        # Process each proximal track
-        for proximal_track in fov_proximal_tracks:
-            if proximal_track.object_id in ego_object_ids:
-                # MATCH: Same object ID - positive evidence
-                # Find matching ego track
-                ego_track = next((t for t in ego_fused_tracks if t.object_id == proximal_track.object_id), None)
-                if ego_track:
-                    self._generate_positive_psm_paper_style(
-                        ego_track, proximal_track, proximal_robot, robot_psms, all_track_psms
-                    )
-            else:
-                # MISMATCH: Different object ID - negative evidence (false positive)
-                self._generate_negative_psm_paper_style(
-                    proximal_track, proximal_robot, robot_psms, all_track_psms
+        # Process assigned track pairs
+        assignment_threshold = 5.0  
+        for ego_idx, prox_idx in zip(ego_indices, proximal_indices):
+            cost = cost_matrix[ego_idx, prox_idx]
+            
+            if cost <= assignment_threshold:  # Valid assignment
+                ego_track = ego_fused_tracks[ego_idx]
+                proximal_track = proximal_tracks[prox_idx]
+                
+                # MATCH: Assigned tracks - positive evidence
+                self._generate_positive_psm_paper_style(
+                    ego_track, proximal_track, proximal_robot, robot_psms, all_track_psms
                 )
+            else:
+                # Assignment cost too high - treat as unassigned
+                assigned_proximal_indices.discard(prox_idx)
+        
+        # Process unassigned proximal tracks (false positives)
+        for prox_idx, proximal_track in enumerate(proximal_tracks):
+            if prox_idx not in assigned_proximal_indices:
+                if self.is_in_fov(ego_robot, proximal_track.position):
+                    # MISMATCH: Unassigned proximal track - negative evidence (false positive)
+                    self._generate_negative_psm_paper_style(
+                        proximal_track, proximal_robot, robot_psms, all_track_psms
+                    )
+    
+    def _compute_assignment_cost_matrix(self, ego_tracks: List[Track], proximal_tracks: List[Track]) -> np.ndarray:
+        """Compute cost matrix for linear sum assignment based on spatial distance"""
+        n_ego = len(ego_tracks)
+        n_prox = len(proximal_tracks)
+        
+        cost_matrix = np.zeros((n_ego, n_prox))
+        
+        for i, ego_track in enumerate(ego_tracks):
+            for j, prox_track in enumerate(proximal_tracks):
+                # Use Euclidean distance as the primary cost
+                spatial_distance = np.linalg.norm(ego_track.position - prox_track.position)
+                
+                cost_matrix[i, j] = spatial_distance
+        
+        return cost_matrix
     
     def _generate_positive_psm_paper_style(self, ego_fused_track: Track, proximal_track: Track,
                                          proximal_robot: RobotState, robot_psms: Dict, all_track_psms: Dict):
@@ -1041,9 +1040,9 @@ class SimulationEnvironment:
         agent_expected_trust = self.trust_estimator.get_expected_trust(
             proximal_robot.trust_alpha, proximal_robot.trust_beta)
         
-        # Agent PSM: value = 1 - E[proximal_track_trust], confidence = 1 - V[proximal_track_trust]
-        agent_value = 1.0 - proximal_track_expected_trust  # Corrected: negative evidence
-        agent_confidence = 1.0 - proximal_track_trust_variance  # Ensure positive confidence 
+        # Agent PSM: value = E[ego_fused_track_trust], confidence = 1-V[ego_fused_track_trust] (positive)        
+        agent_value = proximal_track_expected_trust 
+        agent_confidence = 1.0 - proximal_track_trust_variance  # Higher confidence when track trust is certain 
         robot_psms[proximal_robot.id].append((agent_value, agent_confidence))
         
         # Track PSM: value = 0 (no match/false positive), confidence = E[agent_trust]
@@ -1079,32 +1078,25 @@ class SimulationEnvironment:
         for robot in self.robots:
             raw_detections = self.generate_detections(robot)
             self.raw_tracks[robot.id] = raw_detections  # Keep raw tracks for PSM generation
-            self.tracks[robot.id] = raw_detections.copy()  # Copy for filtering/merging
             
-            # Update object trust from generated tracks
-            for track in self.tracks[robot.id]:
-                if track.object_id:
-                    self.data_aggregator.update_object_trust(track.object_id, track.trust_alpha, track.trust_beta)
+            # Convert per-robot object tracks to list format for legacy compatibility
+            self.tracks[robot.id] = list(self.robot_object_tracks[robot.id].values())
+            
+            # Object trust is now maintained per-robot in robot_object_trust - no need for separate aggregator trust
         
-        # Merge overlapping tracks within each robot (keep highest trust)
-        self.merge_overlapping_tracks()
+        # No longer merge overlapping tracks - each object maintains separate tracks per robot
         
         # *** PERFORM TRUST ESTIMATION FIRST (before uniqueness enforcement) ***
         # This allows multi-robot consensus to be rewarded before filtering
         self.data_aggregator.tracks_by_robot = self.tracks
         self.data_aggregator.robots = self.robots
         
-        # Update object trust from tracks before consensus analysis
-        for tracks in self.tracks.values():
-            for track in tracks:
-                if track.object_id:
-                    self.data_aggregator.update_object_trust(track.object_id, track.trust_alpha, track.trust_beta)
+        # Object trust is now maintained per-robot in robot_object_trust - no centralized update needed
         
         # Perform trust estimation using assignment-based PSMs (rewards consensus)
         trust_updates = self.perform_assignment_based_trust_estimation()
         
-        # *** THEN enforce global one-track-per-object constraint (for final output) ***
-        self._enforce_global_object_uniqueness()
+        # No longer enforce global object uniqueness - each robot maintains its own object tracks
         
         self.time += self.dt
         
