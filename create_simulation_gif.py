@@ -351,46 +351,87 @@ def create_summary_plot(world_bounds, simulation_data):
     num_robots = len(final_data['robots']) if final_data['robots'] else 4
     robot_colors = plt.cm.Set1(np.linspace(0, 1, num_robots))
     
-    # Plot everything as in the animation
+    # Plot ground truth objects (blue stars, same as GIF)
     for gt_obj in final_data['ground_truth_objects']:
-        marker_map = {'stationary': 's', 'linear': '>', 'random_walk': 'd', 'circular': 'o'}
-        color_map = {'vehicle': 'red', 'person': 'orange', 'animal': 'brown'}
-        
-        marker = marker_map.get(gt_obj['movement_pattern'], 'o')
-        color = color_map.get(gt_obj['object_type'], 'red')
-        
         ax1.scatter(gt_obj['position'][0], gt_obj['position'][1],
-                   c=color, marker=marker, s=200, alpha=0.9,
-                   edgecolors='black', linewidth=2)
+                   c='blue', marker='*', s=300, alpha=0.9,
+                   edgecolors='black', linewidth=2, 
+                   label='Ground Truth' if gt_obj['id'] == 0 else '')
+        
+        # Add GT object ID label
+        ax1.text(gt_obj['position'][0], gt_obj['position'][1] + 1.2, f'GT{gt_obj["id"]}', 
+               ha='center', va='bottom', fontsize=8, fontweight='bold',
+               bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
     
+    # Plot robots with FOV (matching GIF format exactly)
     for i, robot in enumerate(final_data['robots']):
-        color = robot_colors[i]
         pos = robot['position']
-        marker = '^' if robot['is_adversarial'] else 'o'
+        
+        # Robot color and type (matching GIF)
+        if robot['is_adversarial']:
+            color = 'red'
+            robot_type = 'ADV'
+        else:
+            color = 'green'
+            robot_type = 'LEG'
+        
+        # Robot size based on trust (matching GIF)
         robot_size = 100 + robot['trust'] * 200
         
-        ax1.scatter(pos[0], pos[1], c=[color], marker=marker, s=robot_size,
-                   edgecolors='white', linewidth=2, alpha=0.9)
+        # All robots use square marker (matching GIF)
+        ax1.scatter(pos[0], pos[1], c=color, marker='s', s=robot_size,
+                   edgecolors='white', linewidth=2, alpha=0.9,
+                   label=f'{robot_type} Robot' if (robot_type == 'LEG' and i == 0) or (robot_type == 'ADV' and robot['is_adversarial'] and not any(r['is_adversarial'] and r['id'] < robot['id'] for r in final_data['robots'])) else '')
         
-        # FOV
+        # Robot ID text (matching GIF)
+        ax1.text(pos[0], pos[1] - 1.5, f'R{robot["id"]}\n{robot["trust"]:.2f}', 
+               ha='center', va='top', fontsize=9, fontweight='bold',
+               bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor=color))
+        
+        # Field of View (FOV) visualization (matching GIF)
         fov_angles = np.linspace(robot['orientation'] - robot['fov_angle']/2,
                                robot['orientation'] + robot['fov_angle']/2, 30)
-        fov_x = [pos[0]] + [pos[0] + robot['fov_range'] * np.cos(a) for a in fov_angles] + [pos[0]]
-        fov_y = [pos[1]] + [pos[1] + robot['fov_range'] * np.sin(a) for a in fov_angles] + [pos[1]]
         
-        fov_alpha = 0.05 if robot['is_adversarial'] else 0.1
+        # FOV triangle
+        fov_x = [pos[0]]
+        fov_y = [pos[1]]
+        for angle in fov_angles:
+            fov_x.append(pos[0] + robot['fov_range'] * np.cos(angle))
+            fov_y.append(pos[1] + robot['fov_range'] * np.sin(angle))
+        fov_x.append(pos[0])
+        fov_y.append(pos[1])
+        
+        # FOV fill (matching GIF transparency)
+        fov_alpha = 0.15 if robot['is_adversarial'] else 0.1
         ax1.fill(fov_x, fov_y, color=color, alpha=fov_alpha)
+        ax1.plot(fov_x, fov_y, color=color, linewidth=2, alpha=0.6)
         
-        # Detections
-        for detection in final_data['detections'][robot['id']]:
-            det_pos = detection['position']
-            det_size = 30 + detection['confidence'] * 40 + detection['trust_mean'] * 30
-            ax1.scatter(det_pos[0], det_pos[1], c=[color], marker='+', s=det_size, alpha=0.8)
-        
+        # Plot false positive objects (orange stars, same as GT but different color)
         for fp in final_data['false_positives'][robot['id']]:
-            fp_pos = fp['position']
-            fp_size = 20 + fp['confidence'] * 20
-            ax1.scatter(fp_pos[0], fp_pos[1], c='red', marker='x', s=fp_size, alpha=0.7)
+            if fp.get('type') == 'fp_object':  # Only show FP objects
+                fp_pos = fp['position']
+                
+                # FP Objects: Use same star symbol as GT objects but orange color
+                ax1.scatter(fp_pos[0], fp_pos[1], 
+                          c='orange', marker='*', s=300, alpha=0.9, 
+                          edgecolors='black', linewidth=2)
+                
+                # Add FP object ID label (similar to GT objects)
+                ax1.text(fp_pos[0], fp_pos[1] + 1.2, f'FP{fp["object_id"].replace("fp_", "")}', 
+                       ha='center', va='bottom', fontsize=8, fontweight='bold',
+                       bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+    
+    # Add consistent legend (matching GIF format)
+    from matplotlib.lines import Line2D
+    
+    legend_elements = [
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='blue', markersize=12, label='Ground Truth Objects'),
+        Line2D([0], [0], marker='*', color='w', markerfacecolor='orange', markeredgecolor='black', 
+               markeredgewidth=2, markersize=12, label='False Positive Objects'),
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='green', markersize=10, label='Legitimate Robots'), 
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='red', markersize=10, label='Adversarial Robots'),
+    ]
+    ax1.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1, 1), fontsize=10)
     
     # Right plot: Trust evolution over time
     ax2.set_xlabel('Time (s)', fontsize=12)
@@ -425,4 +466,4 @@ def create_summary_plot(world_bounds, simulation_data):
     print("✅ Summary plot saved as: simulation_summary.png")
 
 if __name__ == "__main__":
-    create_simulation_gif()
+    create_simulation_gif("paper_trust_data.json")
