@@ -20,6 +20,7 @@ import pickle
 from scipy.optimize import linear_sum_assignment
 
 from trust_algorithm import TrustAlgorithm, RobotState, Track
+from paper_trust_algorithm import PaperTrustAlgorithm
 
 
 @dataclass
@@ -307,6 +308,9 @@ class TrainingDataCollector:
     def __init__(self):
         self.training_examples = []
         self.graph_builder = GraphBuilder()
+        # Paper algorithm to generate training targets
+        self.paper_algorithm = PaperTrustAlgorithm()
+        self.paper_algorithm_initialized = False
     
     def collect_from_simulation_step(self, robots: List[RobotState], 
                                    tracks_by_robot: Dict[int, List[Track]],
@@ -314,7 +318,70 @@ class TrainingDataCollector:
                                    trust_updates: Dict[int, Dict],
                                    ego_robot: RobotState,
                                    ego_fused_tracks: List[Track]) -> None:
-        """Collect training data from a single simulation step"""
+        """Collect training data from a single simulation step using paper algorithm as ground truth"""
+        
+        # Initialize paper algorithm if needed
+        if not self.paper_algorithm_initialized:
+            self.paper_algorithm.initialize(robots)
+            self.paper_algorithm_initialized = True
+        
+        # Create deep copies of robot states and tracks to avoid affecting main simulation
+        robot_copies = []
+        for robot in robots:
+            robot_copy = RobotState(
+                id=robot.id,
+                position=robot.position.copy(),
+                velocity=robot.velocity.copy(),
+                orientation=robot.orientation,
+                fov_range=robot.fov_range,
+                fov_angle=robot.fov_angle,
+                is_adversarial=robot.is_adversarial,
+                trust_alpha=robot.trust_alpha,
+                trust_beta=robot.trust_beta
+            )
+            robot_copies.append(robot_copy)
+        
+        # Create deep copies of tracks_by_robot and robot_object_tracks to capture paper algorithm changes
+        tracks_by_robot_copy = {}
+        for robot_id, tracks_list in tracks_by_robot.items():
+            tracks_by_robot_copy[robot_id] = []
+            for track in tracks_list:
+                track_copy = Track(
+                    id=track.id,
+                    position=track.position.copy(),
+                    velocity=track.velocity.copy(),
+                    covariance=track.covariance.copy(),
+                    confidence=track.confidence,
+                    timestamp=track.timestamp,
+                    source_robot=track.source_robot,
+                    trust_alpha=track.trust_alpha,
+                    trust_beta=track.trust_beta,
+                    object_id=track.object_id
+                )
+                tracks_by_robot_copy[robot_id].append(track_copy)
+        
+        robot_object_tracks_copy = {}
+        for robot_id, obj_tracks in robot_object_tracks.items():
+            robot_object_tracks_copy[robot_id] = {}
+            for obj_id, track in obj_tracks.items():
+                track_copy = Track(
+                    id=track.id,
+                    position=track.position.copy(),
+                    velocity=track.velocity.copy(),
+                    covariance=track.covariance.copy(),
+                    confidence=track.confidence,
+                    timestamp=track.timestamp,
+                    source_robot=track.source_robot,
+                    trust_alpha=track.trust_alpha,
+                    trust_beta=track.trust_beta,
+                    object_id=track.object_id
+                )
+                robot_object_tracks_copy[robot_id][obj_id] = track_copy
+        
+        # Run paper algorithm to get PSM ground truth and track trust updates
+        paper_trust_updates = self.paper_algorithm.update_trust(
+            robot_copies, tracks_by_robot_copy, robot_object_tracks_copy, 0.0
+        )
         
         # Build graph for this step
         proximal_robots = [r for r in robots if r.id != ego_robot.id]
@@ -324,8 +391,21 @@ class TrainingDataCollector:
             ego_robot, ego_fused_tracks, proximal_robots, proximal_tracks_by_robot
         )
         
-        # Generate labels from trust updates
-        labels = self._generate_labels(robots, ego_fused_tracks, trust_updates)
+        # Collect all tracks for more diverse training data (including false positives)
+        all_ego_tracks = ego_fused_tracks.copy()
+        
+        # Also include raw tracks from ego robot to capture false positives
+        if ego_robot.id in tracks_by_robot:
+            for track in tracks_by_robot[ego_robot.id]:
+                # Add track if not already in fused tracks (avoid duplicates by checking object_id)
+                if track.object_id and not any(ft.object_id == track.object_id for ft in all_ego_tracks):
+                    all_ego_tracks.append(track)
+        
+        # Generate labels from paper algorithm PSMs (including track trust updates)
+        labels = self._generate_labels_from_paper_algorithm(
+            robots, all_ego_tracks, robot_copies, paper_trust_updates,
+            tracks_by_robot, tracks_by_robot_copy, robot_object_tracks, robot_object_tracks_copy
+        )
         
         # Create training example
         example = TrainingExample(
@@ -335,11 +415,190 @@ class TrainingDataCollector:
                 'ego_robot_id': ego_robot.id,
                 'num_robots': len(robots),
                 'num_tracks': len(ego_fused_tracks),
-                'adversarial_robots': [r.id for r in robots if r.is_adversarial]
+                'adversarial_robots': [r.id for r in robots if r.is_adversarial],
+                'used_paper_algorithm': True
             }
         )
         
         self.training_examples.append(example)
+    
+    def _generate_labels_from_paper_algorithm(self, original_robots: List[RobotState], 
+                                            tracks: List[Track], 
+                                            robot_copies_after_paper: List[RobotState],
+                                            paper_trust_updates: Dict[int, Dict],
+                                            original_tracks_by_robot: Dict[int, List[Track]],
+                                            tracks_by_robot_after_paper: Dict[int, List[Track]],
+                                            original_robot_object_tracks: Dict[int, Dict[str, Track]],
+                                            robot_object_tracks_after_paper: Dict[int, Dict[str, Track]]) -> Dict[str, Dict[str, float]]:
+        """Generate training labels from paper algorithm PSMs by computing trust deltas"""
+        labels = {}
+        
+        # Create lookup for original robot states
+        original_robot_lookup = {r.id: r for r in original_robots}
+        paper_robot_lookup = {r.id: r for r in robot_copies_after_paper}
+        
+        # Agent labels from actual trust changes computed by paper algorithm
+        for robot_id, paper_robot in paper_robot_lookup.items():
+            if robot_id in original_robot_lookup:
+                original_robot = original_robot_lookup[robot_id]
+                
+                # Compute the actual PSM that the paper algorithm would have applied
+                # PSM update: new_alpha = old_alpha + confidence * value
+                #            new_beta = old_beta + confidence * (1 - value)
+                
+                # Calculate what PSM the paper algorithm effectively used
+                delta_alpha = paper_robot.trust_alpha - original_robot.trust_alpha
+                delta_beta = paper_robot.trust_beta - original_robot.trust_beta
+                
+                # Reconstruct PSM from deltas (if there was a change)
+                if abs(delta_alpha) > 1e-6 or abs(delta_beta) > 1e-6:
+                    # Total confidence is roughly delta_alpha + delta_beta
+                    total_delta = delta_alpha + delta_beta
+                    if total_delta > 1e-6:
+                        psm_confidence = total_delta
+                        psm_value = delta_alpha / total_delta  # What fraction went to alpha
+                    else:
+                        # Negative PSM - beta increased more than alpha
+                        psm_confidence = max(abs(delta_alpha), abs(delta_beta))
+                        psm_value = 0.1 if delta_alpha > delta_beta else 0.9
+                else:
+                    # No trust change - neutral PSM
+                    psm_confidence = 0.1
+                    psm_value = 0.5
+                
+                # Clamp values to reasonable ranges
+                psm_confidence = np.clip(psm_confidence, 0.01, 2.0)
+                psm_value = np.clip(psm_value, 0.0, 1.0)
+                
+                labels[f"agent_{robot_id}"] = {
+                    'value': psm_value,
+                    'confidence': psm_confidence,
+                    'current_alpha': original_robot.trust_alpha,
+                    'current_beta': original_robot.trust_beta,
+                    'is_trustworthy': 0.0 if original_robot.is_adversarial else 1.0,
+                    'paper_delta_alpha': delta_alpha,
+                    'paper_delta_beta': delta_beta
+                }
+        
+        # Track labels - extract actual trust changes from Paper Algorithm track processing
+        
+        # Create comprehensive track lookup from original states
+        original_track_lookup = {}
+        for track in tracks:
+            original_track_lookup[track.id] = track
+        
+        # Also check tracks in robot_object_tracks (fused tracks)
+        for robot_id, obj_tracks in original_robot_object_tracks.items():
+            for obj_id, track in obj_tracks.items():
+                original_track_lookup[track.id] = track
+        
+        # Create lookup for tracks after paper algorithm processing
+        paper_track_lookup = {}
+        
+        # Get tracks from tracks_by_robot_after_paper
+        for robot_id, tracks_list in tracks_by_robot_after_paper.items():
+            for track in tracks_list:
+                paper_track_lookup[track.id] = track
+        
+        # Get fused tracks from robot_object_tracks_after_paper  
+        for robot_id, obj_tracks in robot_object_tracks_after_paper.items():
+            for obj_id, track in obj_tracks.items():
+                paper_track_lookup[track.id] = track
+        
+        # Generate track PSMs from actual paper algorithm trust changes
+        for track in tracks:
+            original_track = original_track_lookup.get(track.id, track)
+            paper_track = paper_track_lookup.get(track.id)
+            
+            if paper_track and (abs(paper_track.trust_alpha - original_track.trust_alpha) > 1e-6 or 
+                              abs(paper_track.trust_beta - original_track.trust_beta) > 1e-6):
+                # Track trust was updated by paper algorithm - extract PSM
+                delta_alpha = paper_track.trust_alpha - original_track.trust_alpha
+                delta_beta = paper_track.trust_beta - original_track.trust_beta
+                
+                # Reconstruct PSM from trust deltas (similar to agent approach)
+                if abs(delta_alpha) > 1e-6 or abs(delta_beta) > 1e-6:
+                    total_delta = delta_alpha + delta_beta
+                    if total_delta > 1e-6:
+                        psm_confidence = total_delta
+                        psm_value = delta_alpha / total_delta
+                    else:
+                        # Negative PSM or complex update
+                        psm_confidence = max(abs(delta_alpha), abs(delta_beta))
+                        psm_value = 0.2 if delta_alpha < delta_beta else 0.8
+                else:
+                    # No change
+                    psm_confidence = 0.1
+                    psm_value = 0.5
+                
+                # Clamp to reasonable ranges
+                psm_confidence = np.clip(psm_confidence, 0.01, 3.0)
+                psm_value = np.clip(psm_value, 0.0, 1.0)
+                
+                labels[f"track_{track.id}"] = {
+                    'value': psm_value,
+                    'confidence': psm_confidence,
+                    'current_alpha': original_track.trust_alpha,
+                    'current_beta': original_track.trust_beta,
+                    'is_trustworthy': self._determine_track_ground_truth_trustworthy(original_track),
+                    'paper_delta_alpha': delta_alpha,
+                    'paper_delta_beta': delta_beta,
+                    'used_paper_algorithm': True
+                }
+            else:
+                # Track not updated by paper algorithm or no change - use heuristic
+                track_trust = original_track.trust_alpha / (original_track.trust_alpha + original_track.trust_beta)
+                source_robot = original_robot_lookup.get(track.source_robot)
+                
+                if source_robot:
+                    source_trust = source_robot.trust_alpha / (source_robot.trust_alpha + source_robot.trust_beta)
+                    is_source_trustworthy = source_trust > 0.5 and not source_robot.is_adversarial
+                    
+                    if is_source_trustworthy:
+                        psm_value = 0.5 + 0.3 * track.confidence  
+                        psm_confidence = track.confidence * 0.8
+                    else:
+                        psm_value = 0.3 + 0.2 * track.confidence  
+                        psm_confidence = track.confidence * 1.2  # Negative bias
+                else:
+                    psm_value = 0.45 + 0.1 * track.confidence
+                    psm_confidence = track.confidence * 0.6
+                
+                psm_confidence = np.clip(psm_confidence, 0.01, 2.0)
+                psm_value = np.clip(psm_value, 0.0, 1.0)
+                
+                labels[f"track_{track.id}"] = {
+                    'value': psm_value,
+                    'confidence': psm_confidence,
+                    'current_alpha': original_track.trust_alpha,
+                    'current_beta': original_track.trust_beta,
+                    'is_trustworthy': self._determine_track_ground_truth_trustworthy(original_track),
+                    'used_paper_algorithm': False
+                }
+        
+        return labels
+    
+    def _determine_track_ground_truth_trustworthy(self, track: Track) -> float:
+        """
+        Determine if a track is trustworthy based on ground truth information
+        
+        Ground truth trustworthiness:
+        - 1.0: Track corresponds to a real ground truth object (object_id starts with 'gt_obj_')
+        - 0.0: Track is a false positive detection (any other object_id pattern)
+        
+        This provides the actual ground truth label rather than inferring from trust parameters.
+        """
+        if track.object_id and isinstance(track.object_id, str):
+            if track.object_id.startswith('gt_obj_'):
+                # Track corresponds to real ground truth object
+                return 1.0
+            else:
+                # Track is false positive or unknown - not trustworthy
+                return 0.0
+        else:
+            # No object_id or invalid format - assume untrustworthy
+            # This can happen for unassigned tracks or processing errors
+            return 0.0
     
     def _generate_labels(self, robots: List[RobotState], tracks: List[Track], 
                         trust_updates: Dict[int, Dict]) -> Dict[str, Dict[str, float]]:
@@ -467,132 +726,104 @@ class GNNTrainer:
     def _compute_supervised_loss(self, predictions: Dict, labels: Dict[str, Dict[str, float]], 
                                 graph_data: HeteroData) -> torch.Tensor:
         """
-        Compute supervised learning loss using KL divergence between Beta distributions
+        Compute supervised learning loss using simplified trust-based MSE loss
         
-        Loss = KL(updated_trust || ground_truth_trust) + λ * KL(current_trust || updated_trust)
-        
-        Where:
-        - First term: Minimize distance from updated trust to ground truth
-        - Second term: Regularization to prevent drastic updates
+        This is much faster than Beta KL divergence while still capturing trust learning objectives:
+        - Predict PSM values that move current trust toward ground truth
+        - Use MSE between predicted and target trust values
         """
         total_loss = torch.tensor(0.0, requires_grad=True, device=self.device)
-        regularization_weight = 0.1  # λ parameter for regularization
+        num_losses = 0
         
         # Agent losses - only compute if agent predictions exist
         if 'agent' in predictions:
-            agent_features = graph_data['agent'].x  # [num_agents, feature_dim]
-            
             for node_id, label_dict in labels.items():
                 if node_id.startswith('agent_'):
                     agent_id = int(node_id.split('_')[1])
                     if agent_id in graph_data.agent_nodes:
                         idx = graph_data.agent_nodes[agent_id]
                         
-                        # With simplified 1D features, get trust parameters from stored metadata
-                        # The trust parameters and ground truth should be available in labels
+                        # Current trust parameters
                         current_alpha = label_dict.get('current_alpha', 1.0)
                         current_beta = label_dict.get('current_beta', 1.0)
+                        current_trust = current_alpha / (current_alpha + current_beta)
                         
-                        # Ground truth trustworthiness from labels
+                        # Ground truth trustworthiness
                         is_trustworthy = label_dict.get('is_trustworthy', 1.0)
-                        ground_truth_alpha = 10.0 if is_trustworthy else 1.0  # Strong belief
-                        ground_truth_beta = 1.0 if is_trustworthy else 10.0   # Strong belief
+                        target_trust = 0.9 if is_trustworthy > 0.5 else 0.1
                         
-                        # Get GNN predictions for PSM updates
+                        # Get GNN predictions
                         psm_value = predictions['agent']['value'][idx].squeeze()
                         psm_confidence = predictions['agent']['confidence'][idx].squeeze()
                         
-                        # Compute updated trust parameters from PSM
-                        delta_alpha = psm_confidence * psm_value
-                        delta_beta = psm_confidence * (1 - psm_value)
+                        # Compute what the updated trust would be
+                        # PSM update: delta_alpha = confidence * value, delta_beta = confidence * (1-value)
+                        delta_alpha = psm_confidence * torch.clamp(psm_value, 0, 1)
+                        delta_beta = psm_confidence * torch.clamp(1 - psm_value, 0, 1)
                         
                         updated_alpha = current_alpha + delta_alpha
                         updated_beta = current_beta + delta_beta
                         
-                        # Ensure minimum values
-                        updated_alpha = torch.clamp(updated_alpha, min=0.1)
-                        updated_beta = torch.clamp(updated_beta, min=0.1)
+                        updated_trust = updated_alpha / (updated_alpha + updated_beta)
                         
-                        # Convert to tensors for KL divergence computation
-                        current_alpha_t = torch.tensor(current_alpha, device=self.device, requires_grad=False)
-                        current_beta_t = torch.tensor(current_beta, device=self.device, requires_grad=False)
+                        # Loss: MSE between updated trust and target trust
+                        trust_loss = (updated_trust - target_trust) ** 2
                         
-                        ground_truth_alpha_t = torch.tensor(ground_truth_alpha, device=self.device, requires_grad=False)
-                        ground_truth_beta_t = torch.tensor(ground_truth_beta, device=self.device, requires_grad=False)
+                        # Additional loss to encourage appropriate confidence
+                        # High confidence when we're certain, low when uncertain
+                        uncertainty = abs(current_trust - 0.5)  # How far from uncertain (0.5)
+                        target_confidence = 0.3 + 0.6 * uncertainty  # Scale confidence with certainty
+                        confidence_loss = (psm_confidence - target_confidence) ** 2
                         
-                        # Compute KL divergence between Beta distributions
-                        # KL(Beta(α₁,β₁) || Beta(α₂,β₂)) = ln(B(α₂,β₂)/B(α₁,β₁)) + (α₁-α₂)ψ(α₁) + (β₁-β₂)ψ(β₁) + (α₂-α₁+β₂-β₁)ψ(α₁+β₁)
-                        
-                        # Loss 1: KL(updated_trust || ground_truth_trust)
-                        kl_ground_truth = self._beta_kl_divergence(
-                            updated_alpha, updated_beta,
-                            ground_truth_alpha_t, ground_truth_beta_t
-                        )
-                        
-                        # Loss 2: KL(current_trust || updated_trust) for regularization  
-                        kl_regularization = self._beta_kl_divergence(
-                            current_alpha_t, current_beta_t,
-                            updated_alpha, updated_beta
-                        )
-                        
-                        # Combined loss
-                        agent_loss = kl_ground_truth + regularization_weight * kl_regularization
+                        agent_loss = trust_loss + 0.1 * confidence_loss
                         total_loss = total_loss + agent_loss
+                        num_losses += 1
         
-        # Track losses - similar structure
+        # Track losses - similar simplified structure
         if 'track' in predictions:
-            track_features = graph_data['track'].x  # [num_tracks, feature_dim]
-            
             for node_id, label_dict in labels.items():
                 if node_id.startswith('track_'):
                     track_id = node_id.split('_', 1)[1]
                     if track_id in graph_data.track_nodes:
                         idx = graph_data.track_nodes[track_id]
                         
-                        # With simplified 1D features, get trust parameters from labels
+                        # Current trust parameters
                         current_alpha = label_dict.get('current_alpha', 1.0)
                         current_beta = label_dict.get('current_beta', 1.0)
+                        current_trust = current_alpha / (current_alpha + current_beta)
                         
-                        # Ground truth trustworthiness from labels
+                        # Ground truth trustworthiness
                         is_trustworthy = label_dict.get('is_trustworthy', 1.0)
-                        ground_truth_alpha = 5.0 if is_trustworthy > 0.5 else 1.0
-                        ground_truth_beta = 1.0 if is_trustworthy > 0.5 else 5.0
+                        target_trust = 0.8 if is_trustworthy > 0.5 else 0.2
                         
                         # Get GNN predictions
                         psm_value = predictions['track']['value'][idx].squeeze()
                         psm_confidence = predictions['track']['confidence'][idx].squeeze()
                         
-                        # Compute updated parameters
-                        delta_alpha = psm_confidence * psm_value
-                        delta_beta = psm_confidence * (1 - psm_value)
+                        # Compute updated trust
+                        delta_alpha = psm_confidence * torch.clamp(psm_value, 0, 1)
+                        delta_beta = psm_confidence * torch.clamp(1 - psm_value, 0, 1)
                         
                         updated_alpha = current_alpha + delta_alpha
                         updated_beta = current_beta + delta_beta
                         
-                        updated_alpha = torch.clamp(updated_alpha, min=0.1)
-                        updated_beta = torch.clamp(updated_beta, min=0.1)
+                        updated_trust = updated_alpha / (updated_alpha + updated_beta)
                         
-                        # Convert to tensors
-                        current_alpha_t = torch.tensor(current_alpha, device=self.device, requires_grad=False)
-                        current_beta_t = torch.tensor(current_beta, device=self.device, requires_grad=False)
+                        # Loss: MSE between updated trust and target trust
+                        trust_loss = (updated_trust - target_trust) ** 2
                         
-                        ground_truth_alpha_t = torch.tensor(ground_truth_alpha, device=self.device, requires_grad=False)
-                        ground_truth_beta_t = torch.tensor(ground_truth_beta, device=self.device, requires_grad=False)
+                        # Confidence loss
+                        uncertainty = abs(current_trust - 0.5)
+                        target_confidence = 0.2 + 0.5 * uncertainty
+                        confidence_loss = (psm_confidence - target_confidence) ** 2
                         
-                        # Compute KL divergences
-                        kl_ground_truth = self._beta_kl_divergence(
-                            updated_alpha, updated_beta,
-                            ground_truth_alpha_t, ground_truth_beta_t
-                        )
-                        
-                        kl_regularization = self._beta_kl_divergence(
-                            current_alpha_t, current_beta_t,
-                            updated_alpha, updated_beta
-                        )
-                        
-                        # Combined loss
-                        track_loss = kl_ground_truth + regularization_weight * kl_regularization
+                        track_loss = trust_loss + 0.1 * confidence_loss
                         total_loss = total_loss + track_loss
+                        num_losses += 1
+        
+        # Average the loss
+        if num_losses > 0:
+            total_loss = total_loss / num_losses
         
         return total_loss
     
@@ -660,7 +891,7 @@ class NeuralSymbolicTrustAlgorithm(TrustAlgorithm):
         print("Neural Symbolic Trust Algorithm initialized with GNN")
     
     def update_trust(self, robots: List[RobotState], tracks_by_robot: Dict[int, List[Track]], 
-                    robot_object_tracks: Dict[int, Dict[str, Track]], time: float) -> Dict[int, Dict]:
+                    robot_object_tracks: Dict[int, Dict[str, Track]], simulation_time: float) -> Dict[int, Dict]:
         """Update trust using GNN-based neural symbolic reasoning"""
         
         trust_updates = {}

@@ -405,7 +405,7 @@ class SimulationEnvironment:
         
         # Parameters for adversarial behavior
         false_negative_rate = 0.0
-        false_positive_rate = 1.0
+        false_positive_rate = 0.5
         position_noise_std = noise_std * 0.5
         velocity_noise_std = 0.2
         

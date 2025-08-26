@@ -47,13 +47,34 @@ def show_gpu_status():
 class AlgorithmComparator:
     """Compares GNN and Paper trust algorithms"""
     
+    def _find_best_gpu(self):
+        """Find GPU with most free memory"""
+        if not torch.cuda.is_available():
+            return None
+        
+        best_gpu = 0
+        max_free_memory = 0
+        
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            allocated = torch.cuda.memory_allocated(i)
+            free_memory = props.total_memory - allocated
+            
+            if free_memory > max_free_memory:
+                max_free_memory = free_memory
+                best_gpu = i
+        
+        return best_gpu
+    
     def __init__(self, device: str = "auto"):
         # Handle different device specifications
         if device == "auto":
             if torch.cuda.is_available():
-                # Use first available GPU
-                self.device = torch.device('cuda:0')
-                gpu_id = 0
+                # Find GPU with most free memory
+                best_gpu = self._find_best_gpu()
+                self.device = torch.device(f'cuda:{best_gpu}')
+                gpu_id = best_gpu
+                print(f"🔍 Auto-selected GPU {best_gpu} (most free memory)")
             else:
                 self.device = torch.device('cpu')
                 gpu_id = None
