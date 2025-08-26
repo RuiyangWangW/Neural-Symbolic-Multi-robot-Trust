@@ -673,6 +673,8 @@ class GNNTrainer:
         """Train using supervised learning"""
         losses = []
         
+        print(f"Starting training with {len(training_examples)} examples")
+        
         for epoch in range(epochs):
             epoch_loss = 0.0
             num_batches = 0
@@ -687,8 +689,21 @@ class GNNTrainer:
             avg_loss = epoch_loss / max(1, num_batches)
             losses.append(avg_loss)
             
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch}/{epochs}, Loss: {avg_loss:.4f}")
+            if epoch % 10 == 0 or epoch < 5:
+                print(f"Epoch {epoch}/{epochs}, Loss: {avg_loss:.6f}")
+                
+                # Debug: Check if model parameters are changing
+                if epoch == 0:
+                    self._first_params = [p.clone() for p in self.model.parameters()]
+                elif epoch == 10:
+                    param_changes = []
+                    for i, p in enumerate(self.model.parameters()):
+                        change = torch.mean(torch.abs(p - self._first_params[i])).item()
+                        param_changes.append(change)
+                    avg_change = sum(param_changes) / len(param_changes)
+                    print(f"Average parameter change after 10 epochs: {avg_change:.6f}")
+                    if avg_change < 1e-6:
+                        print("WARNING: Model parameters barely changing - possible training issue!")
         
         return losses
     
@@ -696,8 +711,17 @@ class GNNTrainer:
         """Train a single batch in supervised mode"""
         total_loss = 0.0
         
-        for example in batch:
+        # Enable debug for first example of first batch
+        if not hasattr(self, '_batch_count'):
+            self._batch_count = 0
+        
+        for i, example in enumerate(batch):
             self.optimizer.zero_grad()
+            
+            # Enable debug output for first example
+            if self._batch_count == 0 and i == 0:
+                self._debug_loss = True
+                print(f"    Processing example with {len(example.labels)} labels")
             
             # Move data to device
             x_dict = {k: v.to(self.device) for k, v in example.graph_data.x_dict.items()}
@@ -712,14 +736,25 @@ class GNNTrainer:
             # Forward pass
             predictions = self.model(x_dict, edge_index_dict)
             
+            # Debug predictions for first example
+            if self._batch_count == 0 and i == 0:
+                for pred_type, pred_dict in predictions.items():
+                    print(f"    {pred_type} predictions: value={pred_dict['value'].mean().item():.4f}, confidence={pred_dict['confidence'].mean().item():.4f}")
+            
             # Compute loss
             loss = self._compute_supervised_loss(predictions, example.labels, example.graph_data)
+            
+            # Check if loss has gradients
+            if self._batch_count == 0 and i == 0:
+                print(f"    Loss requires_grad: {loss.requires_grad}, Loss value: {loss.item():.6f}")
             
             # Backward pass
             loss.backward()
             self.optimizer.step()
             
             total_loss += loss.item()
+        
+        self._batch_count += 1
         
         return total_loss / len(batch)
     
@@ -823,9 +858,17 @@ class GNNTrainer:
         
         # Average the loss
         if num_losses > 0:
-            total_loss = total_loss / num_losses
-        
-        return total_loss
+            avg_loss = total_loss / num_losses
+            # Debug first batch to check if loss computation is working
+            if hasattr(self, '_debug_loss') and self._debug_loss:
+                print(f"    Loss computation: {num_losses} nodes, avg loss: {avg_loss.item():.6f}")
+                self._debug_loss = False
+            return avg_loss
+        else:
+            if hasattr(self, '_debug_loss') and self._debug_loss:
+                print("    WARNING: No valid loss computed - no matching nodes!")
+                self._debug_loss = False
+            return torch.tensor(0.0, requires_grad=True, device=self.device)
     
     def _beta_kl_divergence(self, alpha1: torch.Tensor, beta1: torch.Tensor, 
                            alpha2: torch.Tensor, beta2: torch.Tensor) -> torch.Tensor:
@@ -963,40 +1006,45 @@ class NeuralSymbolicTrustAlgorithm(TrustAlgorithm):
         """Apply GNN predictions as PSMs to update trust distributions"""
         
         # Update agent trust based on GNN predictions
-        if 'agent' in predictions:
-            for robot_idx, robot in enumerate(robots):
-                if robot_idx < predictions['agent']['value'].shape[0]:
-                    psm_value = predictions['agent']['value'][robot_idx].item()
-                    psm_confidence = predictions['agent']['confidence'][robot_idx].item()
-                    
-                    # Apply PSM using Beta-Bernoulli update (similar to paper algorithm)
-                    delta_alpha = psm_confidence * psm_value if psm_value > 0 else 0
-                    delta_beta = psm_confidence * (1 - psm_value) if psm_value < 0 else 0
-                    
-                    robot.trust_alpha += delta_alpha
-                    robot.trust_beta += delta_beta
-                    
-                    # Ensure minimum values
-                    robot.trust_alpha = max(0.1, robot.trust_alpha)
-                    robot.trust_beta = max(0.1, robot.trust_beta)
+        if 'agent' in predictions and hasattr(graph_data, 'agent_nodes'):
+            for robot in robots:
+                if robot.id in graph_data.agent_nodes:
+                    idx = graph_data.agent_nodes[robot.id]
+                    if idx < predictions['agent']['value'].shape[0]:
+                        psm_value = torch.clamp(predictions['agent']['value'][idx], 0, 1).item()
+                        psm_confidence = torch.clamp(predictions['agent']['confidence'][idx], 0, 5).item()
+                        
+                        # Apply PSM using proper Beta-Bernoulli update
+                        # PSM value is probability of positive evidence
+                        delta_alpha = psm_confidence * psm_value
+                        delta_beta = psm_confidence * (1 - psm_value)
+                        
+                        robot.trust_alpha += delta_alpha
+                        robot.trust_beta += delta_beta
+                        
+                        # Ensure minimum values
+                        robot.trust_alpha = max(0.1, robot.trust_alpha)
+                        robot.trust_beta = max(0.1, robot.trust_beta)
         
         # Update track trust based on GNN predictions
-        if 'track' in predictions:
-            for track_idx, track in enumerate(tracks):
-                if track_idx < predictions['track']['value'].shape[0]:
-                    psm_value = predictions['track']['value'][track_idx].item()
-                    psm_confidence = predictions['track']['confidence'][track_idx].item()
-                    
-                    # Apply PSM to track trust
-                    delta_alpha = psm_confidence * psm_value if psm_value > 0 else 0
-                    delta_beta = psm_confidence * (1 - psm_value) if psm_value < 0 else 0
-                    
-                    track.trust_alpha += delta_alpha
-                    track.trust_beta += delta_beta
-                    
-                    # Ensure minimum values
-                    track.trust_alpha = max(0.1, track.trust_alpha)
-                    track.trust_beta = max(0.1, track.trust_beta)
+        if 'track' in predictions and hasattr(graph_data, 'track_nodes'):
+            for track in tracks:
+                if track.id in graph_data.track_nodes:
+                    idx = graph_data.track_nodes[track.id]
+                    if idx < predictions['track']['value'].shape[0]:
+                        psm_value = torch.clamp(predictions['track']['value'][idx], 0, 1).item()
+                        psm_confidence = torch.clamp(predictions['track']['confidence'][idx], 0, 5).item()
+                        
+                        # Apply PSM to track trust
+                        delta_alpha = psm_confidence * psm_value
+                        delta_beta = psm_confidence * (1 - psm_value)
+                        
+                        track.trust_alpha += delta_alpha
+                        track.trust_beta += delta_beta
+                        
+                        # Ensure minimum values
+                        track.trust_alpha = max(0.1, track.trust_alpha)
+                        track.trust_beta = max(0.1, track.trust_beta)
     
     def train_model(self, training_data_file: str, epochs: int = 100) -> List[float]:
         """Train the GNN model from collected data"""
