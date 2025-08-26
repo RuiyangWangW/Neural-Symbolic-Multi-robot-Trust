@@ -1,0 +1,25 @@
+# Core scientific computing packages
+numpy>=2.3.0
+matplotlib>=3.10.0
+scipy>=1.16.0
+scikit-learn>=1.7.0
+
+# Machine learning and deep learning
+torch>=2.8.0
+torchvision>=0.23.0
+torchaudio>=2.8.0
+
+# Graph neural networks
+torch-geometric>=2.6.0
+torch-scatter>=2.1.0
+torch-sparse>=0.6.0
+pyg-lib>=0.4.0
+
+# Data manipulation and visualization
+pandas>=2.3.0
+seaborn>=0.13.0
+
+# Additional utilities
+tqdm>=4.67.0
+requests>=2.32.0
+
