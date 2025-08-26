@@ -13,6 +13,7 @@ import json
 
 from simulation_environment import SimulationEnvironment
 from neural_symbolic_trust_algorithm import NeuralSymbolicTrustAlgorithm
+from paper_trust_algorithm import PaperTrustAlgorithm
 
 
 class GNNDataCollector:
@@ -222,84 +223,59 @@ class GNNDataCollector:
         """Run a scenario with random temporal sampling"""
         examples_before = len(neural_algorithm.training_data_collector.training_examples)
         
-        # Create environment with scenario parameters
+        # Create environment with paper trust algorithm for ground truth
+        paper_algorithm = PaperTrustAlgorithm()
         env = SimulationEnvironment(
             num_robots=scenario['num_robots'],
             num_targets=scenario['num_targets'],
             world_size=scenario['world_size'],
             adversarial_ratio=scenario['adversarial_ratio'],
-            trust_algorithm=neural_algorithm
+            trust_algorithm=paper_algorithm
         )
+        
+        # Track steps where we've already collected data to avoid duplicates
+        collected_steps = set()
         
         # Set additional parameters if the environment supports them
         self._configure_environment_parameters(env, scenario)
         
-        # Generate random sampling points throughout the simulation
-        # This ensures we collect data from different temporal stages
-        num_samples = total_steps // sample_interval
+        # Calculate sampling points based on sample_interval parameter
+        # This creates natural sampling based on the configured interval
+        sample_steps = list(range(sample_interval, total_steps, sample_interval))
+        print(f"   🎯 Will collect data at {len(sample_steps)} steps: every {sample_interval} steps")
         
-        # Create valid range for sampling points
-        sampling_start = min(sample_interval, total_steps // 2)
-        sampling_end = max(sampling_start + 1, total_steps - sample_interval)
-        
-        if sampling_end > sampling_start and num_samples > 0:
-            sample_range = list(range(sampling_start, sampling_end))
-            sample_size = min(num_samples, len(sample_range), total_steps // sample_interval // 2)
-            
-            if sample_size > 0 and len(sample_range) > 0:
-                sample_points = sorted(np.random.choice(
-                    sample_range, 
-                    size=sample_size,
-                    replace=False
-                ))
-            else:
-                sample_points = []
-        else:
-            sample_points = []
-        
-        # Add some systematic sampling points for stability  
-        systematic_start = min(100, total_steps // 4)
-        if systematic_start < total_steps:
-            systematic_points = list(range(systematic_start, total_steps, max(sample_interval * 2, total_steps // 5)))
-        else:
-            systematic_points = []
-            
-        all_sample_points = sorted(set(sample_points + systematic_points))
-        
-        sample_windows = []
-        for point in all_sample_points:
-            # Create random window around sample point
-            window_size = np.random.randint(10, 30)  # Random window size
-            start = max(0, point - window_size // 2)
-            end = min(total_steps, point + window_size // 2)
-            sample_windows.append((start, end))
-        
-        # Run simulation with temporal sampling
-        current_window_idx = 0
-        collecting = False
-        
+        # Run simulation with limited data collection
         for step in range(total_steps):
+            # Run simulation step
             env.step()
             
-            # Check if we should start/stop collecting
-            if current_window_idx < len(sample_windows):
-                window_start, window_end = sample_windows[current_window_idx]
+            # Collect data only at specific sample steps, and only once per step
+            if step in sample_steps and step not in collected_steps:
+                # Temporarily disable the automatic collection in neural algorithm
+                original_learning_mode = neural_algorithm.learning_mode
+                neural_algorithm.learning_mode = False
                 
-                if step == window_start:
-                    collecting = True
-                elif step == window_end:
-                    collecting = False
-                    current_window_idx += 1
-            
-            # Only collect data during sampling windows
-            if not collecting:
-                # Temporarily disable data collection
-                if hasattr(neural_algorithm.training_data_collector, 'enabled'):
-                    neural_algorithm.training_data_collector.enabled = False
-            else:
-                # Re-enable data collection
-                if hasattr(neural_algorithm.training_data_collector, 'enabled'):
-                    neural_algorithm.training_data_collector.enabled = True
+                # Find a robot with tracks to use as ego robot for data collection
+                if env.robots and any(robot_object_tracks for robot_object_tracks in env.robot_object_tracks.values()):
+                    # Find a robot with tracks to use as ego robot
+                    ego_robot = None
+                    ego_tracks = []
+                    for robot in env.robots:
+                        robot_tracks = list(env.robot_object_tracks.get(robot.id, {}).values())
+                        if robot_tracks:
+                            ego_robot = robot
+                            ego_tracks = robot_tracks
+                            break
+                    
+                    if ego_robot:
+                        neural_algorithm.training_data_collector.collect_from_simulation_step(
+                            env.robots, env.tracks, env.robot_object_tracks,
+                            {}, ego_robot, ego_tracks
+                        )
+                
+                # Restore learning mode and mark step as collected
+                neural_algorithm.learning_mode = original_learning_mode
+                collected_steps.add(step)
         
         examples_after = len(neural_algorithm.training_data_collector.training_examples)
         return examples_after - examples_before
