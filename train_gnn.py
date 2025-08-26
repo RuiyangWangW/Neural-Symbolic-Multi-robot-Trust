@@ -167,15 +167,21 @@ class GNNTrainer:
             torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
             print(f"   🔧 Enabled cuDNN benchmark for faster training")
         
-        # Re-create trainer with correct device after moving model
-        from neural_symbolic_trust_algorithm import GNNTrainer as Trainer
-        neural_algorithm.trainer = Trainer(neural_algorithm.model, device=self.device)
+        # Update the trainer's device to match our selected device
+        if neural_algorithm.trainer is not None:
+            neural_algorithm.trainer.device = self.device
+            # Update optimizer to use the moved model parameters
+            neural_algorithm.trainer.optimizer = torch.optim.Adam(neural_algorithm.model.parameters(), 
+                                                                 lr=neural_algorithm.trainer.optimizer.param_groups[0]['lr'])
         
         # Get model info
         model_info = neural_algorithm.get_model_info()
         print(f"\n🔧 Model Information:")
         print(f"   Type: {model_info['model_type']}")
         print(f"   Parameters: {model_info['num_parameters']:,}")
+        
+        # Validate training data diversity before training
+        self._validate_training_data(training_data_file)
         
         # Train the model
         print(f"\n🚀 Starting training...")
@@ -245,6 +251,55 @@ class GNNTrainer:
         plt.close()  # Close figure to free memory
         
         print(f"   📊 Training curve saved to: {plot_file}")
+    
+    def _validate_training_data(self, training_data_file: str):
+        """Validate that training data has proper diversity"""
+        import pickle
+        from collections import Counter
+        
+        try:
+            with open(training_data_file, 'rb') as f:
+                examples = pickle.load(f)
+        except Exception as e:
+            print(f"❌ Failed to load training data: {e}")
+            return
+        
+        print(f"🔍 TRAINING DATA VALIDATION:")
+        print(f"   📊 Total examples: {len(examples):,}")
+        
+        # Analyze agent diversity
+        agent_counts = []
+        track_counts = []
+        
+        for example in examples[:1000]:  # Sample first 1000 for speed
+            agent_labels = sum(1 for k in example.labels.keys() if k.startswith('agent_'))
+            track_labels = sum(1 for k in example.labels.keys() if k.startswith('track_'))
+            agent_counts.append(agent_labels)
+            track_counts.append(track_labels)
+        
+        agent_diversity = len(set(agent_counts))
+        track_diversity = len(set(track_counts))
+        
+        print(f"   🤖 Agent count range: {min(agent_counts)} - {max(agent_counts)} ({agent_diversity} unique values)")
+        print(f"   🎯 Track count range: {min(track_counts)} - {max(track_counts)} ({track_diversity} unique values)")
+        
+        # Show distribution
+        agent_counter = Counter(agent_counts)
+        most_common_agents = agent_counter.most_common(3)
+        print(f"   📈 Most common agent counts: {most_common_agents}")
+        
+        # Validation checks
+        if agent_diversity < 2:
+            print(f"   ⚠️  WARNING: Low agent diversity ({agent_diversity} unique values)")
+            print(f"       This suggests data collection issues - should see 4-12 agents")
+        else:
+            print(f"   ✅ Good agent diversity ({agent_diversity} unique values)")
+        
+        if len(examples) < 1000:
+            print(f"   ⚠️  WARNING: Small dataset ({len(examples)} examples)")
+            print(f"       Consider collecting more data for better training")
+        else:
+            print(f"   ✅ Adequate dataset size ({len(examples):,} examples)")
 
 
 def main():

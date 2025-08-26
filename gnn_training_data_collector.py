@@ -81,7 +81,7 @@ class GNNDataCollector:
             
             # Run this scenario and collect samples
             examples_from_scenario = self._run_scenario_with_sampling(
-                neural_algorithm, scenario, steps_per_scenario, sample_intervals
+                neural_algorithm, scenario, steps_per_scenario, sample_intervals, scenario_idx
             )
             
             total_examples_collected = len(neural_algorithm.training_data_collector.training_examples)
@@ -219,7 +219,7 @@ class GNNDataCollector:
         
         return scenarios
     
-    def _run_scenario_with_sampling(self, neural_algorithm, scenario, total_steps, sample_interval):
+    def _run_scenario_with_sampling(self, neural_algorithm, scenario, total_steps, sample_interval, scenario_idx=0):
         """Run a scenario with random temporal sampling"""
         examples_before = len(neural_algorithm.training_data_collector.training_examples)
         
@@ -261,12 +261,14 @@ class GNNDataCollector:
                 original_learning_mode = neural_algorithm.learning_mode
                 neural_algorithm.learning_mode = False
                 
-                # Loop through all robots with tracks to collect multiple training examples
+                # Loop through robots with tracks to collect training examples
+                # Each robot with tracks becomes an ego robot for one training example
                 if env.robots:
                     collected_for_step = 0
+                    
                     for robot in env.robots:
                         robot_tracks = list(env.robot_object_tracks.get(robot.id, {}).values())
-                        if robot_tracks:  # Only collect if this robot has tracks
+                        if robot_tracks:  # Only collect if this robot has tracks to serve as ego
                             # Collect training data using this robot as ego robot
                             neural_algorithm.training_data_collector.collect_from_simulation_step(
                                 env.robots, env.tracks, env.robot_object_tracks,
