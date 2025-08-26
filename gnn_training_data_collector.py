@@ -233,6 +233,11 @@ class GNNDataCollector:
             trust_algorithm=paper_algorithm
         )
         
+        # Replace the neural algorithm's paper algorithm with the simulation's instance
+        # This ensures training data uses the continuously updated trust state
+        neural_algorithm.training_data_collector.paper_algorithm = paper_algorithm
+        neural_algorithm.training_data_collector.paper_algorithm_initialized = True
+        
         # Track steps where we've already collected data to avoid duplicates
         collected_steps = set()
         
@@ -243,6 +248,7 @@ class GNNDataCollector:
         # This creates natural sampling based on the configured interval
         sample_steps = list(range(sample_interval, total_steps, sample_interval))
         print(f"   🎯 Will collect data at {len(sample_steps)} steps: every {sample_interval} steps")
+        print(f"   📊 Expected examples: {len(sample_steps)} steps × ~{scenario['num_robots']} robots = ~{len(sample_steps) * scenario['num_robots']} total")
         
         # Run simulation with limited data collection
         for step in range(total_steps):
@@ -255,23 +261,21 @@ class GNNDataCollector:
                 original_learning_mode = neural_algorithm.learning_mode
                 neural_algorithm.learning_mode = False
                 
-                # Find a robot with tracks to use as ego robot for data collection
-                if env.robots and any(robot_object_tracks for robot_object_tracks in env.robot_object_tracks.values()):
-                    # Find a robot with tracks to use as ego robot
-                    ego_robot = None
-                    ego_tracks = []
+                # Loop through all robots with tracks to collect multiple training examples
+                if env.robots:
+                    collected_for_step = 0
                     for robot in env.robots:
                         robot_tracks = list(env.robot_object_tracks.get(robot.id, {}).values())
-                        if robot_tracks:
-                            ego_robot = robot
-                            ego_tracks = robot_tracks
-                            break
+                        if robot_tracks:  # Only collect if this robot has tracks
+                            # Collect training data using this robot as ego robot
+                            neural_algorithm.training_data_collector.collect_from_simulation_step(
+                                env.robots, env.tracks, env.robot_object_tracks,
+                                {}, robot, robot_tracks
+                            )
+                            collected_for_step += 1
                     
-                    if ego_robot:
-                        neural_algorithm.training_data_collector.collect_from_simulation_step(
-                            env.robots, env.tracks, env.robot_object_tracks,
-                            {}, ego_robot, ego_tracks
-                        )
+                    if collected_for_step > 0:
+                        print(f"      Collected {collected_for_step} training examples at step {step}")
                 
                 # Restore learning mode and mark step as collected
                 neural_algorithm.learning_mode = original_learning_mode
@@ -317,9 +321,9 @@ def main():
     # Collect diverse training data with optimized parameters for server
     training_data_file = collector.collect_diverse_training_data(
         num_scenarios=25,           # Multiple diverse scenarios
-        steps_per_scenario=500,     # Steps per scenario  
-        sample_intervals=40,        # Sampling interval
-        target_examples=8000,       # Target number of examples
+        steps_per_scenario=600,     # Steps per scenario  
+        sample_intervals=20,        # Sampling interval
+        target_examples=100000,       # Target number of examples
         output_file="gnn_training_data.pkl"
     )
     
