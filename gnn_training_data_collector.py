@@ -121,8 +121,26 @@ class GNNDataCollector:
         }
         
         metadata_file = output_file.replace('.pkl', '_metadata.json')
+        
+        # Convert numpy types to Python native types for JSON serialization
+        def convert_numpy_types(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {key: convert_numpy_types(value) for key, value in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_numpy_types(item) for item in obj]
+            else:
+                return obj
+        
+        metadata_serializable = convert_numpy_types(metadata)
+        
         with open(metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=2)
+            json.dump(metadata_serializable, f, indent=2)
         
         print(f"\n✅ Diverse training data collection completed!")
         print(f"   📊 Total examples: {total_examples_collected:,}")
@@ -149,45 +167,45 @@ class GNNDataCollector:
         """Generate diverse scenario configurations"""
         scenarios = []
         
-        # Define parameter ranges for diversity
+        # Define parameter ranges for systematic testing scenarios - Discrete uniform selection
         robot_counts = [4, 5, 6, 7, 8, 10, 12]
         target_multipliers = [2.0, 2.5, 3.0]  # targets = robots * multiplier
-        adversarial_ratios = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
+        adversarial_ratios = [0.2, 0.3, 0.4, 0.5]  # Exactly 4 values for uniform selection
         world_sizes = [(40, 40), (50, 50), (60, 60), (80, 80), (100, 100)]
         
-        # Sensor error rates (false positive and false negative)
-        false_positive_rates = [0.0, 0.01, 0.02, 0.05, 0.1, 0.15]
-        false_negative_rates = [0.0, 0.01, 0.02, 0.05, 0.1, 0.15]
+        # Sensor error rates - Exact values for systematic testing with uniform probability
+        false_positive_rates = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]  # 10 values
+        false_negative_rates = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]            # 8 values
         
         for i in range(num_scenarios):
             # Select parameters with some correlation but maintain diversity
             num_robots = np.random.choice(robot_counts)
             num_targets = int(num_robots * np.random.choice(target_multipliers))
             
-            # Ensure adversarial ratio makes sense (at least 1 adversarial robot if ratio > 0)
-            adversarial_ratio = np.random.choice(adversarial_ratios)
-            min_adversarial = 1 if adversarial_ratio > 0 else 0
-            if int(num_robots * adversarial_ratio) < min_adversarial:
-                adversarial_ratio = min_adversarial / num_robots
+            # Select adversarial ratio from discrete set, ensuring at least 1 adversarial robot
+            # Filter valid adversarial ratios for this robot count (must result in >= 1 adversarial robot)
+            valid_adversarial_ratios = [ratio for ratio in adversarial_ratios 
+                                      if int(num_robots * ratio) >= 1]
             
-            # Sensor parameters - sometimes correlated, sometimes independent
-            if np.random.random() < 0.3:  # 30% chance of correlated errors
-                base_error = np.random.choice([0.01, 0.02, 0.05, 0.1])
-                fp_rate = base_error + np.random.uniform(-0.01, 0.01)
-                fn_rate = base_error + np.random.uniform(-0.01, 0.01)
-            else:  # Independent error rates
-                fp_rate = np.random.choice(false_positive_rates)
-                fn_rate = np.random.choice(false_negative_rates)
+            if valid_adversarial_ratios:
+                adversarial_ratio = np.random.choice(valid_adversarial_ratios)
+            else:
+                # Fallback: if no valid ratios, use minimum that gives 1 adversarial robot
+                # This should rarely happen with robot_counts=[4,5,6,7,8,10,12] and ratios=[0.2,0.3,0.4,0.5]
+                adversarial_ratio = 1.0 / num_robots
             
-            # Clamp to valid ranges
-            fp_rate = max(0.0, min(0.2, fp_rate))
-            fn_rate = max(0.0, min(0.2, fn_rate))
+            # Sensor parameters - uniform selection from discrete values
+            # Always use independent selection for systematic coverage (no correlation)
+            fp_rate = np.random.choice(false_positive_rates)  # Uniform selection from discrete FP rates
+            fn_rate = np.random.choice(false_negative_rates)  # Uniform selection from discrete FN rates
+            
+            # No clamping needed - values are already from the exact discrete sets
             
             scenario = {
                 'num_robots': num_robots,
                 'num_targets': num_targets,
                 'adversarial_ratio': adversarial_ratio,
-                'world_size': np.random.choice(world_sizes),
+                'world_size': world_sizes[np.random.randint(len(world_sizes))],
                 'false_positive_rate': fp_rate,
                 'false_negative_rate': fn_rate,
                 # Additional diversity parameters
@@ -219,14 +237,33 @@ class GNNDataCollector:
         # Generate random sampling points throughout the simulation
         # This ensures we collect data from different temporal stages
         num_samples = total_steps // sample_interval
-        sample_points = sorted(np.random.choice(
-            range(sample_interval, total_steps - sample_interval), 
-            size=min(num_samples, total_steps // sample_interval // 2),
-            replace=False
-        ))
         
-        # Add some systematic sampling points for stability
-        systematic_points = list(range(100, total_steps, sample_interval * 2))
+        # Create valid range for sampling points
+        sampling_start = min(sample_interval, total_steps // 2)
+        sampling_end = max(sampling_start + 1, total_steps - sample_interval)
+        
+        if sampling_end > sampling_start and num_samples > 0:
+            sample_range = list(range(sampling_start, sampling_end))
+            sample_size = min(num_samples, len(sample_range), total_steps // sample_interval // 2)
+            
+            if sample_size > 0 and len(sample_range) > 0:
+                sample_points = sorted(np.random.choice(
+                    sample_range, 
+                    size=sample_size,
+                    replace=False
+                ))
+            else:
+                sample_points = []
+        else:
+            sample_points = []
+        
+        # Add some systematic sampling points for stability  
+        systematic_start = min(100, total_steps // 4)
+        if systematic_start < total_steps:
+            systematic_points = list(range(systematic_start, total_steps, max(sample_interval * 2, total_steps // 5)))
+        else:
+            systematic_points = []
+            
         all_sample_points = sorted(set(sample_points + systematic_points))
         
         sample_windows = []
@@ -304,7 +341,7 @@ def main():
     # Collect diverse training data with optimized parameters for server
     training_data_file = collector.collect_diverse_training_data(
         num_scenarios=25,           # Multiple diverse scenarios
-        steps_per_scenario=800,     # Steps per scenario  
+        steps_per_scenario=500,     # Steps per scenario  
         sample_intervals=40,        # Sampling interval
         target_examples=8000,       # Target number of examples
         output_file="gnn_training_data.pkl"

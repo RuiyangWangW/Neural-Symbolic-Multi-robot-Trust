@@ -13,7 +13,6 @@ from typing import List, Dict, Tuple, Optional
 import random
 from scipy.stats import beta
 from scipy.spatial.distance import euclidean
-import json
 
 # Import the trust algorithm interfaces
 from trust_algorithm import TrustAlgorithm, RobotState, Track
@@ -610,21 +609,6 @@ class SimulationEnvironment:
                           for robot_id, fp_store in self.fp_objects_by_robot.items() if fp_store}
         }
     
-    def collect_training_data(self, num_steps: int = 1000) -> List[Dict]:
-        """Collect training data for neural symbolic learning"""
-        training_data = []
-        
-        for _ in range(num_steps):
-            step_data = self.step()
-            training_data.append(step_data)
-        
-        return training_data
-    
-    def save_data(self, data: List[Dict], filename: str):
-        """Save collected data to file"""
-        with open(filename, 'w') as f:
-            json.dump(data, f, indent=2)
-        print(f"Saved {len(data)} simulation steps to {filename}")
     
     def switch_trust_algorithm(self, new_algorithm: TrustAlgorithm):
         """Switch to a different trust algorithm"""
@@ -778,9 +762,9 @@ def main():
         trust_algorithm=paper_algorithm
     )
     
-    # Collect some data (using 500 steps like original)
-    paper_data = env_paper.collect_training_data(num_steps=500)
-    env_paper.save_data(paper_data, 'paper_trust_data.json')
+    # Run simulation (using 500 steps like original)
+    for _ in range(500):
+        env_paper.step()
     env_paper.visualize_current_state('paper_algorithm_state.png')
     
     """
