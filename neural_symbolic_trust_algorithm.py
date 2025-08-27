@@ -801,8 +801,9 @@ class GNNTrainer:
                         
                         updated_trust = updated_alpha / (updated_alpha + updated_beta)
                         
-                        # Loss: MSE between updated trust and target trust
-                        trust_loss = (updated_trust - target_trust) ** 2
+                        # Loss: Scaled MSE between updated trust and target trust
+                        # Scale by 10 to improve gradient flow for trust values in [0,1]
+                        trust_loss = 10.0 * (updated_trust - target_trust) ** 2
                         
                         # Additional loss to encourage appropriate confidence
                         # High confidence when we're certain, low when uncertain
@@ -844,8 +845,9 @@ class GNNTrainer:
                         
                         updated_trust = updated_alpha / (updated_alpha + updated_beta)
                         
-                        # Loss: MSE between updated trust and target trust
-                        trust_loss = (updated_trust - target_trust) ** 2
+                        # Loss: Scaled MSE between updated trust and target trust
+                        # Scale by 10 to improve gradient flow for trust values in [0,1]
+                        trust_loss = 10.0 * (updated_trust - target_trust) ** 2
                         
                         # Confidence loss
                         uncertainty = abs(current_trust - 0.5)
