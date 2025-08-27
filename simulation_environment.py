@@ -47,6 +47,7 @@ class SimulationEnvironment:
     def __init__(self, num_robots: int = 5, num_targets: int = 10, 
                  world_size: Tuple[float, float] = (100.0, 100.0),
                  adversarial_ratio: float = 0.3,
+                 proximal_range: float = 50.0,
                  trust_algorithm: Optional[TrustAlgorithm] = None):
         """
         Initialize simulation environment
@@ -56,12 +57,14 @@ class SimulationEnvironment:
             num_targets: Number of ground truth objects
             world_size: Size of the simulation world
             adversarial_ratio: Fraction of robots that are adversarial
+            proximal_range: Maximum distance for robots to be considered proximal
             trust_algorithm: Trust algorithm to use (defaults to paper's method)
         """
         self.num_robots = num_robots
         self.num_targets = num_targets
         self.world_size = world_size
         self.adversarial_ratio = adversarial_ratio
+        self.proximal_range = proximal_range
         
         # Initialize trust algorithm (default to paper's method)
         if trust_algorithm is None:
@@ -75,7 +78,8 @@ class SimulationEnvironment:
         self.raw_tracks: Dict[int, List[Track]] = {}  # Robot ID -> raw unfiltered tracks
         
         # Per-robot object track management
-        self.robot_object_tracks: Dict[int, Dict[str, Track]] = {}  # robot_id -> {object_id: Track}
+        self.robot_object_tracks: Dict[int, Dict[str, Track]] = {}  # robot_id -> {object_id: Track} - ALL accumulated tracks
+        self.robot_current_tracks: Dict[int, Dict[str, Track]] = {}  # robot_id -> {object_id: Track} - CURRENT timestep tracks only
         
         self.time = 0.0
         self.dt = 0.1  # 10Hz simulation rate
@@ -96,6 +100,7 @@ class SimulationEnvironment:
         for i in range(self.num_robots):
             # Initialize per-robot object tracking structures
             self.robot_object_tracks[i] = {}
+            self.robot_current_tracks[i] = {}
             self.fp_objects_by_robot[i] = {}
             self.fp_next_id_by_robot[i] = 0
             
@@ -379,21 +384,37 @@ class SimulationEnvironment:
                 # Create track ID
                 track_key = f"{robot.id}_{object_id}"
                 
-                track = Track(
-                    id=track_key,
-                    position=noisy_pos,
-                    velocity=noisy_vel,
-                    covariance=covariance,
-                    confidence=random.uniform(0.85, 0.98),
-                    timestamp=self.time,
-                    source_robot=robot.id,
-                    trust_alpha=trust_alpha,
-                    trust_beta=trust_beta,
-                    object_id=object_id
-                )
+                # Check if track already exists in accumulated tracks
+                if object_id in self.robot_object_tracks[robot.id]:
+                    # Update existing track with new observation
+                    existing_track = self.robot_object_tracks[robot.id][object_id]
+                    existing_track.position = noisy_pos
+                    existing_track.velocity = noisy_vel
+                    existing_track.covariance = covariance
+                    existing_track.confidence = random.uniform(0.85, 0.98)
+                    existing_track.timestamp = self.time
+                    existing_track.trust_alpha = trust_alpha
+                    existing_track.trust_beta = trust_beta
+                    track = existing_track
+                else:
+                    # Create new track
+                    track = Track(
+                        id=track_key,
+                        position=noisy_pos,
+                        velocity=noisy_vel,
+                        covariance=covariance,
+                        confidence=random.uniform(0.85, 0.98),
+                        timestamp=self.time,
+                        source_robot=robot.id,
+                        trust_alpha=trust_alpha,
+                        trust_beta=trust_beta,
+                        object_id=object_id
+                    )
+                    # Add new track to accumulated tracks
+                    self.robot_object_tracks[robot.id][object_id] = track
                 
-                # Update per-robot object track registry
-                self.robot_object_tracks[robot.id][object_id] = track
+                # Always add to current timestep tracks (whether new or updated)
+                self.robot_current_tracks[robot.id][object_id] = track
                 detections.append(track)
         
         return detections
@@ -431,20 +452,37 @@ class SimulationEnvironment:
             
             track_key = f"{robot.id}_{object_id}"
             
-            track = Track(
-                id=track_key,
-                position=noisy_pos,
-                velocity=noisy_vel,
-                covariance=covariance,
-                confidence=random.uniform(0.85, 0.98),
-                timestamp=self.time,
-                source_robot=robot.id,
-                trust_alpha=trust_alpha,
-                trust_beta=trust_beta,
-                object_id=object_id
-            )
+            # Check if track already exists in accumulated tracks
+            if object_id in self.robot_object_tracks[robot.id]:
+                # Update existing track with new observation
+                existing_track = self.robot_object_tracks[robot.id][object_id]
+                existing_track.position = noisy_pos
+                existing_track.velocity = noisy_vel
+                existing_track.covariance = covariance
+                existing_track.confidence = random.uniform(0.85, 0.98)
+                existing_track.timestamp = self.time
+                existing_track.trust_alpha = trust_alpha
+                existing_track.trust_beta = trust_beta
+                track = existing_track
+            else:
+                # Create new track
+                track = Track(
+                    id=track_key,
+                    position=noisy_pos,
+                    velocity=noisy_vel,
+                    covariance=covariance,
+                    confidence=random.uniform(0.85, 0.98),
+                    timestamp=self.time,
+                    source_robot=robot.id,
+                    trust_alpha=trust_alpha,
+                    trust_beta=trust_beta,
+                    object_id=object_id
+                )
+                # Add new track to accumulated tracks
+                self.robot_object_tracks[robot.id][object_id] = track
             
-            self.robot_object_tracks[robot.id][object_id] = track
+            # Always add to current timestep tracks (whether new or updated)
+            self.robot_current_tracks[robot.id][object_id] = track
             tracks.append(track)
         
         # Generate persistent false positives
@@ -537,26 +575,59 @@ class SimulationEnvironment:
                     trust_beta = 1.0
                     self.trust_algorithm.robot_object_trust[robot.id][fp_id] = (trust_alpha, trust_beta)
                 
-                track = Track(
-                    id=fp_track_key,
-                    position=pos.copy(),
-                    velocity=vel.copy(),
-                    covariance=np.eye(6) * 1e-6,
-                    confidence=random.uniform(0.95, 0.99),
-                    timestamp=self.time,
-                    source_robot=robot.id,
-                    trust_alpha=trust_alpha,
-                    trust_beta=trust_beta,
-                    object_id=fp_id
-                )
+                # Check if track already exists in accumulated tracks
+                if fp_id in self.robot_object_tracks[robot.id]:
+                    # Update existing track with new observation
+                    existing_track = self.robot_object_tracks[robot.id][fp_id]
+                    existing_track.position = pos.copy()
+                    existing_track.velocity = vel.copy()
+                    existing_track.covariance = np.eye(6) * 1e-6
+                    existing_track.confidence = random.uniform(0.95, 0.99)
+                    existing_track.timestamp = self.time
+                    existing_track.trust_alpha = trust_alpha
+                    existing_track.trust_beta = trust_beta
+                    track = existing_track
+                else:
+                    # Create new track
+                    track = Track(
+                        id=fp_track_key,
+                        position=pos.copy(),
+                        velocity=vel.copy(),
+                        covariance=np.eye(6) * 1e-6,
+                        confidence=random.uniform(0.95, 0.99),
+                        timestamp=self.time,
+                        source_robot=robot.id,
+                        trust_alpha=trust_alpha,
+                        trust_beta=trust_beta,
+                        object_id=fp_id
+                    )
+                    # Add new track to accumulated tracks
+                    self.robot_object_tracks[robot.id][fp_id] = track
                 
-                self.robot_object_tracks[robot.id][fp_id] = track
+                # Always add to current timestep tracks (whether new or updated)
+                self.robot_current_tracks[robot.id][fp_id] = track
                 tracks.append(track)
         
         return tracks
     
+    def get_proximal_robots(self, ego_robot: 'RobotState') -> List['RobotState']:
+        """Get robots within proximal range of the ego robot"""
+        proximal_robots = []
+        
+        for robot in self.robots:
+            if robot.id != ego_robot.id:  # Exclude the ego robot itself
+                distance = np.linalg.norm(ego_robot.position - robot.position)
+                if distance <= self.proximal_range:
+                    proximal_robots.append(robot)
+        
+        return proximal_robots
+    
     def step(self) -> Dict:
         """Execute one simulation step"""
+        # Clear current timestep tracks for all robots
+        for robot_id in self.robot_current_tracks:
+            self.robot_current_tracks[robot_id].clear()
+        
         # Update ground truth objects
         self._update_ground_truth_objects()
         
@@ -583,7 +654,8 @@ class SimulationEnvironment:
         
         # Update trust using the pluggable trust algorithm
         trust_updates = self.trust_algorithm.update_trust(
-            self.robots, self.tracks, self.robot_object_tracks, self.time
+            self.robots, self.tracks, self.robot_object_tracks, self.time, 
+            self.robot_current_tracks, self
         )
         
         self.time += self.dt

@@ -212,7 +212,8 @@ class GNNDataCollector:
                 # Additional diversity parameters
                 'sensor_range': np.random.uniform(20, 40),
                 'communication_range': np.random.uniform(30, 60),
-                'movement_speed': np.random.uniform(0.5, 2.0)
+                'movement_speed': np.random.uniform(0.5, 2.0),
+                'proximal_range': np.random.uniform(30, 70)  # Vary proximal range
             }
             
             scenarios.append(scenario)
@@ -230,6 +231,7 @@ class GNNDataCollector:
             num_targets=scenario['num_targets'],
             world_size=scenario['world_size'],
             adversarial_ratio=scenario['adversarial_ratio'],
+            proximal_range=scenario.get('proximal_range', 50.0),  # Default 50.0
             trust_algorithm=paper_algorithm
         )
         
@@ -267,12 +269,19 @@ class GNNDataCollector:
                     collected_for_step = 0
                     
                     for robot in env.robots:
-                        robot_tracks = list(env.robot_object_tracks.get(robot.id, {}).values())
-                        if robot_tracks:  # Only collect if this robot has tracks to serve as ego
-                            # Collect training data using this robot as ego robot
+                        # Use current timestep tracks instead of accumulated tracks
+                        robot_current_tracks = list(env.robot_current_tracks.get(robot.id, {}).values())
+                        if robot_current_tracks:  # Only collect if this robot has current tracks to serve as ego
+                            # Convert current timestep tracks to tracks_by_robot format
+                            current_tracks_by_robot = {}
+                            for robot_id, obj_tracks in env.robot_current_tracks.items():
+                                if obj_tracks:  # Only include robots that have current tracks
+                                    current_tracks_by_robot[robot_id] = list(obj_tracks.values())
+                            
+                            # Collect training data using this robot as ego robot with CURRENT tracks
                             neural_algorithm.training_data_collector.collect_from_simulation_step(
-                                env.robots, env.tracks, env.robot_object_tracks,
-                                {}, robot, robot_tracks
+                                env.robots, current_tracks_by_robot, env.robot_current_tracks,
+                                {}, robot, robot_current_tracks
                             )
                             collected_for_step += 1
                     
@@ -320,12 +329,12 @@ def main():
     """Main function to collect training data"""
     collector = GNNDataCollector(seed=42)  # Set seed for reproducibility
     
-    # Collect diverse training data with optimized parameters for server
+    # Collect diverse training data with smaller parameters for testing
     training_data_file = collector.collect_diverse_training_data(
-        num_scenarios=25,           # Multiple diverse scenarios
-        steps_per_scenario=600,     # Steps per scenario  
+        num_scenarios=25,            # Fewer scenarios for faster collection
+        steps_per_scenario=500,     # Fewer steps per scenario  
         sample_intervals=20,        # Sampling interval
-        target_examples=100000,       # Target number of examples
+        target_examples=10000,         # Smaller target for testing
         output_file="gnn_training_data.pkl"
     )
     

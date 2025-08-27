@@ -12,12 +12,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import HeteroConv, GCNConv, SAGEConv, Linear
+from torch_geometric.nn import HeteroConv, SAGEConv, Linear
 from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass
-import json
 import pickle
-from scipy.optimize import linear_sum_assignment
 
 from trust_algorithm import TrustAlgorithm, RobotState, Track
 from paper_trust_algorithm import PaperTrustAlgorithm
@@ -170,13 +168,15 @@ class GraphBuilder:
         # Create graph data structure
         data = HeteroData()
         
-        # Build nodes and features - include ego robot and proximal robots
+        # Build all robots list
         all_robots = [ego_robot] + proximal_robots
+        
+        # Build edges first to determine which agents and tracks are connected
+        edges = self._build_edges(all_robots, ego_fused_tracks, proximal_tracks_by_robot)
+        
+        # Then build agent and track nodes using only connected ones
         agent_nodes, agent_features = self._build_agent_nodes(all_robots)
         track_nodes, track_features = self._build_track_nodes(ego_fused_tracks)
-        
-        # Build edges with neural symbolic predicates
-        edges = self._build_edges(all_robots, ego_fused_tracks, proximal_tracks_by_robot)
         
         # Populate graph data
         data['agent'].x = torch.tensor(agent_features, dtype=torch.float)
@@ -199,21 +199,28 @@ class GraphBuilder:
         agent_nodes = {}
         agent_features = []
         
-        for i, robot in enumerate(all_robots):
-            node_id = f"agent_{robot.id}"
-            agent_nodes[robot.id] = i
-            
-            # Agent features: Only trustworthy predicate [trustworthy_predicate(1)]
-            trustworthy_pred = self._compute_trustworthy_predicate(robot)
-            
-            # Store ground truth and current trust for loss computation (not part of GNN features)
-            robot._ground_truth_trustworthy = 1.0 - float(robot.is_adversarial)  # Store for loss
-            robot._current_trust_alpha = robot.trust_alpha  # Store for loss  
-            robot._current_trust_beta = robot.trust_beta   # Store for loss
-            
-            features = np.array([trustworthy_pred])  # Only trustworthy predicate
-            
-            agent_features.append(features)
+        # Filter agents to only include those with connections to tracks
+        connected_agents = getattr(self, '_connected_agents', set())
+        
+        agent_idx = 0
+        for original_idx, robot in enumerate(all_robots):
+            # Only include agents that have at least one edge to a track
+            if not connected_agents or original_idx in connected_agents:
+                node_id = f"agent_{robot.id}"
+                agent_nodes[robot.id] = agent_idx
+                
+                # Agent features: Only trustworthy predicate [trustworthy_predicate(1)]
+                trustworthy_pred = self._compute_trustworthy_predicate(robot)
+                
+                # Store ground truth and current trust for loss computation (not part of GNN features)
+                robot._ground_truth_trustworthy = 1.0 - float(robot.is_adversarial)  # Store for loss
+                robot._current_trust_alpha = robot.trust_alpha  # Store for loss  
+                robot._current_trust_beta = robot.trust_beta   # Store for loss
+                
+                features = np.array([trustworthy_pred])  # Only trustworthy predicate
+                
+                agent_features.append(features)
+                agent_idx += 1
         
         return agent_nodes, np.array(agent_features)
     
@@ -222,26 +229,30 @@ class GraphBuilder:
         track_nodes = {}
         track_features = []
         
-        # Add ego fused tracks
-        for track_idx, track in enumerate(ego_fused_tracks):
-            node_id = f"track_{track.id}"
-            track_nodes[track.id] = track_idx
-            
-            # Track features: only trustworthy predicate
-            trustworthy_pred = self._compute_track_trustworthy_predicate(track)
-            
-            features = np.array([trustworthy_pred])
-            
-            track_features.append(features)
-            track_idx += 1
+        # Filter tracks to only include those connected to agents
+        connected_tracks = getattr(self, '_connected_tracks', set())
         
-        # Only use ego fused tracks for graph construction
+        # Add ego fused tracks that have connections to agents
+        track_idx = 0
+        for original_idx, track in enumerate(ego_fused_tracks):
+            # Only include tracks that have at least one edge to an agent
+            if not connected_tracks or original_idx in connected_tracks:
+                node_id = f"track_{track.id}"
+                track_nodes[track.id] = track_idx
+                
+                # Track features: only trustworthy predicate
+                trustworthy_pred = self._compute_track_trustworthy_predicate(track)
+                
+                features = np.array([trustworthy_pred])
+                
+                track_features.append(features)
+                track_idx += 1
         
         return track_nodes, np.array(track_features) if track_features else np.array([]).reshape(0, 1)
     
     def _build_edges(self, all_robots: List[RobotState], ego_fused_tracks: List[Track],
                     proximal_tracks_by_robot: Dict[int, List[Track]]) -> Dict[str, List[Tuple[int, int]]]:
-        """Build edges representing neural symbolic predicates"""
+        """Build edges representing neural symbolic predicates using direct observations"""
         edges = {
             ('agent', 'observes', 'track'): [],
             ('track', 'observed_by', 'agent'): [],
@@ -249,23 +260,113 @@ class GraphBuilder:
             ('track', 'in_fov_by', 'agent'): []
         }
         
-        # InFoV predicate - agent-to-track visibility
-        for robot_idx, robot in enumerate(all_robots):
-            for track_idx, track in enumerate(ego_fused_tracks):
-                if self._is_track_in_fov_predicate(robot, track.position):
-                    edges[('agent', 'in_fov', 'track')].append((robot_idx, track_idx))
-                    edges[('track', 'in_fov_by', 'agent')].append((track_idx, robot_idx))
+        # Build edges based on actual observations received by robots
+        # If a robot has an observation of a track, that track is both InFoV and Observed
         
-        # Observed predicate - agent-to-track observations
         for robot_idx, robot in enumerate(all_robots):
-            robot_tracks = proximal_tracks_by_robot.get(robot.id, [])
-            for track in robot_tracks:
-                track_idx = self._get_track_index(track.id, ego_fused_tracks)
-                if track_idx is not None:
-                    edges[('agent', 'observes', 'track')].append((robot_idx, track_idx))
-                    edges[('track', 'observed_by', 'agent')].append((track_idx, robot_idx))
+            if robot_idx == 0:  # Ego robot (first in all_robots list)
+                # Ego robot: check which fused tracks it has source tracks for
+                for track_idx, fused_track in enumerate(ego_fused_tracks):
+                    if hasattr(fused_track, '_source_tracks'):
+                        # Check if ego robot contributed to this fused track
+                        ego_contributed = any(robot_id == robot.id for robot_id, _ in fused_track._source_tracks)
+                        if ego_contributed:
+                            # Ego robot observed this track (and by definition, it's in FoV)
+                            edges[('agent', 'observes', 'track')].append((robot_idx, track_idx))
+                            edges[('track', 'observed_by', 'agent')].append((track_idx, robot_idx))
+                            edges[('agent', 'in_fov', 'track')].append((robot_idx, track_idx))
+                            edges[('track', 'in_fov_by', 'agent')].append((track_idx, robot_idx))
+            else:
+                # Proximal robots: check if they have observations that match fused tracks
+                robot_tracks = proximal_tracks_by_robot.get(robot.id, [])
+                for robot_track in robot_tracks:
+                    # Find corresponding fused track by object_id
+                    for fused_track_idx, fused_track in enumerate(ego_fused_tracks):
+                        if (hasattr(robot_track, 'object_id') and hasattr(fused_track, 'object_id') and 
+                            robot_track.object_id == fused_track.object_id):
+                            # This robot observed this track (and by definition, it's in FoV)
+                            edges[('agent', 'observes', 'track')].append((robot_idx, fused_track_idx))
+                            edges[('track', 'observed_by', 'agent')].append((fused_track_idx, robot_idx))
+                            edges[('agent', 'in_fov', 'track')].append((robot_idx, fused_track_idx))
+                            edges[('track', 'in_fov_by', 'agent')].append((fused_track_idx, robot_idx))
+                            break  # Found match, move to next robot track
         
-        return edges
+        # For tracks that robots don't directly observe, check if they're still in FoV
+        # This catches cases where a track exists but robot doesn't have it in current observations
+        for robot_idx, robot in enumerate(all_robots):
+            for track_idx, fused_track in enumerate(ego_fused_tracks):
+                # Check if we already added edges for this robot-track pair
+                if (robot_idx, track_idx) not in [(r, t) for r, t in edges[('agent', 'in_fov', 'track')]]:
+                    # Use geometric check for InFoV (but not Observed)
+                    if self._is_track_in_fov_predicate(robot, fused_track.position):
+                        edges[('agent', 'in_fov', 'track')].append((robot_idx, track_idx))
+                        edges[('track', 'in_fov_by', 'agent')].append((track_idx, robot_idx))
+        
+        # Remove tracks that have no connections to any agents
+        # This prevents isolated track nodes in the graph
+        connected_tracks = set()
+        for edge_list in edges.values():
+            for src, dst in edge_list:
+                # Find track indices in edge relationships
+                if edge_list == edges[('agent', 'in_fov', 'track')] or edge_list == edges[('agent', 'observes', 'track')]:
+                    connected_tracks.add(dst)  # dst is track index
+                elif edge_list == edges[('track', 'in_fov_by', 'agent')] or edge_list == edges[('track', 'observed_by', 'agent')]:
+                    connected_tracks.add(src)  # src is track index
+        
+        # Create mapping from original track indices to filtered track indices
+        track_original_to_filtered = {}
+        filtered_track_idx = 0
+        for original_idx in sorted(connected_tracks):
+            track_original_to_filtered[original_idx] = filtered_track_idx
+            filtered_track_idx += 1
+        
+        # Determine which agents have connections
+        connected_agents = set()
+        for edge_list in edges.values():
+            for src, dst in edge_list:
+                if edge_list == edges[('agent', 'in_fov', 'track')] or edge_list == edges[('agent', 'observes', 'track')]:
+                    connected_agents.add(src)  # src is agent index
+                elif edge_list == edges[('track', 'in_fov_by', 'agent')] or edge_list == edges[('track', 'observed_by', 'agent')]:
+                    connected_agents.add(dst)  # dst is agent index
+        
+        # Create mapping from original agent indices to filtered agent indices
+        agent_original_to_filtered = {}
+        filtered_agent_idx = 0
+        for original_idx in sorted(connected_agents):
+            agent_original_to_filtered[original_idx] = filtered_agent_idx
+            filtered_agent_idx += 1
+        
+        # Update edge indices to use filtered agent and track indices
+        filtered_edges = {
+            ('agent', 'observes', 'track'): [],
+            ('track', 'observed_by', 'agent'): [],
+            ('agent', 'in_fov', 'track'): [],
+            ('track', 'in_fov_by', 'agent'): []
+        }
+        
+        # Remap edge indices
+        for (src, dst) in edges[('agent', 'in_fov', 'track')]:
+            if src in agent_original_to_filtered and dst in track_original_to_filtered:
+                filtered_edges[('agent', 'in_fov', 'track')].append((agent_original_to_filtered[src], track_original_to_filtered[dst]))
+                
+        for (src, dst) in edges[('track', 'in_fov_by', 'agent')]:
+            if src in track_original_to_filtered and dst in agent_original_to_filtered:
+                filtered_edges[('track', 'in_fov_by', 'agent')].append((track_original_to_filtered[src], agent_original_to_filtered[dst]))
+                
+        for (src, dst) in edges[('agent', 'observes', 'track')]:
+            if src in agent_original_to_filtered and dst in track_original_to_filtered:
+                filtered_edges[('agent', 'observes', 'track')].append((agent_original_to_filtered[src], track_original_to_filtered[dst]))
+                
+        for (src, dst) in edges[('track', 'observed_by', 'agent')]:
+            if src in track_original_to_filtered and dst in agent_original_to_filtered:
+                filtered_edges[('track', 'observed_by', 'agent')].append((track_original_to_filtered[src], agent_original_to_filtered[dst]))
+        
+        
+        # Store for filtering in graph building
+        self._connected_tracks = connected_tracks
+        self._connected_agents = connected_agents
+        
+        return filtered_edges
     
     def _compute_trustworthy_predicate(self, robot: RobotState, threshold: float = 0.5) -> float:
         """Compute trustworthy predicate for agent using threshold comparison"""
@@ -311,6 +412,273 @@ class TrainingDataCollector:
         # Paper algorithm to generate training targets
         self.paper_algorithm = PaperTrustAlgorithm()
         self.paper_algorithm_initialized = False
+    
+    def _fuse_tracks_for_training(self, ego_robot: RobotState, ego_fused_tracks: List[Track],
+                                 proximal_robots: List[RobotState], 
+                                 robot_object_tracks: Dict[int, Dict[str, Track]]) -> List[Track]:
+        """
+        Fuse tracks using the same logic as paper algorithm for training data consistency
+        
+        Returns all tracks that should appear in the graph:
+        - Fused tracks (ego + proximal observations of same object)
+        - Ego-only tracks (not observed by trusted proximal robots)  
+        - Proximal-only tracks (false positives from ego's perspective)
+        """
+        from collections import defaultdict
+        
+        fusion_threshold = 5.0  # Distance threshold for track fusion
+        trust_threshold = 0.5   # Trust threshold for fusion eligibility
+        
+        # Track all objects and their observers
+        object_observers = defaultdict(list)  # object_id -> [(robot_id, track)]
+        all_tracks = []
+        
+        # 1. Collect GENUINE ego tracks only (exclude false positive tracks from adversarial robots)
+        ego_tracks = ego_fused_tracks.copy()
+        for track in ego_tracks:
+            if hasattr(track, 'object_id'):
+                # Only include tracks that are genuinely observed by ego robot
+                # Exclude false positive tracks (which have '_fp_' in their ID)
+                if hasattr(track, 'id') and '_fp_' not in track.id:
+                    object_observers[track.object_id].append((ego_robot.id, track))
+        
+        # 2. Collect proximal robot tracks
+        for robot in proximal_robots:
+            robot_tracks = robot_object_tracks.get(robot.id, {})
+            for track in robot_tracks.values():
+                if hasattr(track, 'object_id'):
+                    object_observers[track.object_id].append((robot.id, track))
+        
+        # 3. Process each observed object
+        processed_objects = set()
+        
+        for object_id, observers in object_observers.items():
+            if object_id in processed_objects:
+                continue
+                
+            ego_observations = [(rid, t) for rid, t in observers if rid == ego_robot.id]
+            proximal_observations = [(rid, t) for rid, t in observers if rid != ego_robot.id]
+            
+            if ego_observations and proximal_observations:
+                # Object observed by both ego and proximal robots - create fused track
+                ego_track = ego_observations[0][1]  # Use first (should be only) ego observation
+                
+                # Find trusted proximal observations within fusion threshold
+                trusted_proximal = []
+                for robot_id, prox_track in proximal_observations:
+                    # Find robot by ID
+                    robot = next((r for r in proximal_robots if r.id == robot_id), None)
+                    if robot is None:
+                        continue
+                        
+                    # Check trust thresholds and distance
+                    agent_trust = robot.trust_alpha / (robot.trust_alpha + robot.trust_beta)
+                    track_trust = prox_track.trust_alpha / (prox_track.trust_alpha + prox_track.trust_beta)
+                    distance = np.linalg.norm(ego_track.position - prox_track.position)
+                    
+                    if (agent_trust >= trust_threshold and 
+                        track_trust >= trust_threshold and 
+                        distance <= fusion_threshold):
+                        trusted_proximal.append(prox_track)
+                
+                if trusted_proximal:
+                    # Create fused track - inherits ego's trust distribution
+                    fused_track = Track(
+                        id=f"{ego_robot.id}_fused_obj_{object_id}",
+                        position=ego_track.position.copy(),  # For simplicity, use ego position
+                        velocity=ego_track.velocity.copy(),
+                        covariance=ego_track.covariance.copy(),
+                        confidence=min(1.0, (ego_track.confidence + sum(t.confidence for t in trusted_proximal)) / (len(trusted_proximal) + 1)),
+                        timestamp=ego_track.timestamp,
+                        source_robot=ego_robot.id,
+                        trust_alpha=ego_track.trust_alpha,  # Inherit ego's trust
+                        trust_beta=ego_track.trust_beta,    # Inherit ego's trust
+                        object_id=object_id
+                    )
+                    all_tracks.append(fused_track)
+                else:
+                    # No trusted proximal observations - use ego track as is
+                    all_tracks.append(ego_track)
+                    
+            elif ego_observations:
+                # Ego-only observation
+                ego_track = ego_observations[0][1]
+                all_tracks.append(ego_track)
+                
+            elif proximal_observations:
+                # Proximal-only observations - fuse multiple proximal robot observations
+                # Separate legitimate and adversarial observations
+                legitimate_observations = []
+                adversarial_observations = []
+                
+                for robot_id, prox_track in proximal_observations:
+                    # Find robot by ID to check if it's adversarial
+                    robot = next((r for r in proximal_robots if r.id == robot_id), None)
+                    if robot is None:
+                        continue
+                    
+                    if robot.is_adversarial:
+                        adversarial_observations.append((robot_id, prox_track, robot))
+                    else:
+                        legitimate_observations.append((robot_id, prox_track, robot))
+                
+                # Create fused legitimate proximal track if multiple legitimate observations exist
+                if len(legitimate_observations) > 1:
+                    fused_track = self._create_fused_proximal_track(
+                        ego_robot, legitimate_observations, object_id, "proximal_fused"
+                    )
+                    all_tracks.append(fused_track)
+                    # Store mapping for trust propagation
+                    setattr(fused_track, '_source_tracks', [(robot_id, track) for robot_id, track, _ in legitimate_observations])
+                elif len(legitimate_observations) == 1:
+                    # Single legitimate observation - create regular proximal track
+                    robot_id, prox_track, robot = legitimate_observations[0]
+                    track = Track(
+                        id=f"{ego_robot.id}_proximal_{robot_id}_{object_id}",
+                        position=prox_track.position.copy(),
+                        velocity=prox_track.velocity.copy(),
+                        covariance=prox_track.covariance.copy(),
+                        confidence=prox_track.confidence,
+                        timestamp=prox_track.timestamp,
+                        source_robot=robot_id,  # Original source robot
+                        trust_alpha=prox_track.trust_alpha,  # Inherit proximal track trust
+                        trust_beta=prox_track.trust_beta,    # Inherit proximal track trust
+                        object_id=object_id
+                    )
+                    all_tracks.append(track)
+                    # Store mapping for trust propagation
+                    setattr(track, '_source_tracks', [(robot_id, prox_track)])
+                
+                # Create fused adversarial track if multiple adversarial observations exist
+                if len(adversarial_observations) > 1:
+                    fused_track = self._create_fused_proximal_track(
+                        ego_robot, adversarial_observations, object_id, "fp_fused"
+                    )
+                    all_tracks.append(fused_track)
+                    # Store mapping for trust propagation
+                    setattr(fused_track, '_source_tracks', [(robot_id, track) for robot_id, track, _ in adversarial_observations])
+                elif len(adversarial_observations) == 1:
+                    # Single adversarial observation - create regular false positive track
+                    robot_id, prox_track, robot = adversarial_observations[0]
+                    track = Track(
+                        id=f"{ego_robot.id}_fp_{robot_id}_{object_id}",
+                        position=prox_track.position.copy(),
+                        velocity=prox_track.velocity.copy(),
+                        covariance=prox_track.covariance.copy(),
+                        confidence=prox_track.confidence,
+                        timestamp=prox_track.timestamp,
+                        source_robot=ego_robot.id,  # From ego's perspective
+                        trust_alpha=1.0,  # Start with neutral trust
+                        trust_beta=1.0,   # Start with neutral trust
+                        object_id=object_id
+                    )
+                    all_tracks.append(track)
+                    # Store mapping for trust propagation
+                    setattr(track, '_source_tracks', [(robot_id, prox_track)])
+                    
+            processed_objects.add(object_id)
+        
+        return all_tracks
+    
+    def _create_fused_proximal_track(self, ego_robot: 'RobotState', observations: List[Tuple[int, 'Track', 'RobotState']], 
+                                    object_id: str, track_type: str) -> 'Track':
+        """
+        Create a fused track from multiple proximal robot observations
+        
+        Args:
+            ego_robot: The ego robot from whose perspective the track is created
+            observations: List of (robot_id, track, robot_state) tuples
+            object_id: The object ID being observed
+            track_type: Type of track ("proximal_fused" or "fp_fused")
+            
+        Returns:
+            Fused track with highest mean trust distribution
+        """
+        if not observations:
+            raise ValueError("Cannot create fused track from empty observations")
+        
+        # Find observation with highest mean trust
+        best_observation = None
+        highest_mean_trust = -1.0
+        
+        for robot_id, track, robot in observations:
+            mean_trust = track.trust_alpha / (track.trust_alpha + track.trust_beta)
+            if mean_trust > highest_mean_trust:
+                highest_mean_trust = mean_trust
+                best_observation = (robot_id, track, robot)
+        
+        best_robot_id, best_track, best_robot = best_observation
+        
+        # Calculate fused position as weighted average by confidence
+        total_confidence = sum(track.confidence for _, track, _ in observations)
+        if total_confidence > 0:
+            fused_position = np.zeros(3)
+            fused_velocity = np.zeros(3)
+            
+            for robot_id, track, robot in observations:
+                weight = track.confidence / total_confidence
+                fused_position += weight * track.position
+                fused_velocity += weight * track.velocity
+        else:
+            # Fallback to best track's position/velocity
+            fused_position = best_track.position.copy()
+            fused_velocity = best_track.velocity.copy()
+        
+        # Calculate average confidence
+        avg_confidence = sum(track.confidence for _, track, _ in observations) / len(observations)
+        
+        # Create fused track ID with all source robots
+        source_robot_ids = sorted([robot_id for robot_id, _, _ in observations])
+        if track_type == "proximal_fused":
+            track_id = f"{ego_robot.id}_proximal_fused_{'_'.join(map(str, source_robot_ids))}_{object_id}"
+            source_robot = source_robot_ids[0]  # Use first robot as representative source
+        else:  # fp_fused
+            track_id = f"{ego_robot.id}_fp_fused_{'_'.join(map(str, source_robot_ids))}_{object_id}"
+            source_robot = ego_robot.id  # From ego's perspective for false positives
+        
+        # Create fused track inheriting the highest mean trust
+        fused_track = Track(
+            id=track_id,
+            position=fused_position,
+            velocity=fused_velocity,
+            covariance=best_track.covariance.copy(),  # Use best track's covariance
+            confidence=avg_confidence,
+            timestamp=max(track.timestamp for _, track, _ in observations),  # Most recent timestamp
+            source_robot=source_robot,
+            trust_alpha=best_track.trust_alpha,  # Inherit highest mean trust distribution
+            trust_beta=best_track.trust_beta,
+            object_id=object_id
+        )
+        
+        return fused_track
+    
+    def _propagate_trust_updates_to_source_tracks(self, fused_tracks: List['Track'], 
+                                                 robot_object_tracks: Dict[int, Dict[str, 'Track']]) -> None:
+        """
+        Propagate trust updates from fused tracks back to their source tracks
+        
+        Args:
+            fused_tracks: List of fused tracks that have been updated by GNN
+            robot_object_tracks: robot_id -> {object_id: Track} for updating source tracks
+        """
+        for fused_track in fused_tracks:
+            # Check if this track has source tracks to update
+            if hasattr(fused_track, '_source_tracks'):
+                source_tracks = fused_track._source_tracks
+                
+                for robot_id, source_track in source_tracks:
+                    # Find the source track in robot_object_tracks and update its trust
+                    if (robot_id in robot_object_tracks and 
+                        source_track.object_id in robot_object_tracks[robot_id]):
+                        
+                        source_track_to_update = robot_object_tracks[robot_id][source_track.object_id]
+                        
+                        # Update trust distribution from fused track
+                        source_track_to_update.trust_alpha = fused_track.trust_alpha
+                        source_track_to_update.trust_beta = fused_track.trust_beta
+                        
+                        # Optionally update other properties that might have been refined
+                        # source_track_to_update.confidence = fused_track.confidence
     
     def collect_from_simulation_step(self, robots: List[RobotState], 
                                    tracks_by_robot: Dict[int, List[Track]],
@@ -383,12 +751,23 @@ class TrainingDataCollector:
             robot_copies, tracks_by_robot_copy, robot_object_tracks_copy, 0.0
         )
         
-        # Build graph for this step
-        proximal_robots = [r for r in robots if r.id != ego_robot.id]
+        # Build graph using proper track fusion logic as in paper algorithm
+        # 1. Get proximal robots that have tracks
+        robots_with_tracks = {r_id for r_id, tracks in robot_object_tracks.items() 
+                             if tracks and r_id in [robot.id for robot in robots]}
+        proximal_robots = [r for r in robots if r.id != ego_robot.id and r.id in robots_with_tracks]
+        
+        # 2. Perform track fusion using paper algorithm logic
+        fused_tracks = self._fuse_tracks_for_training(
+            ego_robot, ego_fused_tracks, proximal_robots, robot_object_tracks_copy
+        )
+        
+        # 3. Build proximal tracks dict for edge creation (individual robot tracks)
         proximal_tracks_by_robot = {r_id: tracks for r_id, tracks in tracks_by_robot.items() 
-                                  if r_id != ego_robot.id}
+                                  if r_id != ego_robot.id and r_id in robots_with_tracks}
+        
         graph_data = self.graph_builder.build_graph(
-            ego_robot, ego_fused_tracks, proximal_robots, proximal_tracks_by_robot
+            ego_robot, fused_tracks, proximal_robots, proximal_tracks_by_robot
         )
         
         # Collect all tracks for more diverse training data (including false positives)
@@ -936,27 +1315,81 @@ class NeuralSymbolicTrustAlgorithm(TrustAlgorithm):
         print("Neural Symbolic Trust Algorithm initialized with GNN")
     
     def update_trust(self, robots: List[RobotState], tracks_by_robot: Dict[int, List[Track]], 
-                    robot_object_tracks: Dict[int, Dict[str, Track]], simulation_time: float) -> Dict[int, Dict]:
+                    robot_object_tracks: Dict[int, Dict[str, Track]], simulation_time: float,
+                    robot_current_tracks: Optional[Dict[int, Dict[str, Track]]] = None,
+                    environment: Optional['SimulationEnvironment'] = None) -> Dict[int, Dict]:
         """Update trust using GNN-based neural symbolic reasoning"""
         
         trust_updates = {}
         
+        # Track all fused tracks for trust propagation
+        all_fused_tracks = []
+        
         # Main loop: iterate over each robot as ego robot
         for ego_robot in robots:
-            # Get ego robot's fused tracks from robot_object_tracks
-            ego_fused_tracks = list(robot_object_tracks.get(ego_robot.id, {}).values())
+            # Always prefer current timestep tracks for graph input if available
+            if robot_current_tracks:
+                # Get current tracks for ego robot
+                ego_current_tracks_dict = robot_current_tracks.get(ego_robot.id, {})
+                ego_fused_tracks = list(ego_current_tracks_dict.values())
+                
+                # Ensure current tracks inherit trust values from accumulated tracks
+                for track_id, current_track in ego_current_tracks_dict.items():
+                    if (ego_robot.id in robot_object_tracks and 
+                        track_id in robot_object_tracks[ego_robot.id]):
+                        accumulated_track = robot_object_tracks[ego_robot.id][track_id]
+                        # Inherit trust values from accumulated track
+                        current_track.trust_alpha = accumulated_track.trust_alpha
+                        current_track.trust_beta = accumulated_track.trust_beta
+                
+                # Build proximal tracks dictionary from current timestep
+                proximal_tracks_by_robot = {}
+                for r_id, current_tracks_dict in robot_current_tracks.items():
+                    if r_id != ego_robot.id:
+                        proximal_tracks_list = list(current_tracks_dict.values())
+                        # Ensure proximal tracks inherit trust from accumulated tracks
+                        for track in proximal_tracks_list:
+                            if (r_id in robot_object_tracks and 
+                                hasattr(track, 'object_id') and
+                                track.object_id in robot_object_tracks[r_id]):
+                                accumulated_track = robot_object_tracks[r_id][track.object_id]
+                                track.trust_alpha = accumulated_track.trust_alpha
+                                track.trust_beta = accumulated_track.trust_beta
+                        proximal_tracks_by_robot[r_id] = proximal_tracks_list
+            else:
+                # Fallback: use all accumulated tracks
+                ego_fused_tracks = list(robot_object_tracks.get(ego_robot.id, {}).values())
+                proximal_tracks_by_robot = {r_id: tracks for r_id, tracks in tracks_by_robot.items() 
+                                          if r_id != ego_robot.id}
             
             if not ego_fused_tracks:
                 continue
             
-            # Get proximal robots and their tracks
-            proximal_robots = [r for r in robots if r.id != ego_robot.id]
-            proximal_tracks_by_robot = {r_id: tracks for r_id, tracks in tracks_by_robot.items() 
-                                      if r_id != ego_robot.id}
+            # Get proximal robots within range
+            if environment:
+                proximal_robots = environment.get_proximal_robots(ego_robot)
+                # Filter proximal tracks to only include robots in range
+                proximal_robot_ids = {r.id for r in proximal_robots}
+                proximal_tracks_by_robot = {r_id: tracks for r_id, tracks in proximal_tracks_by_robot.items() 
+                                          if r_id in proximal_robot_ids}
+            else:
+                # Fallback: consider all other robots as proximal
+                proximal_robots = [r for r in robots if r.id != ego_robot.id]
             
-            # Build graph with neural symbolic predicates
+            # Perform track fusion to reduce redundant proximal tracks
+            # Always use accumulated tracks for fusion logic (contains complete track history)
+            fused_tracks = self._fuse_tracks_for_training(
+                ego_robot, ego_fused_tracks, proximal_robots, robot_object_tracks
+            )
+            
+            # Collect fused tracks that have source track mappings for propagation
+            for track in fused_tracks:
+                if hasattr(track, '_source_tracks'):
+                    all_fused_tracks.append(track)
+            
+            # Build graph with neural symbolic predicates using fused tracks
             graph_data = self.graph_builder.build_graph(
-                ego_robot, ego_fused_tracks, proximal_robots, proximal_tracks_by_robot
+                ego_robot, fused_tracks, proximal_robots, proximal_tracks_by_robot
             )
             
             # Apply GNN to get PSM predictions
@@ -990,16 +1423,36 @@ class NeuralSymbolicTrustAlgorithm(TrustAlgorithm):
                 'algorithm': 'neural_symbolic_gnn'
             }
         
+        # Propagate trust updates from fused tracks back to their source tracks
+        if all_fused_tracks:
+            self._propagate_trust_updates_to_source_tracks(all_fused_tracks, robot_object_tracks)
+        
         # Collect training data if in learning mode
         if self.learning_mode and self.training_data_collector:
-            # Collect training data for all robots that have fused tracks
-            for robot in robots:
-                ego_fused_tracks = list(robot_object_tracks.get(robot.id, {}).values())
-                if ego_fused_tracks:  # Only collect if we have tracks
-                    self.training_data_collector.collect_from_simulation_step(
-                        robots, tracks_by_robot, robot_object_tracks, trust_updates, 
-                        robot, ego_fused_tracks
-                    )
+            # Use current timestep tracks for training data collection if available
+            if robot_current_tracks:
+                # Convert current tracks to list format for collect_from_simulation_step
+                current_tracks_by_robot = {}
+                for r_id, current_tracks_dict in robot_current_tracks.items():
+                    current_tracks_by_robot[r_id] = list(current_tracks_dict.values())
+                
+                # Collect training data for all robots that have current tracks
+                for robot in robots:
+                    ego_current_tracks = list(robot_current_tracks.get(robot.id, {}).values())
+                    if ego_current_tracks:  # Only collect if we have current tracks
+                        self.training_data_collector.collect_from_simulation_step(
+                            robots, current_tracks_by_robot, robot_current_tracks, trust_updates, 
+                            robot, ego_current_tracks
+                        )
+            else:
+                # Fallback to accumulated tracks if current tracks not available
+                for robot in robots:
+                    ego_fused_tracks = list(robot_object_tracks.get(robot.id, {}).values())
+                    if ego_fused_tracks:  # Only collect if we have tracks
+                        self.training_data_collector.collect_from_simulation_step(
+                            robots, tracks_by_robot, robot_object_tracks, trust_updates, 
+                            robot, ego_fused_tracks
+                        )
         
         return trust_updates
     
@@ -1093,3 +1546,221 @@ class NeuralSymbolicTrustAlgorithm(TrustAlgorithm):
             'num_parameters': sum(p.numel() for p in self.model.parameters()),
             'training_examples': len(self.training_data_collector.training_examples) if self.training_data_collector else 0
         }
+    
+    def _fuse_tracks_for_training(self, ego_robot: RobotState, ego_fused_tracks: List[Track],
+                                 proximal_robots: List[RobotState], 
+                                 robot_object_tracks: Dict[int, Dict[str, Track]]) -> List[Track]:
+        """
+        Fuse tracks from ego robot and all its proximal robots.
+        All tracks with same object_id and within distance threshold are fused.
+        Trust distributions are updated for raw source tracks.
+        """
+        from collections import defaultdict
+        
+        fusion_threshold = 5.0  # Distance threshold for track fusion
+        
+        # Track all observations from ego + proximal robots by object_id
+        object_observations = defaultdict(list)  # object_id -> [(robot_id, track)]
+        
+        # 1. Collect ego robot tracks  
+        for track in ego_fused_tracks:
+            if hasattr(track, 'object_id') and track.object_id:
+                object_observations[track.object_id].append((ego_robot.id, track))
+        
+        # 2. Collect proximal robot tracks
+        for robot in proximal_robots:
+            robot_tracks = robot_object_tracks.get(robot.id, {})
+            for track in robot_tracks.values():
+                if hasattr(track, 'object_id') and track.object_id:
+                    object_observations[track.object_id].append((robot.id, track))
+        
+        # 3. Process each object: fuse tracks within distance threshold
+        final_tracks = []
+        
+        for object_id, observations in object_observations.items():
+            if not observations:
+                continue
+                
+            # Group observations by spatial proximity
+            track_groups = []
+            
+            for robot_id, track in observations:
+                # Find existing group within fusion threshold
+                assigned = False
+                for group in track_groups:
+                    # Check distance to any track in the group
+                    for _, existing_track in group:
+                        distance = np.linalg.norm(track.position - existing_track.position)
+                        if distance <= fusion_threshold:
+                            group.append((robot_id, track))
+                            assigned = True
+                            break
+                    if assigned:
+                        break
+                
+                if not assigned:
+                    # Create new group
+                    track_groups.append([(robot_id, track)])
+            
+            # Create fused tracks for each group
+            for group_idx, group in enumerate(track_groups):
+                if len(group) == 1:
+                    # Single track - use as is
+                    robot_id, track = group[0]
+                    fused_track = Track(
+                        id=f"{ego_robot.id}_{object_id}_{group_idx}",
+                        position=track.position.copy(),
+                        velocity=track.velocity.copy(), 
+                        covariance=track.covariance.copy(),
+                        confidence=track.confidence,
+                        timestamp=track.timestamp,
+                        source_robot=robot_id,
+                        trust_alpha=track.trust_alpha,
+                        trust_beta=track.trust_beta,
+                        object_id=object_id
+                    )
+                else:
+                    # Multiple tracks - fuse them
+                    # Weighted average by confidence
+                    total_confidence = sum(track.confidence for _, track in group)
+                    if total_confidence > 0:
+                        fused_position = np.zeros(3)
+                        fused_velocity = np.zeros(3)
+                        for _, track in group:
+                            weight = track.confidence / total_confidence
+                            fused_position += weight * track.position
+                            fused_velocity += weight * track.velocity
+                    else:
+                        # Fallback to simple average
+                        fused_position = np.mean([track.position for _, track in group], axis=0)
+                        fused_velocity = np.mean([track.velocity for _, track in group], axis=0)
+                    
+                    # Fuse trust distributions (sum of alphas and betas)
+                    fused_alpha = sum(track.trust_alpha for _, track in group)
+                    fused_beta = sum(track.trust_beta for _, track in group)
+                    
+                    # Average confidence and latest timestamp
+                    avg_confidence = np.mean([track.confidence for _, track in group])
+                    latest_timestamp = max(track.timestamp for _, track in group)
+                    
+                    # Average covariance
+                    avg_covariance = np.mean([track.covariance for _, track in group], axis=0)
+                    
+                    fused_track = Track(
+                        id=f"{ego_robot.id}_{object_id}_{group_idx}_fused",
+                        position=fused_position,
+                        velocity=fused_velocity,
+                        covariance=avg_covariance,
+                        confidence=avg_confidence,
+                        timestamp=latest_timestamp,
+                        source_robot=ego_robot.id,
+                        trust_alpha=fused_alpha,
+                        trust_beta=fused_beta,
+                        object_id=object_id
+                    )
+                
+                # Store source tracks for trust propagation back to raw tracks
+                setattr(fused_track, '_source_tracks', group)
+                final_tracks.append(fused_track)
+        
+        return final_tracks
+    
+    def _create_fused_proximal_track(self, ego_robot: 'RobotState', observations: List[Tuple[int, 'Track', 'RobotState']], 
+                                    object_id: str, track_type: str) -> 'Track':
+        """
+        Create a fused track from multiple proximal robot observations
+        
+        Args:
+            ego_robot: The ego robot from whose perspective the track is created
+            observations: List of (robot_id, track, robot_state) tuples
+            object_id: The object ID being observed
+            track_type: Type of track ("proximal_fused" or "fp_fused")
+            
+        Returns:
+            Fused track with highest mean trust distribution
+        """
+        if not observations:
+            raise ValueError("Cannot create fused track from empty observations")
+        
+        # Find observation with highest mean trust
+        best_observation = None
+        highest_mean_trust = -1.0
+        
+        for robot_id, track, robot in observations:
+            mean_trust = track.trust_alpha / (track.trust_alpha + track.trust_beta)
+            if mean_trust > highest_mean_trust:
+                highest_mean_trust = mean_trust
+                best_observation = (robot_id, track, robot)
+        
+        best_robot_id, best_track, best_robot = best_observation
+        
+        # Calculate fused position as weighted average by confidence
+        total_confidence = sum(track.confidence for _, track, _ in observations)
+        if total_confidence > 0:
+            fused_position = np.zeros(3)
+            fused_velocity = np.zeros(3)
+            
+            for robot_id, track, robot in observations:
+                weight = track.confidence / total_confidence
+                fused_position += weight * track.position
+                fused_velocity += weight * track.velocity
+        else:
+            # Fallback to best track's position/velocity
+            fused_position = best_track.position.copy()
+            fused_velocity = best_track.velocity.copy()
+        
+        # Calculate average confidence
+        avg_confidence = sum(track.confidence for _, track, _ in observations) / len(observations)
+        
+        # Create fused track ID with all source robots
+        source_robot_ids = sorted([robot_id for robot_id, _, _ in observations])
+        if track_type == "proximal_fused":
+            track_id = f"{ego_robot.id}_proximal_fused_{'_'.join(map(str, source_robot_ids))}_{object_id}"
+            source_robot = source_robot_ids[0]  # Use first robot as representative source
+        else:  # fp_fused
+            track_id = f"{ego_robot.id}_fp_fused_{'_'.join(map(str, source_robot_ids))}_{object_id}"
+            source_robot = ego_robot.id  # From ego's perspective for false positives
+        
+        # Create fused track inheriting the highest mean trust
+        fused_track = Track(
+            id=track_id,
+            position=fused_position,
+            velocity=fused_velocity,
+            covariance=best_track.covariance.copy(),  # Use best track's covariance
+            confidence=avg_confidence,
+            timestamp=max(track.timestamp for _, track, _ in observations),  # Most recent timestamp
+            source_robot=source_robot,
+            trust_alpha=best_track.trust_alpha,  # Inherit highest mean trust distribution
+            trust_beta=best_track.trust_beta,
+            object_id=object_id
+        )
+        
+        return fused_track
+    
+    def _propagate_trust_updates_to_source_tracks(self, fused_tracks: List['Track'], 
+                                                 robot_object_tracks: Dict[int, Dict[str, 'Track']]) -> None:
+        """
+        Propagate trust updates from fused tracks back to their source tracks
+        
+        Args:
+            fused_tracks: List of fused tracks that have been updated by GNN
+            robot_object_tracks: robot_id -> {object_id: Track} for updating source tracks
+        """
+        for fused_track in fused_tracks:
+            # Check if this track has source tracks to update
+            if hasattr(fused_track, '_source_tracks'):
+                source_tracks = fused_track._source_tracks
+                
+                for robot_id, source_track in source_tracks:
+                    # Find the source track in robot_object_tracks and update its trust
+                    if (robot_id in robot_object_tracks and 
+                        source_track.object_id in robot_object_tracks[robot_id]):
+                        
+                        source_track_to_update = robot_object_tracks[robot_id][source_track.object_id]
+                        
+                        # Update trust distribution from fused track
+                        source_track_to_update.trust_alpha = fused_track.trust_alpha
+                        source_track_to_update.trust_beta = fused_track.trust_beta
+                        
+                        # Optionally update other properties that might have been refined
+                        # source_track_to_update.confidence = fused_track.confidence

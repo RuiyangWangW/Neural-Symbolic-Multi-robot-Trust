@@ -238,10 +238,12 @@ class PaperTrustAlgorithm(TrustAlgorithm):
             self.robot_object_trust[robot.id] = {}
     
     def update_trust(self, robots: List[RobotState], tracks_by_robot: Dict[int, List[Track]], 
-                    robot_object_tracks: Dict[int, Dict[str, Track]], time: float) -> Dict[int, Dict]:
+                    robot_object_tracks: Dict[int, Dict[str, Track]], time: float,
+                    robot_current_tracks: Optional[Dict[int, Dict[str, Track]]] = None,
+                    environment: Optional['SimulationEnvironment'] = None) -> Dict[int, Dict]:
         """Update trust values using the paper's assignment-based PSM generation"""
         
-        # Update data aggregator
+        # Use all-time accumulated tracks for fusion (reverted from current timestep)
         self.data_aggregator = DataAggregator(robots, tracks_by_robot)
         
         trust_updates = {}
@@ -265,9 +267,14 @@ class PaperTrustAlgorithm(TrustAlgorithm):
                 continue
             
             # INNER LOOP: For each proximal robot, compare its raw tracks with ego fused tracks
-            for proximal_robot in robots:
-                if proximal_robot.id == ego_robot.id:
-                    continue
+            # Filter proximal robots by distance if environment is available
+            if environment:
+                proximal_robots_in_range = environment.get_proximal_robots(ego_robot)
+            else:
+                # Fallback: consider all other robots as proximal
+                proximal_robots_in_range = [r for r in robots if r.id != ego_robot.id]
+            
+            for proximal_robot in proximal_robots_in_range:
                     
                 # Use per-robot object tracks for proximal robot (important for trust evaluation)
                 proximal_robot_tracks = list(robot_object_tracks[proximal_robot.id].values())

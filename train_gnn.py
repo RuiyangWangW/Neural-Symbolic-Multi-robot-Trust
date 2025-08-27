@@ -19,23 +19,33 @@ from neural_symbolic_trust_algorithm import NeuralSymbolicTrustAlgorithm
 
 
 def show_gpu_status():
-    """Display status of all available GPUs"""
-    if not torch.cuda.is_available():
-        print("❌ CUDA not available")
-        return
-    
+    """Display status of all available GPUs (CUDA and MPS)"""
     print("📊 GPU STATUS:")
-    num_gpus = torch.cuda.device_count()
-    for i in range(num_gpus):
-        props = torch.cuda.get_device_properties(i)
-        total_gb = props.total_memory / 1024**3
-        allocated_gb = torch.cuda.memory_allocated(i) / 1024**3
-        free_gb = total_gb - allocated_gb
-        
-        status = "✅ Available" if free_gb > 2.0 else "⚠️  Limited" if free_gb > 1.0 else "❌ Busy"
-        
-        print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
-        print(f"    Memory: {allocated_gb:.1f}/{total_gb:.1f} GB used ({free_gb:.1f} GB free) {status}")
+    
+    # Check MPS (Apple Silicon)
+    if torch.backends.mps.is_available():
+        print("  🍎 Apple Metal Performance Shaders (MPS): ✅ Available")
+        print("    Apple Silicon GPU acceleration enabled")
+    else:
+        print("  🍎 Apple MPS: ❌ Not available")
+    
+    # Check CUDA
+    if torch.cuda.is_available():
+        print("  🔥 CUDA GPUs:")
+        num_gpus = torch.cuda.device_count()
+        for i in range(num_gpus):
+            props = torch.cuda.get_device_properties(i)
+            total_gb = props.total_memory / 1024**3
+            allocated_gb = torch.cuda.memory_allocated(i) / 1024**3
+            free_gb = total_gb - allocated_gb
+            
+            status = "✅ Available" if free_gb > 2.0 else "⚠️  Limited" if free_gb > 1.0 else "❌ Busy"
+            
+            print(f"    GPU {i}: {torch.cuda.get_device_name(i)}")
+            print(f"      Memory: {allocated_gb:.1f}/{total_gb:.1f} GB used ({free_gb:.1f} GB free) {status}")
+    else:
+        print("  🔥 CUDA: ❌ Not available")
+    
     print()
 
 class GNNTrainer:
@@ -63,18 +73,26 @@ class GNNTrainer:
     def __init__(self, device: str = "auto"):
         # Handle different device specifications
         if device == "auto":
-            if torch.cuda.is_available():
+            # Auto-select best available device
+            if torch.backends.mps.is_available():
+                self.device = torch.device('mps')
+                gpu_id = "mps"
+                print(f"🔍 Auto-selected MPS (Apple Silicon GPU)")
+            elif torch.cuda.is_available():
                 # Find GPU with most free memory
                 best_gpu = self._find_best_gpu()
                 self.device = torch.device(f'cuda:{best_gpu}')
                 gpu_id = best_gpu
-                print(f"🔍 Auto-selected GPU {best_gpu} (most free memory)")
+                print(f"🔍 Auto-selected CUDA GPU {best_gpu} (most free memory)")
             else:
                 self.device = torch.device('cpu')
                 gpu_id = None
         elif device == "cpu":
             self.device = torch.device('cpu')
             gpu_id = None
+        elif device == "mps":
+            self.device = torch.device('mps')
+            gpu_id = "mps"
         elif device.startswith("cuda"):
             # Handle cuda, cuda:0, cuda:1, etc.
             self.device = torch.device(device)
@@ -88,11 +106,16 @@ class GNNTrainer:
                 gpu_id = int(device)
                 self.device = torch.device(f'cuda:{gpu_id}')
             except ValueError:
-                print(f"❌ Invalid device '{device}'. Use 'cpu', 'cuda', 'cuda:N', or GPU number")
+                print(f"❌ Invalid device '{device}'. Use 'cpu', 'mps', 'cuda', 'cuda:N', or GPU number")
                 raise ValueError(f"Invalid device: {device}")
         
-        # Verify GPU availability and set device
-        if gpu_id is not None:
+        # Verify device availability and set device
+        if gpu_id == "mps":
+            if not torch.backends.mps.is_available():
+                print(f"⚠️  MPS not available, falling back to CPU")
+                self.device = torch.device('cpu')
+                gpu_id = None
+        elif gpu_id is not None and gpu_id != "mps":
             if not torch.cuda.is_available():
                 print(f"⚠️  CUDA not available, falling back to CPU")
                 self.device = torch.device('cpu')
@@ -119,9 +142,12 @@ class GNNTrainer:
                     gpu_id = None
         
         # Print device information
-        if gpu_id is not None:
+        if gpu_id == "mps":
+            print(f"🍎 Using Apple Silicon GPU (MPS)")
+            print(f"   Metal Performance Shaders acceleration enabled")
+        elif gpu_id is not None:
             torch.cuda.set_device(gpu_id)  # Set current GPU
-            print(f"🚀 Using GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
+            print(f"🚀 Using CUDA GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
             print(f"   GPU Memory: {torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3:.1f} GB")
             print(f"   Memory Usage: {torch.cuda.memory_allocated(gpu_id)/1024**3:.2f} GB allocated")
         else:
@@ -163,9 +189,12 @@ class GNNTrainer:
         neural_algorithm.model = neural_algorithm.model.to(self.device)
         
         if self.device.type == 'cuda':
-            # Enable GPU optimizations
+            # Enable CUDA GPU optimizations
             torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
             print(f"   🔧 Enabled cuDNN benchmark for faster training")
+        elif self.device.type == 'mps':
+            # Enable MPS optimizations
+            print(f"   🔧 Using Metal Performance Shaders for Apple Silicon GPU acceleration")
         
         # Update the trainer's device to match our selected device
         if neural_algorithm.trainer is not None:
@@ -186,10 +215,13 @@ class GNNTrainer:
         # Train the model
         print(f"\n🚀 Starting training...")
         
-        # Monitor GPU memory if using CUDA
+        # Monitor GPU memory if using CUDA or MPS
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()  # Clear cache before training
-            print(f"   💾 GPU memory before training: {torch.cuda.memory_allocated()/1024**3:.2f} GB allocated")
+            print(f"   💾 CUDA memory before training: {torch.cuda.memory_allocated()/1024**3:.2f} GB allocated")
+        elif self.device.type == 'mps':
+            torch.mps.empty_cache()  # Clear MPS cache before training
+            print(f"   💾 MPS memory cache cleared before training")
         
         start_time = time.time()
         
@@ -202,8 +234,10 @@ class GNNTrainer:
         
         # Report GPU memory usage after training
         if self.device.type == 'cuda':
-            print(f"   💾 GPU memory after training: {torch.cuda.memory_allocated()/1024**3:.2f} GB allocated")
-            print(f"   💾 Peak GPU memory usage: {torch.cuda.max_memory_allocated()/1024**3:.2f} GB")
+            print(f"   💾 CUDA memory after training: {torch.cuda.memory_allocated()/1024**3:.2f} GB allocated")
+            print(f"   💾 Peak CUDA memory usage: {torch.cuda.max_memory_allocated()/1024**3:.2f} GB")
+        elif self.device.type == 'mps':
+            print(f"   💾 MPS training completed - memory managed by Metal")
         
         # Save trained model
         neural_algorithm.save_model(output_model_file)
@@ -316,19 +350,20 @@ def main():
             show_gpu_status()
             return
         
-        # Valid device options: cpu, cuda, cuda:N, auto, or just GPU number
-        valid_devices = ["cpu", "cuda", "auto"] + [f"cuda:{i}" for i in range(8)] + [str(i) for i in range(8)]
+        # Valid device options: cpu, mps, cuda, cuda:N, auto, or just GPU number
+        valid_devices = ["cpu", "mps", "cuda", "auto"] + [f"cuda:{i}" for i in range(8)] + [str(i) for i in range(8)]
         
         if device_arg in valid_devices or device_arg.startswith("cuda:"):
             device = device_arg
         else:
             print(f"❌ Invalid device '{device_arg}'")
             print(f"Valid options:")
-            print(f"  'auto' - Auto-detect best GPU")
+            print(f"  'auto' - Auto-detect best GPU (MPS > CUDA > CPU)")
             print(f"  'cpu'  - Force CPU usage")  
-            print(f"  'cuda' - Use GPU 0")
-            print(f"  'cuda:1' - Use specific GPU (cuda:0, cuda:1, etc.)")
-            print(f"  '1' - Use GPU by number (0, 1, 2, 3)")
+            print(f"  'mps'  - Use Apple Silicon GPU (M1/M2)")
+            print(f"  'cuda' - Use CUDA GPU 0")
+            print(f"  'cuda:1' - Use specific CUDA GPU (cuda:0, cuda:1, etc.)")
+            print(f"  '1' - Use CUDA GPU by number (0, 1, 2, 3)")
             print(f"  'status' - Show GPU status")
             print()
             show_gpu_status()

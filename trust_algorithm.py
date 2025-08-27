@@ -59,7 +59,9 @@ class TrustAlgorithm(ABC):
     
     @abstractmethod
     def update_trust(self, robots: List[RobotState], tracks_by_robot: Dict[int, List[Track]], 
-                    robot_object_tracks: Dict[int, Dict[str, Track]], time: float) -> Dict[int, Dict]:
+                    robot_object_tracks: Dict[int, Dict[str, Track]], time: float,
+                    robot_current_tracks: Optional[Dict[int, Dict[str, Track]]] = None,
+                    environment: Optional['SimulationEnvironment'] = None) -> Dict[int, Dict]:
         """
         Update trust values for robots and tracks
         
@@ -68,6 +70,8 @@ class TrustAlgorithm(ABC):
             tracks_by_robot: Robot ID -> list of tracks
             robot_object_tracks: robot_id -> {object_id: Track}
             time: Current simulation time
+            robot_current_tracks: robot_id -> {object_id: Track} - current timestep only
+            environment: Simulation environment for proximal range filtering
             
         Returns:
             Dictionary containing trust updates for each robot
