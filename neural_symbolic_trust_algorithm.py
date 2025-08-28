@@ -1054,7 +1054,7 @@ class GNNTrainer:
         self.kl_loss = nn.KLDivLoss(reduction='batchmean')  # Use KL divergence instead of MSE
         
     def train_supervised(self, training_examples: List[TrainingExample], 
-                        epochs: int = 100, batch_size: int = 32) -> List[float]:
+                        epochs: int = 100, batch_size: int = 128) -> List[float]:
         """Train using supervised learning"""
         losses = []
         
