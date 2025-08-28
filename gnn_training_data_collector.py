@@ -332,7 +332,7 @@ def main():
     # Collect diverse training data with smaller parameters for testing
     training_data_file = collector.collect_diverse_training_data(
         num_scenarios=25,            # Fewer scenarios for faster collection
-        steps_per_scenario=500,     # Fewer steps per scenario  
+        steps_per_scenario=1000,     # Fewer steps per scenario  
         sample_intervals=20,        # Sampling interval
         target_examples=10000,         # Smaller target for testing
         output_file="gnn_training_data.pkl"

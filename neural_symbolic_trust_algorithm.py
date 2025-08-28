@@ -267,15 +267,21 @@ class GraphBuilder:
             if robot_idx == 0:  # Ego robot (first in all_robots list)
                 # Ego robot: check which fused tracks it has source tracks for
                 for track_idx, fused_track in enumerate(ego_fused_tracks):
+                    ego_contributed = False
+                    
                     if hasattr(fused_track, '_source_tracks'):
                         # Check if ego robot contributed to this fused track
                         ego_contributed = any(robot_id == robot.id for robot_id, _ in fused_track._source_tracks)
-                        if ego_contributed:
-                            # Ego robot observed this track (and by definition, it's in FoV)
-                            edges[('agent', 'observes', 'track')].append((robot_idx, track_idx))
-                            edges[('track', 'observed_by', 'agent')].append((track_idx, robot_idx))
-                            edges[('agent', 'in_fov', 'track')].append((robot_idx, track_idx))
-                            edges[('track', 'in_fov_by', 'agent')].append((track_idx, robot_idx))
+                    else:
+                        # Fallback: check if track's source_robot matches ego robot
+                        ego_contributed = (fused_track.source_robot == robot.id)
+                    
+                    if ego_contributed:
+                        # Ego robot observed this track (and by definition, it's in FoV)
+                        edges[('agent', 'observes', 'track')].append((robot_idx, track_idx))
+                        edges[('track', 'observed_by', 'agent')].append((track_idx, robot_idx))
+                        edges[('agent', 'in_fov', 'track')].append((robot_idx, track_idx))
+                        edges[('track', 'in_fov_by', 'agent')].append((track_idx, robot_idx))
             else:
                 # Proximal robots: check if they have observations that match fused tracks
                 robot_tracks = proximal_tracks_by_robot.get(robot.id, [])
@@ -1087,55 +1093,82 @@ class GNNTrainer:
         return losses
     
     def _train_batch_supervised(self, batch: List[TrainingExample]) -> float:
-        """Train a single batch in supervised mode"""
-        total_loss = 0.0
+        """Train a single batch in supervised mode using gradient accumulation"""
         
-        # Enable debug for first example of first batch
+        # Enable debug for first batch
         if not hasattr(self, '_batch_count'):
             self._batch_count = 0
         
+        debug_first_batch = (self._batch_count == 0)
+        
+        if debug_first_batch:
+            print(f"    Processing batch of {len(batch)} graphs with gradient accumulation")
+        
+        # Use gradient accumulation - simple and robust
+        self.optimizer.zero_grad()
+        total_loss = 0.0
+        valid_examples = 0
+        
         for i, example in enumerate(batch):
-            self.optimizer.zero_grad()
-            
-            # Enable debug output for first example
-            if self._batch_count == 0 and i == 0:
-                self._debug_loss = True
-                print(f"    Processing example with {len(example.labels)} labels")
-            
-            # Move data to device
-            x_dict = {k: v.to(self.device) for k, v in example.graph_data.x_dict.items()}
-            
-            # Handle edge_index_dict - some graphs may have no edges
             try:
-                edge_index_dict = {k: v.to(self.device) for k, v in example.graph_data.edge_index_dict.items()}
-            except (KeyError, AttributeError):
-                # No edges in this graph - create empty edge_index_dict
+                # Use the graph data as-is - no complex filtering/copying
+                graph_data = example.graph_data
+                
+                # Move data to device
+                x_dict = {k: v.to(self.device) for k, v in graph_data.x_dict.items()}
+                
+                # Handle edges - create empty tensors for missing edge types
                 edge_index_dict = {}
-            
-            # Forward pass
-            predictions = self.model(x_dict, edge_index_dict)
-            
-            # Debug predictions for first example
-            if self._batch_count == 0 and i == 0:
-                for pred_type, pred_dict in predictions.items():
-                    print(f"    {pred_type} predictions: value={pred_dict['value'].mean().item():.4f}, confidence={pred_dict['confidence'].mean().item():.4f}")
-            
-            # Compute loss
-            loss = self._compute_supervised_loss(predictions, example.labels, example.graph_data)
-            
-            # Check if loss has gradients
-            if self._batch_count == 0 and i == 0:
-                print(f"    Loss requires_grad: {loss.requires_grad}, Loss value: {loss.item():.6f}")
-            
-            # Backward pass
-            loss.backward()
+                required_edge_types = [
+                    ('agent', 'observes', 'track'),
+                    ('track', 'observed_by', 'agent'),
+                    ('agent', 'in_fov', 'track'),
+                    ('track', 'in_fov_by', 'agent')
+                ]
+                
+                for edge_type in required_edge_types:
+                    if edge_type in graph_data.edge_index_dict:
+                        edge_index_dict[edge_type] = graph_data.edge_index_dict[edge_type].to(self.device)
+                    else:
+                        edge_index_dict[edge_type] = torch.empty((2, 0), dtype=torch.long, device=self.device)
+                
+                # Forward pass
+                predictions = self.model(x_dict, edge_index_dict)
+                
+                # Debug first example
+                if debug_first_batch and i == 0:
+                    print(f"    Example {i}: Agents: {x_dict['agent'].shape[0] if 'agent' in x_dict else 0}, "
+                          f"Tracks: {x_dict['track'].shape[0] if 'track' in x_dict else 0}")
+                    for pred_type, pred_dict in predictions.items():
+                        print(f"    {pred_type} predictions: value={pred_dict['value'].mean().item():.4f}, "
+                              f"confidence={pred_dict['confidence'].mean().item():.4f}")
+                
+                # Compute loss
+                loss = self._compute_supervised_loss(predictions, example.labels, graph_data)
+                
+                # Scale loss by batch size for proper gradient accumulation
+                scaled_loss = loss / len(batch)
+                scaled_loss.backward()
+                
+                total_loss += loss.item()
+                valid_examples += 1
+                
+            except Exception as e:
+                if debug_first_batch:
+                    print(f"    Example {i} failed: {e}")
+                continue
+        
+        # Update parameters after accumulating gradients from all examples
+        if valid_examples > 0:
             self.optimizer.step()
-            
-            total_loss += loss.item()
+            avg_loss = total_loss / valid_examples
+        else:
+            avg_loss = 0.0
+        
+        print(f"    Processed {valid_examples}/{len(batch)} examples, avg loss: {avg_loss:.6f}")
         
         self._batch_count += 1
-        
-        return total_loss / len(batch)
+        return avg_loss
     
     def _compute_supervised_loss(self, predictions: Dict, labels: Dict[str, Dict[str, float]], 
                                 graph_data: HeteroData) -> torch.Tensor:
@@ -1154,7 +1187,7 @@ class GNNTrainer:
             for node_id, label_dict in labels.items():
                 if node_id.startswith('agent_'):
                     agent_id = int(node_id.split('_')[1])
-                    if agent_id in graph_data.agent_nodes:
+                    if hasattr(graph_data, 'agent_nodes') and agent_id in graph_data.agent_nodes:
                         idx = graph_data.agent_nodes[agent_id]
                         
                         # Current trust parameters
@@ -1199,7 +1232,7 @@ class GNNTrainer:
             for node_id, label_dict in labels.items():
                 if node_id.startswith('track_'):
                     track_id = node_id.split('_', 1)[1]
-                    if track_id in graph_data.track_nodes:
+                    if hasattr(graph_data, 'track_nodes') and track_id in graph_data.track_nodes:
                         idx = graph_data.track_nodes[track_id]
                         
                         # Current trust parameters
@@ -1272,6 +1305,7 @@ class GNNTrainer:
         
         # Ensure non-negative (numerical stability)
         return torch.clamp(kl, min=0.0)
+    
 
 
 class NeuralSymbolicTrustAlgorithm(TrustAlgorithm):
@@ -1664,103 +1698,3 @@ class NeuralSymbolicTrustAlgorithm(TrustAlgorithm):
                 final_tracks.append(fused_track)
         
         return final_tracks
-    
-    def _create_fused_proximal_track(self, ego_robot: 'RobotState', observations: List[Tuple[int, 'Track', 'RobotState']], 
-                                    object_id: str, track_type: str) -> 'Track':
-        """
-        Create a fused track from multiple proximal robot observations
-        
-        Args:
-            ego_robot: The ego robot from whose perspective the track is created
-            observations: List of (robot_id, track, robot_state) tuples
-            object_id: The object ID being observed
-            track_type: Type of track ("proximal_fused" or "fp_fused")
-            
-        Returns:
-            Fused track with highest mean trust distribution
-        """
-        if not observations:
-            raise ValueError("Cannot create fused track from empty observations")
-        
-        # Find observation with highest mean trust
-        best_observation = None
-        highest_mean_trust = -1.0
-        
-        for robot_id, track, robot in observations:
-            mean_trust = track.trust_alpha / (track.trust_alpha + track.trust_beta)
-            if mean_trust > highest_mean_trust:
-                highest_mean_trust = mean_trust
-                best_observation = (robot_id, track, robot)
-        
-        best_robot_id, best_track, best_robot = best_observation
-        
-        # Calculate fused position as weighted average by confidence
-        total_confidence = sum(track.confidence for _, track, _ in observations)
-        if total_confidence > 0:
-            fused_position = np.zeros(3)
-            fused_velocity = np.zeros(3)
-            
-            for robot_id, track, robot in observations:
-                weight = track.confidence / total_confidence
-                fused_position += weight * track.position
-                fused_velocity += weight * track.velocity
-        else:
-            # Fallback to best track's position/velocity
-            fused_position = best_track.position.copy()
-            fused_velocity = best_track.velocity.copy()
-        
-        # Calculate average confidence
-        avg_confidence = sum(track.confidence for _, track, _ in observations) / len(observations)
-        
-        # Create fused track ID with all source robots
-        source_robot_ids = sorted([robot_id for robot_id, _, _ in observations])
-        if track_type == "proximal_fused":
-            track_id = f"{ego_robot.id}_proximal_fused_{'_'.join(map(str, source_robot_ids))}_{object_id}"
-            source_robot = source_robot_ids[0]  # Use first robot as representative source
-        else:  # fp_fused
-            track_id = f"{ego_robot.id}_fp_fused_{'_'.join(map(str, source_robot_ids))}_{object_id}"
-            source_robot = ego_robot.id  # From ego's perspective for false positives
-        
-        # Create fused track inheriting the highest mean trust
-        fused_track = Track(
-            id=track_id,
-            position=fused_position,
-            velocity=fused_velocity,
-            covariance=best_track.covariance.copy(),  # Use best track's covariance
-            confidence=avg_confidence,
-            timestamp=max(track.timestamp for _, track, _ in observations),  # Most recent timestamp
-            source_robot=source_robot,
-            trust_alpha=best_track.trust_alpha,  # Inherit highest mean trust distribution
-            trust_beta=best_track.trust_beta,
-            object_id=object_id
-        )
-        
-        return fused_track
-    
-    def _propagate_trust_updates_to_source_tracks(self, fused_tracks: List['Track'], 
-                                                 robot_object_tracks: Dict[int, Dict[str, 'Track']]) -> None:
-        """
-        Propagate trust updates from fused tracks back to their source tracks
-        
-        Args:
-            fused_tracks: List of fused tracks that have been updated by GNN
-            robot_object_tracks: robot_id -> {object_id: Track} for updating source tracks
-        """
-        for fused_track in fused_tracks:
-            # Check if this track has source tracks to update
-            if hasattr(fused_track, '_source_tracks'):
-                source_tracks = fused_track._source_tracks
-                
-                for robot_id, source_track in source_tracks:
-                    # Find the source track in robot_object_tracks and update its trust
-                    if (robot_id in robot_object_tracks and 
-                        source_track.object_id in robot_object_tracks[robot_id]):
-                        
-                        source_track_to_update = robot_object_tracks[robot_id][source_track.object_id]
-                        
-                        # Update trust distribution from fused track
-                        source_track_to_update.trust_alpha = fused_track.trust_alpha
-                        source_track_to_update.trust_beta = fused_track.trust_beta
-                        
-                        # Optionally update other properties that might have been refined
-                        # source_track_to_update.confidence = fused_track.confidence
