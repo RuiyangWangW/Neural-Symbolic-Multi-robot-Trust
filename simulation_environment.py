@@ -15,9 +15,7 @@ from scipy.stats import beta
 from scipy.spatial.distance import euclidean
 
 # Import the trust algorithm interfaces
-from trust_algorithm import TrustAlgorithm, RobotState, Track
-from paper_trust_algorithm import PaperTrustAlgorithm
-from neural_symbolic_trust_algorithm import NeuralSymbolicTrustAlgorithm
+from trust_algorithm import RobotState, Track
 
 
 @dataclass
@@ -48,7 +46,9 @@ class SimulationEnvironment:
                  world_size: Tuple[float, float] = (100.0, 100.0),
                  adversarial_ratio: float = 0.3,
                  proximal_range: float = 50.0,
-                 trust_algorithm: Optional[TrustAlgorithm] = None):
+                 fov_range: float = 20.0,
+                 fov_angle: float = np.pi/3,
+):
         """
         Initialize simulation environment
         
@@ -58,19 +58,17 @@ class SimulationEnvironment:
             world_size: Size of the simulation world
             adversarial_ratio: Fraction of robots that are adversarial
             proximal_range: Maximum distance for robots to be considered proximal
-            trust_algorithm: Trust algorithm to use (defaults to paper's method)
+            fov_range: Field of view range for robots (default: 20.0)
+            fov_angle: Field of view angle in radians (default: π/3, 60 degrees)
         """
         self.num_robots = num_robots
         self.num_targets = num_targets
         self.world_size = world_size
         self.adversarial_ratio = adversarial_ratio
         self.proximal_range = proximal_range
+        self.fov_range = fov_range
+        self.fov_angle = fov_angle
         
-        # Initialize trust algorithm (default to paper's method)
-        if trust_algorithm is None:
-            self.trust_algorithm = PaperTrustAlgorithm()
-        else:
-            self.trust_algorithm = trust_algorithm
         
         self.robots: List[RobotState] = []
         self.ground_truth_objects: List[GroundTruthObject] = []
@@ -85,10 +83,29 @@ class SimulationEnvironment:
         self.dt = 0.1  # 10Hz simulation rate
         self.next_object_id = 0  # For generating unique object IDs
         
-        # FP objects management for adversarial robots
-        self.fp_objects_by_robot: Dict[int, Dict[str, Dict[str, np.ndarray]]] = {}
-        self.fp_next_id_by_robot: Dict[int, int] = {}
+        # FP objects management - now shared globally
+        self.shared_fp_objects: Dict[str, Dict[str, np.ndarray]] = {}  # Global FP objects {fp_id: {position, velocity}}
+        self.next_shared_fp_id = 0  # Global FP ID counter
         
+        self._initialize_environment()
+    
+    def reset(self):
+        """Reset the simulation to initial state"""
+        # Clear existing state
+        self.robots.clear()
+        self.ground_truth_objects.clear()
+        self.tracks.clear()
+        self.raw_tracks.clear()
+        self.robot_object_tracks.clear()
+        self.robot_current_tracks.clear()
+        self.shared_fp_objects.clear()
+        
+        # Reset time and counters
+        self.time = 0.0
+        self.next_object_id = 0
+        self.next_shared_fp_id = 0
+        
+        # Re-initialize environment with new random positions and adversarial assignments
         self._initialize_environment()
     
     def _initialize_environment(self):
@@ -101,8 +118,6 @@ class SimulationEnvironment:
             # Initialize per-robot object tracking structures
             self.robot_object_tracks[i] = {}
             self.robot_current_tracks[i] = {}
-            self.fp_objects_by_robot[i] = {}
-            self.fp_next_id_by_robot[i] = 0
             
             # Start position (home base)
             start_pos = np.array([
@@ -136,8 +151,8 @@ class SimulationEnvironment:
                 position=start_pos.copy(),
                 velocity=np.array([0.0, 0.0, 0.0]),
                 orientation=0.0,
-                fov_range=20.0,
-                fov_angle=np.pi/3,  # 60 degrees
+                fov_range=self.fov_range,
+                fov_angle=self.fov_angle,
                 is_adversarial=(i in adversarial_ids),
                 start_position=start_pos,
                 goal_position=goal_pos,
@@ -157,10 +172,7 @@ class SimulationEnvironment:
             self.ground_truth_objects.append(obj)
         
         # Initialize trust algorithm
-        self.trust_algorithm.initialize(self.robots)
-        
         print(f"Simulation initialized with {len(self.robots)} robots and {len(self.ground_truth_objects)} objects")
-        print(f"Using trust algorithm: {type(self.trust_algorithm).__name__}")
     
     def _create_ground_truth_object(self, spawn_time: float) -> GroundTruthObject:
         """Create a new ground truth object with random properties"""
@@ -245,10 +257,10 @@ class SimulationEnvironment:
         objects_to_remove = []
         
         for obj in self.ground_truth_objects:
-            # Check if object should be removed (lifespan expired)
-            if obj.lifespan > 0 and (self.time - obj.spawn_time) > obj.lifespan:
-                objects_to_remove.append(obj)
-                continue
+            # Fixed objects - no expiration during episode
+            # if obj.lifespan > 0 and (self.time - obj.spawn_time) > obj.lifespan:
+            #     objects_to_remove.append(obj)
+            #     continue
             
             # Update object based on movement pattern
             if obj.movement_pattern == 'stationary':
@@ -308,11 +320,107 @@ class SimulationEnvironment:
         for obj in objects_to_remove:
             self.ground_truth_objects.remove(obj)
         
-        # Occasionally spawn new objects
-        if random.random() < 0.05:  # 5% chance per step
-            if len(self.ground_truth_objects) < self.num_targets * 2:
-                new_obj = self._create_ground_truth_object(self.time)
-                self.ground_truth_objects.append(new_obj)
+        # Fixed number of ground truth objects - no dynamic spawning
+        
+        # Update shared FP objects based on adversarial robot FOVs
+        self._update_shared_fp_objects()
+    
+    def _update_shared_fp_objects(self):
+        """Manage shared FP objects with random spawning and adversarial robot FOV constraints"""
+        false_positive_rate = 0.5
+        adversarial_robots = [r for r in self.robots if r.is_adversarial]
+        
+        if not adversarial_robots:
+            # No adversarial robots - clear all FP objects
+            self.shared_fp_objects.clear()
+            return
+        
+        # Calculate max FP count based on current ground truth objects
+        max_fp_objects = int(len(self.ground_truth_objects) * false_positive_rate)
+        
+        # Update existing FP object dynamics
+        for fp_id, state in self.shared_fp_objects.items():
+            pos = state['position']
+            vel = state['velocity']
+            
+            # Random steering
+            if random.random() < 0.1:
+                steer = random.uniform(-np.pi/6, np.pi/6)
+                rot = np.array([[np.cos(steer), -np.sin(steer), 0],
+                                [np.sin(steer),  np.cos(steer), 0],
+                                [0, 0, 1]])
+                vel = rot @ vel
+                state['velocity'] = vel
+            
+            # Propagate position
+            pos = pos + vel * self.dt
+            
+            # Boundary handling
+            if pos[0] <= 0 or pos[0] >= self.world_size[0]: vel[0] *= -1
+            if pos[1] <= 0 or pos[1] >= self.world_size[1]: vel[1] *= -1
+            pos[0] = np.clip(pos[0], 0, self.world_size[0])
+            pos[1] = np.clip(pos[1], 0, self.world_size[1])
+            
+            state['position'] = pos
+            state['velocity'] = vel
+        
+        # Random FP spawning (small probability)
+        if random.random() < 0.05 and len(self.shared_fp_objects) < max_fp_objects:  # 5% chance per step
+            # Pick a random adversarial robot to create FP near
+            target_robot = random.choice(adversarial_robots)
+            
+            # Create FP in robot's FOV
+            angle = target_robot.orientation + random.uniform(-target_robot.fov_angle/2, target_robot.fov_angle/2)
+            distance = random.uniform(3, target_robot.fov_range)
+            new_pos = target_robot.position + np.array([
+                distance*np.cos(angle), 
+                distance*np.sin(angle), 
+                random.uniform(-5, 5)
+            ])
+            
+            # Check it's not too close to true objects or existing FPs
+            too_close = any(np.linalg.norm(new_pos - gt.position) < 3.0 
+                           for gt in self.ground_truth_objects)
+            too_close = too_close or any(np.linalg.norm(new_pos - state['position']) < 2.0 
+                                       for state in self.shared_fp_objects.values())
+            
+            if not too_close:
+                speed = random.uniform(0.2, 1.5)
+                theta = random.uniform(0, 2*np.pi)
+                vel = np.array([speed*np.cos(theta), speed*np.sin(theta), random.uniform(-0.2, 0.2)])
+                
+                # Create shared FP with global ID
+                fp_id = f"shared_fp_{self.next_shared_fp_id}"
+                self.next_shared_fp_id += 1
+                self.shared_fp_objects[fp_id] = {'position': new_pos, 'velocity': vel}
+        
+        # Remove excess FP objects if we're over the limit (prioritize those outside adversarial FOVs)
+        if len(self.shared_fp_objects) > max_fp_objects:
+            fps_outside_fov = []
+            fps_inside_fov = []
+            
+            for fp_id, fp_state in self.shared_fp_objects.items():
+                visible_to_adversarial = any(self.is_in_fov(robot, fp_state['position']) 
+                                           for robot in adversarial_robots)
+                if visible_to_adversarial:
+                    fps_inside_fov.append(fp_id)
+                else:
+                    fps_outside_fov.append(fp_id)
+            
+            # How many to remove
+            excess_count = len(self.shared_fp_objects) - max_fp_objects
+            fps_to_remove = []
+            
+            # First remove FPs outside adversarial FOV
+            fps_to_remove.extend(fps_outside_fov[:excess_count])
+            remaining_to_remove = excess_count - len(fps_to_remove)
+            
+            # If still need to remove more, remove some inside FOV
+            if remaining_to_remove > 0:
+                fps_to_remove.extend(fps_inside_fov[:remaining_to_remove])
+            
+            for fp_id in fps_to_remove:
+                del self.shared_fp_objects[fp_id]
     
     def _update_robot_navigation(self, robot: RobotState):
         """Update robot's velocity and orientation based on current patrol target"""
@@ -372,14 +480,9 @@ class SimulationEnvironment:
                 noisy_vel = gt_obj.velocity + np.random.normal(0, 0.2, 3)
                 covariance = np.eye(6) * (noise_std * 0.5)**2
                 
-                # Get or initialize track trust for this robot-object pair
-                if object_id in self.trust_algorithm.robot_object_trust[robot.id]:
-                    trust_alpha, trust_beta = self.trust_algorithm.robot_object_trust[robot.id][object_id]
-                else:
-                    # Initialize with neutral Beta(1,1) prior
-                    trust_alpha = 1.0
-                    trust_beta = 1.0
-                    self.trust_algorithm.robot_object_trust[robot.id][object_id] = (trust_alpha, trust_beta)
+                # Initialize with neutral Beta(1,1) prior
+                trust_alpha = 1.0
+                trust_beta = 1.0
                 
                 # Create track ID
                 track_key = f"{robot.id}_{object_id}"
@@ -425,7 +528,6 @@ class SimulationEnvironment:
         
         # Parameters for adversarial behavior
         false_negative_rate = 0.0
-        false_positive_rate = 0.5
         position_noise_std = noise_std * 0.5
         velocity_noise_std = 0.2
         
@@ -442,13 +544,9 @@ class SimulationEnvironment:
             noisy_vel = gt_obj.velocity + np.random.normal(0, velocity_noise_std, 3)
             covariance = np.eye(6) * position_noise_std**2
             
-            # Get or initialize track trust for this robot-object pair
-            if object_id in self.trust_algorithm.robot_object_trust[robot.id]:
-                trust_alpha, trust_beta = self.trust_algorithm.robot_object_trust[robot.id][object_id]
-            else:
-                trust_alpha = 1.0
-                trust_beta = 1.0
-                self.trust_algorithm.robot_object_trust[robot.id][object_id] = (trust_alpha, trust_beta)
+            # Initialize trust values
+            trust_alpha = 1.0
+            trust_beta = 1.0
             
             track_key = f"{robot.id}_{object_id}"
             
@@ -485,60 +583,10 @@ class SimulationEnvironment:
             self.robot_current_tracks[robot.id][object_id] = track
             tracks.append(track)
         
-        # Generate persistent false positives
-        target_num_fp_in_fov = int(len(true_objects_in_fov) * false_positive_rate)
-        fp_store = self.fp_objects_by_robot[robot.id]
+        # FP objects are now managed globally, just detect visible ones
         
-        # Count current FPs in FOV
-        fp_in_fov = [fp_id for fp_id, state in fp_store.items() 
-                     if self.is_in_fov(robot, state['position'])]
-        current_fp_in_fov = len(fp_in_fov)
-        
-        # Cleanup: Remove excess FPs, prioritizing out-of-FOV ones
-        max_total_fps = target_num_fp_in_fov + 3  # Allow some FPs to exist outside FOV for persistence
-        if len(fp_store) > max_total_fps:
-            # Prioritize removing FPs that are out of FOV first
-            fp_out_of_fov = [fp_id for fp_id, state in fp_store.items() 
-                            if not self.is_in_fov(robot, state['position'])]
-            to_drop = fp_out_of_fov[:len(fp_store) - max_total_fps]
-            
-            # If we still need to drop more, remove some in-FOV ones
-            if len(to_drop) < len(fp_store) - max_total_fps:
-                remaining_to_drop = len(fp_store) - max_total_fps - len(to_drop)
-                to_drop.extend(random.sample(fp_in_fov, min(remaining_to_drop, len(fp_in_fov))))
-            
-            for oid in to_drop:
-                fp_store.pop(oid, None)
-        
-        # Recalculate FP counts after cleanup
-        fp_in_fov = [fp_id for fp_id, state in fp_store.items() 
-                     if self.is_in_fov(robot, state['position'])]
-        current_fp_in_fov = len(fp_in_fov)
-        
-        # Spawn new FPs if needed
-        while current_fp_in_fov < target_num_fp_in_fov:
-            # Create FP in robot's FOV
-            angle = robot.orientation + random.uniform(-robot.fov_angle/2, robot.fov_angle/2)
-            distance = random.uniform(3, robot.fov_range)
-            new_pos = robot.position + np.array([
-                distance*np.cos(angle), 
-                distance*np.sin(angle), 
-                random.uniform(-5, 5)
-            ])
-            
-            # Check it's not too close to true objects
-            if all(np.linalg.norm(new_pos - gt.position) >= 3.0 for gt in true_objects_in_fov):
-                speed = random.uniform(0.2, 1.5)
-                theta = random.uniform(0, 2*np.pi)
-                vel = np.array([speed*np.cos(theta), speed*np.sin(theta), random.uniform(-0.2, 0.2)])
-                
-                fp_id = f"fp_{robot.id}_{self.fp_next_id_by_robot[robot.id]}"
-                self.fp_next_id_by_robot[robot.id] += 1
-                fp_store[fp_id] = {'position': new_pos, 'velocity': vel}
-                current_fp_in_fov += 1
-        
-        # Update FP dynamics and emit tracks for FPs in FOV
-        for fp_id, state in list(fp_store.items()):
+        # Update shared FP dynamics and emit tracks for FPs in FOV
+        for fp_id, state in list(self.shared_fp_objects.items()):
             pos = state['position']
             vel = state['velocity']
             
@@ -567,13 +615,9 @@ class SimulationEnvironment:
             if self.is_in_fov(robot, pos):
                 fp_track_key = f"{robot.id}_{fp_id}"
                 
-                # Get or initialize track trust for this robot-FP pair
-                if fp_id in self.trust_algorithm.robot_object_trust[robot.id]:
-                    trust_alpha, trust_beta = self.trust_algorithm.robot_object_trust[robot.id][fp_id]
-                else:
-                    trust_alpha = 1.0
-                    trust_beta = 1.0
-                    self.trust_algorithm.robot_object_trust[robot.id][fp_id] = (trust_alpha, trust_beta)
+                # Initialize trust values
+                trust_alpha = 1.0
+                trust_beta = 1.0
                 
                 # Check if track already exists in accumulated tracks
                 if fp_id in self.robot_object_tracks[robot.id]:
@@ -652,11 +696,6 @@ class SimulationEnvironment:
             # Convert per-robot object tracks to list format
             self.tracks[robot.id] = list(self.robot_object_tracks[robot.id].values())
         
-        # Update trust using the pluggable trust algorithm
-        trust_updates = self.trust_algorithm.update_trust(
-            self.robots, self.tracks, self.robot_object_tracks, self.time, 
-            self.robot_current_tracks, self
-        )
         
         self.time += self.dt
         
@@ -667,8 +706,6 @@ class SimulationEnvironment:
             'tracks': {robot_id: [(t.id, t.position.tolist(), t.confidence, t.trust_alpha, t.trust_beta) 
                                 for t in tracks] 
                       for robot_id, tracks in self.tracks.items()},
-            'trust_updates': trust_updates,
-            'trust_algorithm': type(self.trust_algorithm).__name__,
             'ground_truth': {
                 'objects': [(obj.id, obj.position.tolist(), obj.velocity.tolist(), 
                            obj.object_type, obj.movement_pattern) for obj in self.ground_truth_objects],
@@ -676,17 +713,11 @@ class SimulationEnvironment:
                 'legitimate_robots': [r.id for r in self.robots if not r.is_adversarial],
                 'num_objects': len(self.ground_truth_objects)
             },
-            'fp_objects': {robot_id: [(fp_id, state['position'].tolist(), state['velocity'].tolist()) 
-                                     for fp_id, state in fp_store.items()]
-                          for robot_id, fp_store in self.fp_objects_by_robot.items() if fp_store}
+            'shared_fp_objects': [(fp_id, state['position'].tolist(), state['velocity'].tolist()) 
+                                 for fp_id, state in self.shared_fp_objects.items()]
         }
     
     
-    def switch_trust_algorithm(self, new_algorithm: TrustAlgorithm):
-        """Switch to a different trust algorithm"""
-        print(f"Switching from {type(self.trust_algorithm).__name__} to {type(new_algorithm).__name__}")
-        self.trust_algorithm = new_algorithm
-        self.trust_algorithm.initialize(self.robots)
     
     def visualize_current_state(self, save_path: Optional[str] = None):
         """Visualize current simulation state matching create_simulation_gif.py format"""
@@ -704,7 +735,7 @@ class SimulationEnvironment:
         leg_trusts = [r.trust_alpha/(r.trust_alpha+r.trust_beta) for r in self.robots if not r.is_adversarial]
         adv_trusts = [r.trust_alpha/(r.trust_alpha+r.trust_beta) for r in self.robots if r.is_adversarial]
         
-        title_parts = [f'Trust-Based Sensor Fusion ({type(self.trust_algorithm).__name__}) - t={self.time:.1f}s']
+        title_parts = [f'Trust-Based Sensor Fusion - t={self.time:.1f}s']
         if leg_trusts:
             title_parts.append(f'LEG Trust: {np.mean(leg_trusts):.2f}')
         if adv_trusts:
@@ -768,9 +799,9 @@ class SimulationEnvironment:
             ax.fill(fov_x, fov_y, color=color, alpha=fov_alpha)
             ax.plot(fov_x, fov_y, color=color, linewidth=2, alpha=0.6)
             
-            # Plot false positive objects (orange stars, same as GT but different color)
-            if robot.id in self.fp_objects_by_robot:
-                for fp_id, fp_state in self.fp_objects_by_robot[robot.id].items():
+            # Plot shared false positive objects (orange stars, same as GT but different color)
+            for fp_id, fp_state in self.shared_fp_objects.items():
+                if self.is_in_fov(robot, fp_state['position']):
                     fp_pos = fp_state['position'][:2]  # Only x, y coordinates
                     
                     # FP Objects: Use same star symbol as GT objects but orange color
@@ -800,7 +831,7 @@ class SimulationEnvironment:
         info_text = f"Ground Truth Objects: {len(self.ground_truth_objects)}\n"
         
         # Count FP objects
-        total_fp_objects = sum(len(fp_store) for fp_store in self.fp_objects_by_robot.values())
+        total_fp_objects = len(self.shared_fp_objects)
         info_text += f"False Positive Objects: {total_fp_objects}\n"
         
         # Add robot trust info
@@ -828,10 +859,8 @@ def main():
     
     # Test with paper's algorithm first
     print("\n=== Testing with Paper's Trust Algorithm ===")
-    paper_algorithm = PaperTrustAlgorithm()
     env_paper = SimulationEnvironment(
-        num_robots=5, num_targets=20, world_size=(50.0, 50.0), 
-        trust_algorithm=paper_algorithm
+        num_robots=5, num_targets=20, world_size=(50.0, 50.0)
     )
     
     # Run simulation (using 500 steps like original)
@@ -842,10 +871,8 @@ def main():
     """
     # Test with neural symbolic algorithm
     print("\n=== Testing with Neural Symbolic Trust Algorithm ===")
-    neural_algorithm = NeuralSymbolicTrustAlgorithm()
     env_neural = SimulationEnvironment(
-        num_robots=5, num_targets=20, world_size=(50.0, 50.0), 
-        trust_algorithm=neural_algorithm
+        num_robots=5, num_targets=20, world_size=(50.0, 50.0)
     )
     
     # Collect data with neural symbolic algorithm
