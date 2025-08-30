@@ -2176,7 +2176,7 @@ def main():
         if arg in ['--no-viz', '--disable-visualization', '--no-visualization']:
             enable_visualization = False
             # print("📊 Visualization disabled for large-scale training")
-        elif arg in ['cpu', 'cuda', 'auto']:
+        elif arg in ['cpu', 'cuda', 'auto'] or arg.startswith('cuda:'):
             device = arg
         elif arg.isdigit():
             episodes = int(arg)
