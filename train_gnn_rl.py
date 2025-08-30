@@ -68,10 +68,10 @@ class PPOTrainer:
             # Handle edge_index_dict - use the proper edge_index_dict we created
             edge_index_dict = {}
             required_edge_types = [
-                ('agent', 'observes', 'track'),
-                ('track', 'observed_by', 'agent'),
-                ('agent', 'in_fov', 'track'),
-                ('track', 'in_fov_by', 'agent'),
+                ('agent', 'in_fov_and_observed', 'track'),
+                ('track', 'observed_and_in_fov_by', 'agent'),
+                ('agent', 'in_fov_only', 'track'),
+                ('track', 'in_fov_only_by', 'agent'),
                 # ('agent', 'isProximal', 'agent')  # TEMPORARILY DISABLED
             ]
             
@@ -187,10 +187,10 @@ class PPOTrainer:
     def _ensure_edge_types(self, edge_index_dict):
         """Ensure all required edge types exist"""
         required_edge_types = [
-            ('agent', 'observes', 'track'),
-            ('track', 'observed_by', 'agent'),
-            ('agent', 'in_fov', 'track'),
-            ('track', 'in_fov_by', 'agent'),
+            ('agent', 'in_fov_and_observed', 'track'),
+            ('track', 'observed_and_in_fov_by', 'agent'),
+            ('agent', 'in_fov_only', 'track'),
+            ('track', 'in_fov_only_by', 'agent'),
             # ('agent', 'isProximal', 'agent')  # TEMPORARILY DISABLED
         ]
         
@@ -1000,14 +1000,16 @@ class RLTrustEnvironment:
             track_feature_summaries.append(summary)
         #print(f"  📍 Track features (T,C,M,F,U): {track_feature_summaries[:8]}{'...' if len(track_feature_summaries) > 8 else ''}")
         
-        # Build edges: Observes, InFoV, and Proximal relationships
-        observes_edges = []  # (agent, track) - robot observes track
-        observed_by_edges = []  # (track, agent) - track observed by robot
-        in_fov_edges = []  # (agent, track) - track is in robot's field of view
-        in_fov_by_edges = []  # (track, agent) - track is in robot's field of view
+        # Build edges with precise semantics:
+        # - in_fov_and_observed: Robot observes a track that is within its FoV  
+        # - in_fov_only: Track is in robot's FoV but robot does not observe it
+        in_fov_and_observed_edges = []  # (agent, track) - robot observes track AND it's in FoV
+        observed_and_in_fov_by_edges = []  # (track, agent) - track observed by robot AND in its FoV
+        in_fov_only_edges = []  # (agent, track) - track in robot's FoV but NOT observed by robot
+        in_fov_only_by_edges = []  # (track, agent) - track in robot's FoV but NOT observed by robot
         # is_proximal_edges = []  # (agent, agent) - robot is proximal to another robot - TEMPORARILY DISABLED
         
-        # STEP 1: Create OBSERVES edges - robot observes tracks it owns/contributes to
+        # CRITICAL: Create edges to maintain same connectivity as original
         for robot in all_robots:
             robot_idx = agent_nodes[robot.id]
             
@@ -1017,29 +1019,23 @@ class RLTrustEnvironment:
                 # Check if robot observes this track (based on ownership/contribution)
                 observes_track = self._robot_observes_track(robot, track, fused_tracks, individual_tracks, track_fusion_map)
                 
-                if observes_track:
-                    observes_edges.append([robot_idx, track_idx])
-                    observed_by_edges.append([track_idx, robot_idx])
-        
-        # STEP 2: Create IN_FOV edges - robot can see tracks from all robots in the group
-        for robot in all_robots:
-            robot_idx = agent_nodes[robot.id]
-            
-            for track in all_tracks:
-                track_idx = track_nodes[track.id]
-                
-                # Check if robot observes this track (if so, it MUST be in FoV)
-                observes_track = self._robot_observes_track(robot, track, fused_tracks, individual_tracks, track_fusion_map)
-                
                 # Check if track is in robot's field of view (distance/angle based)
                 in_fov_by_distance = self._track_in_robot_fov(robot, track)
                 
-                # A track is in FoV if: robot observes it OR it's within FoV distance
-                in_fov = observes_track or in_fov_by_distance
+                # ORIGINAL LOGIC: A track is in FoV if: robot observes it OR it's within FoV distance
+                # This ensures we maintain the same total edge count as before
+                original_in_fov = observes_track or in_fov_by_distance
                 
-                if in_fov:
-                    in_fov_edges.append([robot_idx, track_idx])
-                    in_fov_by_edges.append([track_idx, robot_idx])
+                if original_in_fov:
+                    # Now categorize based on precise semantics
+                    if observes_track:
+                        # Robot observes the track (and it must be in some form of FoV)
+                        in_fov_and_observed_edges.append([robot_idx, track_idx])
+                        observed_and_in_fov_by_edges.append([track_idx, robot_idx])
+                    else:
+                        # Track is in FoV by distance but robot doesn't observe it
+                        in_fov_only_edges.append([robot_idx, track_idx])
+                        in_fov_only_by_edges.append([track_idx, robot_idx])
         
         # STEP 3: Create IS_PROXIMAL edges between robots based on distance
         # TEMPORARILY DISABLED - Comment out proximal edge creation
@@ -1069,14 +1065,14 @@ class RLTrustEnvironment:
         
         # Convert to tensors and create proper edge structure
         edge_types = [
-            ('agent', 'observes', 'track'),
-            ('track', 'observed_by', 'agent'),
-            ('agent', 'in_fov', 'track'),
-            ('track', 'in_fov_by', 'agent'),
+            ('agent', 'in_fov_and_observed', 'track'),
+            ('track', 'observed_and_in_fov_by', 'agent'),
+            ('agent', 'in_fov_only', 'track'),
+            ('track', 'in_fov_only_by', 'agent'),
             # ('agent', 'isProximal', 'agent')  # TEMPORARILY DISABLED
         ]
         
-        edge_data = [observes_edges, observed_by_edges, in_fov_edges, in_fov_by_edges]  # Removed is_proximal_edges
+        edge_data = [in_fov_and_observed_edges, observed_and_in_fov_by_edges, in_fov_only_edges, in_fov_only_by_edges]
         
         for edge_type, edges in zip(edge_types, edge_data):
             if edges:
@@ -1158,10 +1154,10 @@ class RLTrustEnvironment:
         graph_data['track'].x = torch.empty((0, 1), dtype=torch.float)
         
         required_edge_types = [
-            ('agent', 'observes', 'track'),
-            ('track', 'observed_by', 'agent'),
-            ('agent', 'in_fov', 'track'),
-            ('track', 'in_fov_by', 'agent'),
+            ('agent', 'in_fov_and_observed', 'track'),
+            ('track', 'observed_and_in_fov_by', 'agent'),
+            ('agent', 'in_fov_only', 'track'),
+            ('track', 'in_fov_only_by', 'agent'),
             # ('agent', 'isProximal', 'agent')  # TEMPORARILY DISABLED
         ]
         
