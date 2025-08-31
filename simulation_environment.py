@@ -14,8 +14,8 @@ import random
 from scipy.stats import beta
 from scipy.spatial.distance import euclidean
 
-# Import the trust algorithm interfaces
-from trust_algorithm import RobotState, Track
+# Import the clean robot and track classes
+from robot_track_classes import Robot, Track
 
 
 @dataclass
@@ -43,11 +43,13 @@ class SimulationEnvironment:
     """Multi-robot simulation environment with pluggable trust algorithms"""
     
     def __init__(self, num_robots: int = 5, num_targets: int = 10, 
-                 world_size: Tuple[float, float] = (100.0, 100.0),
+                 world_size: Tuple[float, float] = (60.0, 60.0),
                  adversarial_ratio: float = 0.3,
-                 proximal_range: float = 50.0,
-                 fov_range: float = 20.0,
+                 proximal_range: float = 100.0,
+                 fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
+                 false_positive_rate: float = 0.5,
+                 false_negative_rate: float = 0.0
 ):
         """
         Initialize simulation environment
@@ -60,6 +62,8 @@ class SimulationEnvironment:
             proximal_range: Maximum distance for robots to be considered proximal
             fov_range: Field of view range for robots (default: 20.0)
             fov_angle: Field of view angle in radians (default: π/3, 60 degrees)
+            false_positive_rate: Rate of false positive detections (default: 0.5)
+            false_negative_rate: Rate of false negative detections (default: 0.0)
         """
         self.num_robots = num_robots
         self.num_targets = num_targets
@@ -68,23 +72,19 @@ class SimulationEnvironment:
         self.proximal_range = proximal_range
         self.fov_range = fov_range
         self.fov_angle = fov_angle
-        
-        
-        self.robots: List[RobotState] = []
+        self.false_positive_rate = false_positive_rate
+        self.false_negative_rate = false_negative_rate
+
+        self.robots: List[Robot] = []
         self.ground_truth_objects: List[GroundTruthObject] = []
-        self.tracks: Dict[int, List[Track]] = {}  # Robot ID -> list of tracks
-        self.raw_tracks: Dict[int, List[Track]] = {}  # Robot ID -> raw unfiltered tracks
-        
-        # Per-robot object track management
-        self.robot_object_tracks: Dict[int, Dict[str, Track]] = {}  # robot_id -> {object_id: Track} - ALL accumulated tracks
-        self.robot_current_tracks: Dict[int, Dict[str, Track]] = {}  # robot_id -> {object_id: Track} - CURRENT timestep tracks only
+        # Track management is now handled directly by each Robot instance
         
         self.time = 0.0
         self.dt = 0.1  # 10Hz simulation rate
         self.next_object_id = 0  # For generating unique object IDs
         
-        # FP objects management - now shared globally
-        self.shared_fp_objects: Dict[str, Dict[str, np.ndarray]] = {}  # Global FP objects {fp_id: {position, velocity}}
+        # FP objects management - now shared globally using same structure as ground truth
+        self.shared_fp_objects: List[GroundTruthObject] = []  # Global FP objects using GroundTruthObject structure
         self.next_shared_fp_id = 0  # Global FP ID counter
         
         self._initialize_environment()
@@ -94,10 +94,6 @@ class SimulationEnvironment:
         # Clear existing state
         self.robots.clear()
         self.ground_truth_objects.clear()
-        self.tracks.clear()
-        self.raw_tracks.clear()
-        self.robot_object_tracks.clear()
-        self.robot_current_tracks.clear()
         self.shared_fp_objects.clear()
         
         # Reset time and counters
@@ -115,9 +111,6 @@ class SimulationEnvironment:
         adversarial_ids = set(random.sample(range(self.num_robots), num_adversarial))
         
         for i in range(self.num_robots):
-            # Initialize per-robot object tracking structures
-            self.robot_object_tracks[i] = {}
-            self.robot_current_tracks[i] = {}
             
             # Start position (home base)
             start_pos = np.array([
@@ -146,25 +139,27 @@ class SimulationEnvironment:
                 ])
                 attempts += 1
             
-            robot = RobotState(
-                id=i,
+            robot = Robot(
+                robot_id=i,
                 position=start_pos.copy(),
                 velocity=np.array([0.0, 0.0, 0.0]),
-                orientation=0.0,
                 fov_range=self.fov_range,
-                fov_angle=self.fov_angle,
-                is_adversarial=(i in adversarial_ids),
-                start_position=start_pos,
-                goal_position=goal_pos,
-                patrol_speed=random.uniform(1.5, 2.5)
+                fov_angle=self.fov_angle
             )
+            
+            # Set additional attributes for patrol behavior
+            robot.is_adversarial = (i in adversarial_ids)
+            robot.start_position = start_pos
+            robot.goal_position = goal_pos
+            robot.patrol_speed = random.uniform(1.5, 2.5)
+            robot.orientation = 0.0
+            robot.is_returning_home = False
+            robot.position_tolerance = 3.0
             
             # Initialize velocity and orientation toward goal
             self._update_robot_navigation(robot)
             
             self.robots.append(robot)
-            self.tracks[i] = []
-            self.raw_tracks[i] = []
         
         # Initialize ground truth objects
         for i in range(self.num_targets):
@@ -327,7 +322,7 @@ class SimulationEnvironment:
     
     def _update_shared_fp_objects(self):
         """Manage shared FP objects with random spawning and adversarial robot FOV constraints"""
-        false_positive_rate = 0.5
+        false_positive_rate = self.false_positive_rate
         adversarial_robots = [r for r in self.robots if r.is_adversarial]
         
         if not adversarial_robots:
@@ -338,34 +333,53 @@ class SimulationEnvironment:
         # Calculate max FP count based on current ground truth objects
         max_fp_objects = int(len(self.ground_truth_objects) * false_positive_rate)
         
-        # Update existing FP object dynamics
-        for fp_id, state in self.shared_fp_objects.items():
-            pos = state['position']
-            vel = state['velocity']
-            
-            # Random steering
-            if random.random() < 0.1:
-                steer = random.uniform(-np.pi/6, np.pi/6)
-                rot = np.array([[np.cos(steer), -np.sin(steer), 0],
-                                [np.sin(steer),  np.cos(steer), 0],
-                                [0, 0, 1]])
-                vel = rot @ vel
-                state['velocity'] = vel
-            
-            # Propagate position
-            pos = pos + vel * self.dt
-            
-            # Boundary handling
-            if pos[0] <= 0 or pos[0] >= self.world_size[0]: vel[0] *= -1
-            if pos[1] <= 0 or pos[1] >= self.world_size[1]: vel[1] *= -1
-            pos[0] = np.clip(pos[0], 0, self.world_size[0])
-            pos[1] = np.clip(pos[1], 0, self.world_size[1])
-            
-            state['position'] = pos
-            state['velocity'] = vel
+        # Update existing FP object dynamics using same logic as ground truth objects
+        
+        for fp_obj in self.shared_fp_objects:
+            # Update FP object based on movement pattern (similar to ground truth objects)
+            if fp_obj.movement_pattern == 'stationary':
+                pass
+                
+            elif fp_obj.movement_pattern == 'linear':
+                # Move in straight line, bounce off walls
+                new_pos = fp_obj.position + fp_obj.velocity * self.dt
+                
+                # Bounce off boundaries
+                if new_pos[0] <= 0 or new_pos[0] >= self.world_size[0]:
+                    fp_obj.velocity[0] *= -1
+                if new_pos[1] <= 0 or new_pos[1] >= self.world_size[1]:
+                    fp_obj.velocity[1] *= -1
+                
+                fp_obj.position += fp_obj.velocity * self.dt
+                fp_obj.position[0] = np.clip(fp_obj.position[0], 0, self.world_size[0])
+                fp_obj.position[1] = np.clip(fp_obj.position[1], 0, self.world_size[1])
+                
+            elif fp_obj.movement_pattern == 'random_walk':
+                # Random walk with occasional direction changes
+                if random.random() < fp_obj.turn_probability:
+                    angle = random.uniform(0, 2*np.pi)
+                    fp_obj.velocity = np.array([
+                        fp_obj.base_speed * np.cos(angle),
+                        fp_obj.base_speed * np.sin(angle),
+                        0.0
+                    ])
+                
+                new_pos = fp_obj.position + fp_obj.velocity * self.dt
+                if (new_pos[0] <= 0 or new_pos[0] >= self.world_size[0] or 
+                    new_pos[1] <= 0 or new_pos[1] >= self.world_size[1]):
+                    angle = random.uniform(0, 2*np.pi)
+                    fp_obj.velocity = np.array([
+                        fp_obj.base_speed * np.cos(angle),
+                        fp_obj.base_speed * np.sin(angle),
+                        0.0
+                    ])
+                
+                fp_obj.position += fp_obj.velocity * self.dt
+                fp_obj.position[0] = np.clip(fp_obj.position[0], 0, self.world_size[0])
+                fp_obj.position[1] = np.clip(fp_obj.position[1], 0, self.world_size[1])
         
         # Random FP spawning (small probability)
-        if random.random() < 0.05 and len(self.shared_fp_objects) < max_fp_objects:  # 5% chance per step
+        if random.random() < 0.1: 
             # Pick a random adversarial robot to create FP near
             target_robot = random.choice(adversarial_robots)
             
@@ -381,31 +395,40 @@ class SimulationEnvironment:
             # Check it's not too close to true objects or existing FPs
             too_close = any(np.linalg.norm(new_pos - gt.position) < 3.0 
                            for gt in self.ground_truth_objects)
-            too_close = too_close or any(np.linalg.norm(new_pos - state['position']) < 2.0 
-                                       for state in self.shared_fp_objects.values())
+            too_close = too_close or any(np.linalg.norm(new_pos - fp.position) < 2.0 
+                                       for fp in self.shared_fp_objects)
             
             if not too_close:
-                speed = random.uniform(0.2, 1.5)
-                theta = random.uniform(0, 2*np.pi)
-                vel = np.array([speed*np.cos(theta), speed*np.sin(theta), random.uniform(-0.2, 0.2)])
+                # Create a new FP object using GroundTruthObject structure
+                fp_obj = GroundTruthObject(
+                    id=self.next_shared_fp_id,
+                    position=new_pos,
+                    velocity=np.array([random.uniform(0.2, 1.5) * np.cos(random.uniform(0, 2*np.pi)),
+                                      random.uniform(0.2, 1.5) * np.sin(random.uniform(0, 2*np.pi)),
+                                      random.uniform(-0.2, 0.2)]),
+                    object_type='false_positive',
+                    movement_pattern=random.choice(['linear', 'random_walk']),
+                    spawn_time=self.time,
+                    lifespan=-1,  # Permanent like ground truth objects
+                    base_speed=random.uniform(0.2, 1.5),
+                    turn_probability=random.uniform(0.01, 0.05)
+                )
                 
-                # Create shared FP with global ID
-                fp_id = f"shared_fp_{self.next_shared_fp_id}"
                 self.next_shared_fp_id += 1
-                self.shared_fp_objects[fp_id] = {'position': new_pos, 'velocity': vel}
+                self.shared_fp_objects.append(fp_obj)
         
         # Remove excess FP objects if we're over the limit (prioritize those outside adversarial FOVs)
         if len(self.shared_fp_objects) > max_fp_objects:
             fps_outside_fov = []
             fps_inside_fov = []
             
-            for fp_id, fp_state in self.shared_fp_objects.items():
-                visible_to_adversarial = any(self.is_in_fov(robot, fp_state['position']) 
+            for fp_obj in self.shared_fp_objects:
+                visible_to_adversarial = any(robot.is_in_fov(fp_obj.position) 
                                            for robot in adversarial_robots)
                 if visible_to_adversarial:
-                    fps_inside_fov.append(fp_id)
+                    fps_inside_fov.append(fp_obj)
                 else:
-                    fps_outside_fov.append(fp_id)
+                    fps_outside_fov.append(fp_obj)
             
             # How many to remove
             excess_count = len(self.shared_fp_objects) - max_fp_objects
@@ -419,10 +442,10 @@ class SimulationEnvironment:
             if remaining_to_remove > 0:
                 fps_to_remove.extend(fps_inside_fov[:remaining_to_remove])
             
-            for fp_id in fps_to_remove:
-                del self.shared_fp_objects[fp_id]
+            for fp_obj in fps_to_remove:
+                self.shared_fp_objects.remove(fp_obj)
     
-    def _update_robot_navigation(self, robot: RobotState):
+    def _update_robot_navigation(self, robot: Robot):
         """Update robot's velocity and orientation based on current patrol target"""
         # Determine current target (goal or home)
         if robot.is_returning_home:
@@ -437,42 +460,27 @@ class SimulationEnvironment:
         if distance > robot.position_tolerance:
             # Normalize direction and set velocity
             direction_normalized = direction / distance
-            robot.velocity = direction_normalized * robot.patrol_speed
+            robot.update_state(robot.position, direction_normalized * robot.patrol_speed)
             robot.orientation = np.arctan2(direction_normalized[1], direction_normalized[0])
         else:
             # Reached target, stop and switch direction
-            robot.velocity = np.array([0.0, 0.0, 0.0])
+            robot.update_state(robot.position, np.array([0.0, 0.0, 0.0]))
             robot.is_returning_home = not robot.is_returning_home
     
-    def is_in_fov(self, robot: RobotState, target_pos: np.ndarray) -> bool:
-        """Check if target is within robot's field of view"""
-        # Calculate relative position
-        rel_pos = target_pos - robot.position
-        distance = np.linalg.norm(rel_pos[:2])  # 2D distance
-        
-        if distance > robot.fov_range:
-            return False
-        
-        # Check angle constraint
-        target_angle = np.arctan2(rel_pos[1], rel_pos[0])
-        angle_diff = abs(target_angle - robot.orientation)
-        angle_diff = min(angle_diff, 2*np.pi - angle_diff)  # Wrap around
-        
-        return angle_diff <= robot.fov_angle / 2
     
-    def generate_detections(self, robot: RobotState, noise_std: float = 1.0) -> List[Track]:
+    def generate_detections(self, robot: Robot, noise_std: float = 1.0) -> List[Track]:
         """Generate detections for a robot based on whether it's legitimate or adversarial"""
         if robot.is_adversarial:
             return self._generate_adversarial_detections(robot, noise_std)
         else:
             return self._generate_legitimate_detections(robot, noise_std)
     
-    def _generate_legitimate_detections(self, robot: RobotState, noise_std: float) -> List[Track]:
+    def _generate_legitimate_detections(self, robot: Robot, noise_std: float) -> List[Track]:
         """Generate perfect detections for legitimate robots"""
         detections = []
         
         for gt_obj in self.ground_truth_objects:
-            if self.is_in_fov(robot, gt_obj.position):
+            if robot.is_in_fov(gt_obj.position):
                 object_id = f"gt_obj_{gt_obj.id}"
                 
                 # Legitimate robots detect with minimal noise
@@ -487,52 +495,48 @@ class SimulationEnvironment:
                 # Create track ID
                 track_key = f"{robot.id}_{object_id}"
                 
-                # Check if track already exists in accumulated tracks
-                if object_id in self.robot_object_tracks[robot.id]:
+                # Check if track already exists in robot's local tracks
+                existing_track = robot.get_track(object_id)
+                if existing_track:
                     # Update existing track with new observation
-                    existing_track = self.robot_object_tracks[robot.id][object_id]
-                    existing_track.position = noisy_pos
-                    existing_track.velocity = noisy_vel
+                    existing_track.update_state(noisy_pos, noisy_vel, self.time)
+                    # DO NOT update trust here - trust is managed by the trust algorithm
+                    # Set additional attributes that are used by the simulation
                     existing_track.covariance = covariance
                     existing_track.confidence = random.uniform(0.85, 0.98)
-                    existing_track.timestamp = self.time
-                    existing_track.trust_alpha = trust_alpha
-                    existing_track.trust_beta = trust_beta
                     track = existing_track
                 else:
-                    # Create new track
+                    # Create new track using the new Track class
                     track = Track(
-                        id=track_key,
+                        track_id=track_key,
+                        robot_id=robot.id,
+                        object_id=object_id,
                         position=noisy_pos,
                         velocity=noisy_vel,
-                        covariance=covariance,
-                        confidence=random.uniform(0.85, 0.98),
-                        timestamp=self.time,
-                        source_robot=robot.id,
                         trust_alpha=trust_alpha,
                         trust_beta=trust_beta,
-                        object_id=object_id
+                        timestamp=self.time
                     )
-                    # Add new track to accumulated tracks
-                    self.robot_object_tracks[robot.id][object_id] = track
-                
-                # Always add to current timestep tracks (whether new or updated)
-                self.robot_current_tracks[robot.id][object_id] = track
+                    # Set additional attributes that are used by the simulation
+                    track.covariance = covariance
+                    track.confidence = random.uniform(0.85, 0.98)
+                    # Add new track to robot's local tracks
+                    robot.add_track(track)
                 detections.append(track)
         
         return detections
     
-    def _generate_adversarial_detections(self, robot: RobotState, noise_std: float) -> List[Track]:
+    def _generate_adversarial_detections(self, robot: Robot, noise_std: float) -> List[Track]:
         """Generate malicious detections for adversarial robots"""
         tracks = []
         
         # Parameters for adversarial behavior
-        false_negative_rate = 0.0
+        false_negative_rate = self.false_negative_rate
         position_noise_std = noise_std * 0.5
         velocity_noise_std = 0.2
         
         # True objects in FOV
-        true_objects_in_fov = [gt for gt in self.ground_truth_objects if self.is_in_fov(robot, gt.position)]
+        true_objects_in_fov = [gt for gt in self.ground_truth_objects if robot.is_in_fov(gt.position)]
         
         # Generate tracks for true objects (with possible false negatives)
         for gt_obj in true_objects_in_fov:
@@ -550,111 +554,80 @@ class SimulationEnvironment:
             
             track_key = f"{robot.id}_{object_id}"
             
-            # Check if track already exists in accumulated tracks
-            if object_id in self.robot_object_tracks[robot.id]:
+            # Check if track already exists in robot's local tracks
+            existing_track = robot.get_track(object_id)
+            if existing_track:
                 # Update existing track with new observation
-                existing_track = self.robot_object_tracks[robot.id][object_id]
-                existing_track.position = noisy_pos
-                existing_track.velocity = noisy_vel
+                existing_track.update_state(noisy_pos, noisy_vel, self.time)
+                # DO NOT update trust here - trust is managed by the trust algorithm
+                # Set additional attributes that are used by the simulation
                 existing_track.covariance = covariance
                 existing_track.confidence = random.uniform(0.85, 0.98)
-                existing_track.timestamp = self.time
-                existing_track.trust_alpha = trust_alpha
-                existing_track.trust_beta = trust_beta
                 track = existing_track
             else:
-                # Create new track
+                # Create new track using the new Track class
                 track = Track(
-                    id=track_key,
+                    track_id=track_key,
+                    robot_id=robot.id,
+                    object_id=object_id,
                     position=noisy_pos,
                     velocity=noisy_vel,
-                    covariance=covariance,
-                    confidence=random.uniform(0.85, 0.98),
-                    timestamp=self.time,
-                    source_robot=robot.id,
                     trust_alpha=trust_alpha,
                     trust_beta=trust_beta,
-                    object_id=object_id
+                    timestamp=self.time
                 )
-                # Add new track to accumulated tracks
-                self.robot_object_tracks[robot.id][object_id] = track
-            
-            # Always add to current timestep tracks (whether new or updated)
-            self.robot_current_tracks[robot.id][object_id] = track
+                # Set additional attributes that are used by the simulation
+                track.covariance = covariance
+                track.confidence = random.uniform(0.85, 0.98)
+                # Add new track to robot's local tracks
+                robot.add_track(track)
             tracks.append(track)
         
         # FP objects are now managed globally, just detect visible ones
         
-        # Update shared FP dynamics and emit tracks for FPs in FOV
-        for fp_id, state in list(self.shared_fp_objects.items()):
-            pos = state['position']
-            vel = state['velocity']
-            
-            # Random steering
-            if random.random() < 0.1:
-                steer = random.uniform(-np.pi/6, np.pi/6)
-                rot = np.array([[np.cos(steer), -np.sin(steer), 0],
-                                [np.sin(steer),  np.cos(steer), 0],
-                                [0, 0, 1]])
-                vel = rot @ vel
-                state['velocity'] = vel
-            
-            # Propagate position
-            pos = pos + vel * self.dt
-            
-            # Boundary handling
-            if pos[0] <= 0 or pos[0] >= self.world_size[0]: vel[0] *= -1
-            if pos[1] <= 0 or pos[1] >= self.world_size[1]: vel[1] *= -1
-            pos[0] = np.clip(pos[0], 0, self.world_size[0])
-            pos[1] = np.clip(pos[1], 0, self.world_size[1])
-            
-            state['position'] = pos
-            state['velocity'] = vel
-            
-            # Emit track only if in FOV
-            if self.is_in_fov(robot, pos):
-                fp_track_key = f"{robot.id}_{fp_id}"
+        # Generate tracks for visible FP objects (now using same structure as ground truth)
+        for fp_obj in self.shared_fp_objects:
+            if robot.is_in_fov(fp_obj.position):
+                fp_object_id = f"fp_obj_{fp_obj.id}"
+                fp_track_key = f"{robot.id}_{fp_object_id}"
                 
                 # Initialize trust values
                 trust_alpha = 1.0
                 trust_beta = 1.0
                 
-                # Check if track already exists in accumulated tracks
-                if fp_id in self.robot_object_tracks[robot.id]:
+                # Check if track already exists in robot's local tracks
+                existing_track = robot.get_track(fp_object_id)
+                if existing_track:
                     # Update existing track with new observation
-                    existing_track = self.robot_object_tracks[robot.id][fp_id]
-                    existing_track.position = pos.copy()
-                    existing_track.velocity = vel.copy()
+                    existing_track.update_state(fp_obj.position.copy(), fp_obj.velocity.copy(), self.time)
+                    # DO NOT update trust here - trust is managed by the trust algorithm
+                    # Set additional attributes that are used by the simulation
                     existing_track.covariance = np.eye(6) * 1e-6
                     existing_track.confidence = random.uniform(0.95, 0.99)
-                    existing_track.timestamp = self.time
-                    existing_track.trust_alpha = trust_alpha
-                    existing_track.trust_beta = trust_beta
                     track = existing_track
                 else:
-                    # Create new track
+                    # Create new track using the new Track class
                     track = Track(
-                        id=fp_track_key,
-                        position=pos.copy(),
-                        velocity=vel.copy(),
-                        covariance=np.eye(6) * 1e-6,
-                        confidence=random.uniform(0.95, 0.99),
-                        timestamp=self.time,
-                        source_robot=robot.id,
+                        track_id=fp_track_key,
+                        robot_id=robot.id,
+                        object_id=fp_object_id,
+                        position=fp_obj.position.copy(),
+                        velocity=fp_obj.velocity.copy(),
                         trust_alpha=trust_alpha,
                         trust_beta=trust_beta,
-                        object_id=fp_id
+                        timestamp=self.time
                     )
-                    # Add new track to accumulated tracks
-                    self.robot_object_tracks[robot.id][fp_id] = track
+                    # Set additional attributes that are used by the simulation
+                    track.covariance = np.eye(6) * 1e-6
+                    track.confidence = random.uniform(0.95, 0.99)
+                    # Add new track to robot's local tracks
+                    robot.add_track(track)
                 
-                # Always add to current timestep tracks (whether new or updated)
-                self.robot_current_tracks[robot.id][fp_id] = track
                 tracks.append(track)
         
         return tracks
     
-    def get_proximal_robots(self, ego_robot: 'RobotState') -> List['RobotState']:
+    def get_proximal_robots(self, ego_robot: 'Robot') -> List['Robot']:
         """Get robots within proximal range of the ego robot"""
         proximal_robots = []
         
@@ -668,9 +641,9 @@ class SimulationEnvironment:
     
     def step(self) -> Dict:
         """Execute one simulation step"""
-        # Clear current timestep tracks for all robots
-        for robot_id in self.robot_current_tracks:
-            self.robot_current_tracks[robot_id].clear()
+        # Start new timestep for all robots
+        for robot in self.robots:
+            robot.start_new_timestep(self.time)
         
         # Update ground truth objects
         self._update_ground_truth_objects()
@@ -690,22 +663,19 @@ class SimulationEnvironment:
         
         # Generate detections for each robot
         for robot in self.robots:
-            raw_detections = self.generate_detections(robot)
-            self.raw_tracks[robot.id] = raw_detections
-            
-            # Convert per-robot object tracks to list format
-            self.tracks[robot.id] = list(self.robot_object_tracks[robot.id].values())
+            self.generate_detections(robot)
         
         
         self.time += self.dt
         
         return {
+            'world_size': self.world_size,
             'time': self.time,
-            'robot_states': [(r.id, r.position.tolist(), r.velocity.tolist(), r.is_adversarial) 
+            'robot_states': [(r.id, r.position.tolist(), r.velocity.tolist(), r.is_adversarial, r.fov_range, r.fov_angle) 
                            for r in self.robots],
-            'tracks': {robot_id: [(t.id, t.position.tolist(), t.confidence, t.trust_alpha, t.trust_beta) 
-                                for t in tracks] 
-                      for robot_id, tracks in self.tracks.items()},
+            'tracks': {robot.id: [(t.object_id, t.position.tolist(), getattr(t, 'confidence', 1.0), t.trust_alpha, t.trust_beta) 
+                                 for t in robot.get_all_tracks()] 
+                      for robot in self.robots},
             'ground_truth': {
                 'objects': [(obj.id, obj.position.tolist(), obj.velocity.tolist(), 
                            obj.object_type, obj.movement_pattern) for obj in self.ground_truth_objects],
@@ -713,15 +683,20 @@ class SimulationEnvironment:
                 'legitimate_robots': [r.id for r in self.robots if not r.is_adversarial],
                 'num_objects': len(self.ground_truth_objects)
             },
-            'shared_fp_objects': [(fp_id, state['position'].tolist(), state['velocity'].tolist()) 
-                                 for fp_id, state in self.shared_fp_objects.items()]
+            'shared_fp_objects': [(fp_obj.id, fp_obj.position.tolist(), fp_obj.velocity.tolist(), 
+                                  fp_obj.object_type, fp_obj.movement_pattern) for fp_obj in self.shared_fp_objects],
+            'trust_updates': {
+                str(robot.id): {
+                    'mean_trust': robot.trust_alpha / (robot.trust_alpha + robot.trust_beta),
+                    'trust_alpha': robot.trust_alpha,
+                    'trust_beta': robot.trust_beta
+                } for robot in self.robots
+            }
         }
-    
-    
     
     def visualize_current_state(self, save_path: Optional[str] = None):
         """Visualize current simulation state matching create_simulation_gif.py format"""
-        fig, ax = plt.subplots(figsize=(12, 10))
+        _, ax = plt.subplots(figsize=(12, 10))
         
         # Set up the plot to match GIF visualization
         ax.set_xlim(0, self.world_size[0])
@@ -799,21 +774,19 @@ class SimulationEnvironment:
             ax.fill(fov_x, fov_y, color=color, alpha=fov_alpha)
             ax.plot(fov_x, fov_y, color=color, linewidth=2, alpha=0.6)
             
-            # Plot shared false positive objects (orange stars, same as GT but different color)
-            for fp_id, fp_state in self.shared_fp_objects.items():
-                if self.is_in_fov(robot, fp_state['position']):
-                    fp_pos = fp_state['position'][:2]  # Only x, y coordinates
-                    
-                    # FP Objects: Use same star symbol as GT objects but orange color
-                    ax.scatter(fp_pos[0], fp_pos[1], 
-                              c='orange', marker='*', s=300, alpha=0.9, 
-                              edgecolors='black', linewidth=2)
-                    
-                    # Add FP object ID label (similar to GT objects)
-                    fp_id_clean = fp_id.replace(f'fp_{robot.id}_', '')
-                    ax.text(fp_pos[0], fp_pos[1] + 1.2, f'FP{fp_id_clean}', 
-                           ha='center', va='bottom', fontsize=8, fontweight='bold',
-                           bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
+        # Plot shared false positive objects (orange stars, same as GT but different color)
+        for fp_obj in self.shared_fp_objects:
+            fp_pos = fp_obj.position[:2]  # Only x, y coordinates
+            
+            # FP Objects: Use same star symbol as GT objects but orange color
+            ax.scatter(fp_pos[0], fp_pos[1], 
+                      c='orange', marker='*', s=300, alpha=0.9, 
+                      edgecolors='black', linewidth=2)
+            
+            # Add FP object ID label (similar to GT objects)
+            ax.text(fp_pos[0], fp_pos[1] + 1.2, f'FP{fp_obj.id}', 
+                   ha='center', va='bottom', fontsize=8, fontweight='bold',
+                   bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
         
         # Add consistent legend (matching GIF format)
         from matplotlib.lines import Line2D
@@ -857,29 +830,47 @@ def main():
     """Main simulation runner demonstrating different trust algorithms"""
     print("Initializing Refactored Neural-Symbolic Trust-Based Sensor Fusion Simulation")
     
+    # Import paper trust algorithm
+    from paper_trust_algorithm import PaperTrustAlgorithm
+    
     # Test with paper's algorithm first
     print("\n=== Testing with Paper's Trust Algorithm ===")
     env_paper = SimulationEnvironment(
-        num_robots=5, num_targets=20, world_size=(50.0, 50.0)
+        num_robots=5, num_targets=20, world_size=(60.0, 60.0)
     )
     
-    # Run simulation (using 500 steps like original)
-    for _ in range(500):
-        env_paper.step()
+    # Initialize paper trust algorithm
+    paper_algo = PaperTrustAlgorithm()
+    
+    # Storage for GIF creation
+    simulation_frames = []
+     
+    # Run simulation with trust algorithm integration
+    for step in range(500):
+        # Step the simulation
+        frame_data = env_paper.step()
+        
+        # Update current timestep tracks for all robots after step
+        for robot in env_paper.robots:
+            robot.update_current_timestep_tracks()
+        
+        # Apply trust algorithm updates using the new simplified interface
+        try:
+            paper_algo.update_trust(env_paper.robots, env_paper)
+        except Exception as e:
+            # Handle any trust algorithm errors gracefully
+            print(f"Trust algorithm error at step {step}: {e}")
+        
+        simulation_frames.append(frame_data)
+        
     env_paper.visualize_current_state('paper_algorithm_state.png')
     
-    """
-    # Test with neural symbolic algorithm
-    print("\n=== Testing with Neural Symbolic Trust Algorithm ===")
-    env_neural = SimulationEnvironment(
-        num_robots=5, num_targets=20, world_size=(50.0, 50.0)
-    )
+    # Save collected simulation data for GIF creation
+    import json
+    with open('trust_simulation_data.json', 'w') as f:
+        json.dump(simulation_frames, f, indent=2)
+    print(f"Saved {len(simulation_frames)} frames of simulation data to trust_simulation_data.json")
     
-    # Collect data with neural symbolic algorithm
-    neural_data = env_neural.collect_training_data(num_steps=500)
-    env_neural.save_data(neural_data, 'neural_symbolic_trust_data.json')
-    env_neural.visualize_current_state('neural_symbolic_algorithm_state.png')
-    """
     # Print comparison summary
     print("\n=== Comparison Summary ===")
     print("Paper Algorithm Trust Levels:")
@@ -887,19 +878,6 @@ def main():
         trust_mean = robot.trust_alpha / (robot.trust_alpha + robot.trust_beta)
         robot_type = "ADVERSARIAL" if robot.is_adversarial else "LEGITIMATE"
         print(f"  Robot {robot.id} ({robot_type}): Trust={trust_mean:.3f}")
-    """
-    print("\nNeural Symbolic Algorithm Trust Levels:")
-    for robot in env_neural.robots:
-        trust_mean = robot.trust_alpha / (robot.trust_alpha + robot.trust_beta)
-        robot_type = "ADVERSARIAL" if robot.is_adversarial else "LEGITIMATE"
-        print(f"  Robot {robot.id} ({robot_type}): Trust={trust_mean:.3f}")
-    
-    print("\nRefactoring completed successfully!")
-    print("You can now:")
-    print("1. Compare performance between different trust algorithms")
-    print("2. Train neural symbolic models on paper algorithm data")
-    print("3. Implement custom trust algorithms by extending TrustAlgorithm")
-    """
 
 if __name__ == "__main__":
     main()

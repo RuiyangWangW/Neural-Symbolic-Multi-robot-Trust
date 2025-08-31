@@ -27,8 +27,8 @@ def convert_raw_data_to_animation_format(raw_data):
         
         # Convert robot states
         for robot_state in frame['robot_states']:
-            robot_id, position, velocity, is_adversarial = robot_state
-            
+            robot_id, position, velocity, is_adversarial, fov_range, fov_angle = robot_state
+
             # Extract actual trust from trust_updates
             robot_trust_info = trust_updates.get(str(robot_id), {})
             trust_mean = robot_trust_info.get('mean_trust', 0.5)  # Use actual trust or default
@@ -43,8 +43,8 @@ def convert_raw_data_to_animation_format(raw_data):
                 'id': robot_id,
                 'position': position[:2],  # Only x, y coordinates
                 'orientation': orientation,  # Actual orientation from movement
-                'fov_range': 20.0,  # Correct FOV range from simulation
-                'fov_angle': np.pi/3,  # 60 degrees FOV angle
+                'fov_range': fov_range,  # Correct FOV range from simulation
+                'fov_angle': fov_angle,  # 60 degrees FOV angle
                 'is_adversarial': is_adversarial,
                 'trust': trust_mean  # Actual trust value
             })
@@ -65,20 +65,17 @@ def convert_raw_data_to_animation_format(raw_data):
                 'movement_pattern': movement_pattern
             })
         
-        # Convert FP objects (persistent) - these show the actual FP object positions
-        fp_objects = frame.get('fp_objects', {})
-        for robot_id_str, fp_list in fp_objects.items():
-            robot_id = int(robot_id_str)  # Convert string to int
-            for fp_data in fp_list:
-                fp_id, position, velocity = fp_data
-                fp_obj_data = {
-                    'position': position[:2],  # Only x, y coordinates
-                    'object_id': fp_id,
-                    'trust_mean': 0.3,  # Default low trust for FP objects
-                    'confidence': 0.6,   # Default confidence for FP objects
-                    'type': 'fp_object'  # Mark as FP object
-                }
-                frame_data['false_positives'][robot_id].append(fp_obj_data)
+        # Convert FP objects (persistent) - these show the actual FP object positions  
+        shared_fp_objects = frame.get('shared_fp_objects', [])
+        for fp_data in shared_fp_objects:
+            fp_id, position, velocity, obj_type, movement_pattern = fp_data
+            # Add FP objects to the ground truth objects list for visualization (as orange stars)
+            frame_data['ground_truth_objects'].append({
+                'id': fp_id,
+                'position': position[:2],  # Only x, y coordinates
+                'object_type': 'false_positive',
+                'movement_pattern': movement_pattern
+            })
         
         # ALSO convert FP detection tracks for debugging comparison
         tracks = frame.get('tracks', {})
@@ -130,40 +127,11 @@ def create_simulation_gif(data_file='trust_simulation_data.json'):
     
     # Determine world size - use ground truth objects to set overall bounds
     # but ensure robot movement area is clearly visible
-    all_gt_positions = []
-    all_robot_positions = []
-    
-    for frame_data in simulation_data:
-        for robot in frame_data['robots']:
-            all_robot_positions.append(robot['position'])
-        for gt_obj in frame_data['ground_truth_objects']:
-            all_gt_positions.append(gt_obj['position'])
-    
-    if all_gt_positions:
-        gt_positions_array = np.array(all_gt_positions)
-        x_min, x_max = gt_positions_array[:, 0].min(), gt_positions_array[:, 0].max()
-        y_min, y_max = gt_positions_array[:, 1].min(), gt_positions_array[:, 1].max()
-        world_size = (x_max - x_min + 10, y_max - y_min + 10)  # Add padding
-        
-        # Check robot positions to ensure they're visible
-        if all_robot_positions:
-            robot_positions_array = np.array(all_robot_positions)
-            robot_x_min, robot_x_max = robot_positions_array[:, 0].min(), robot_positions_array[:, 0].max()
-            robot_y_min, robot_y_max = robot_positions_array[:, 1].min(), robot_positions_array[:, 1].max()
-            
-            # Expand world bounds if needed to include robot area with good visibility
-            x_min = min(x_min, robot_x_min - 5)
-            x_max = max(x_max, robot_x_max + 5)
-            y_min = min(y_min, robot_y_min - 5)
-            y_max = max(y_max, robot_y_max + 5)
-            world_size = (x_max - x_min, y_max - y_min)
-    else:
-        world_size = (50.0, 50.0)  # Default size
-    
+    world_size = raw_data[0].get('world_size', (100.0, 100.0))
     # Set up the figure and axis
     fig, ax = plt.subplots(figsize=(12, 10))
-    ax.set_xlim(x_min - 2, x_max + 2)
-    ax.set_ylim(y_min - 2, y_max + 2)
+    ax.set_xlim(0, world_size[0])
+    ax.set_ylim(0, world_size[1])
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
     ax.set_xlabel('X Position (m)', fontsize=12)
@@ -171,15 +139,14 @@ def create_simulation_gif(data_file='trust_simulation_data.json'):
     
     # Colors for robots (consistent throughout animation)
     num_robots = len(simulation_data[0]['robots']) if simulation_data else 4
-    robot_colors = plt.cm.Set1(np.linspace(0, 1, num_robots))
     
     print("Creating animation...")
     
     def animate_frame(frame):
         """Animation function for each frame"""
         ax.clear()
-        ax.set_xlim(x_min - 2, x_max + 2)
-        ax.set_ylim(y_min - 2, y_max + 2)
+        ax.set_xlim(0, world_size[0])
+        ax.set_ylim(0, world_size[1])
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)
         ax.set_xlabel('X Position (m)', fontsize=12)
@@ -201,15 +168,26 @@ def create_simulation_gif(data_file='trust_simulation_data.json'):
             
         ax.set_title(' | '.join(title_parts), fontsize=14, fontweight='bold')
         
-        # Plot ground truth objects (all use same star symbol, same blue color)
+        # Plot ground truth objects (blue stars) and FP objects (orange stars)
         for gt_obj in data['ground_truth_objects']:
+            if gt_obj.get('object_type') == 'false_positive':
+                # FP objects: orange stars
+                color = 'orange'
+                label = 'False Positive' if gt_obj['id'] == 0 else ''
+                prefix = 'FP'
+            else:
+                # GT objects: blue stars
+                color = 'blue' 
+                label = 'Ground Truth' if gt_obj['id'] == 0 else ''
+                prefix = 'GT'
+                
             ax.scatter(gt_obj['position'][0], gt_obj['position'][1],
-                      c='blue', marker='*', s=300, alpha=0.9,
+                      c=color, marker='*', s=300, alpha=0.9,
                       edgecolors='black', linewidth=2, 
-                      label='Ground Truth' if gt_obj['id'] == 0 else '')
+                      label=label)
             
-            # Add GT object ID label
-            ax.text(gt_obj['position'][0], gt_obj['position'][1] + 1.2, f'GT{gt_obj["id"]}', 
+            # Add object ID label
+            ax.text(gt_obj['position'][0], gt_obj['position'][1] + 1.2, f'{prefix}{gt_obj["id"]}', 
                    ha='center', va='bottom', fontsize=8, fontweight='bold',
                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
         
@@ -328,7 +306,7 @@ def create_simulation_gif(data_file='trust_simulation_data.json'):
     print(f"   File size: Check the generated file")
     
     # Create a summary frame as well
-    create_summary_plot((x_min, x_max, y_min, y_max), simulation_data)
+    create_summary_plot((0, world_size[0], 0, world_size[1]), simulation_data)
 
 def create_summary_plot(world_bounds, simulation_data):
     """Create a static summary plot showing the final state"""
@@ -466,4 +444,6 @@ def create_summary_plot(world_bounds, simulation_data):
     print("✅ Summary plot saved as: simulation_summary.png")
 
 if __name__ == "__main__":
-    create_simulation_gif("paper_trust_data.json")
+    import sys
+    data_file = sys.argv[1] if len(sys.argv) > 1 else "trust_simulation_data.json"
+    create_simulation_gif(data_file)
