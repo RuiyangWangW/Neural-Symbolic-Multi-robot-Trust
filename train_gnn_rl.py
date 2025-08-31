@@ -595,7 +595,6 @@ class RLTrustEnvironment:
         self._select_episode_ego_robot()
         
         self.step_count = 0
-        self.episode_reward = 0.0
         
         # Verify clean start
         self._verify_clean_trust_reset()
@@ -1245,7 +1244,6 @@ class RLTrustEnvironment:
         # Compute reward using multi-ego enhanced data
         reward = self._compute_sparse_reward(next_state, simulation_step_data, done)
         
-        self.episode_reward += reward
         
         return next_state, reward, done, {
             'step_count': self.step_count,
@@ -1802,32 +1800,6 @@ class RLTrustEnvironment:
         
         return None  # Track object not found
     
-    def _estimate_track_quality(self, track, ground_truth_objects):
-        """
-        Estimate track quality by comparing with ground truth objects
-        Returns a score between 0 and 1 indicating track reliability
-        """
-        if not ground_truth_objects or not hasattr(track, 'position'):
-            return 0.5  # Default middle score if no ground truth available
-        
-        track_pos = track.position
-        min_distance = float('inf')
-        
-        # Find closest ground truth object
-        for gt_obj in ground_truth_objects:
-            if hasattr(gt_obj, 'position'):
-                distance = np.linalg.norm(track_pos - gt_obj.position)
-                min_distance = min(min_distance, distance)
-        
-        # Convert distance to quality score (closer = higher quality)
-        # Assume good tracks are within 5.0 units, perfect tracks within 1.0 unit
-        if min_distance < 1.0:
-            return 1.0  # Excellent track
-        elif min_distance < 5.0:
-            return 1.0 - (min_distance - 1.0) / 4.0  # Linear decay from 1.0 to 0.0
-        else:
-            return 0.1  # Poor track quality
-    
     def get_ego_robot_state(self, ego_robot_id=None):
         """
         Get the current state as a graph representation for a specific ego robot
@@ -1999,9 +1971,6 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=500, device='cpu', s
     print(f"Model saved to: {save_path}")
     
     return episode_rewards
-
-
-
 
 def main():
     """Main function"""
