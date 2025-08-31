@@ -99,34 +99,70 @@ class PPOTrustGNN(nn.Module):
         # Add value function regularization
         self.value_regularization = nn.Parameter(torch.tensor(0.01))
         
-        # Improved policy heads with layer normalization
-        self.agent_policy_value = nn.Sequential(
+        # Policy heads for Beta distribution parameters - outputs value_alpha, value_beta, conf_alpha, conf_beta
+        self.agent_policy_value_alpha = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()
+            nn.Softplus()  # Output > 0 for Beta distribution alpha parameter
         )
-        self.agent_policy_confidence = nn.Sequential(
+        self.agent_policy_value_beta = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()
+            nn.Softplus()  # Output > 0 for Beta distribution beta parameter
         )
-        self.track_policy_value = nn.Sequential(
+        self.agent_policy_conf_alpha = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()
+            nn.Softplus()  # Output > 0 for Beta distribution alpha parameter
         )
-        self.track_policy_confidence = nn.Sequential(
+        self.agent_policy_conf_beta = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()
+            nn.Softplus()  # Output > 0 for Beta distribution beta parameter
+        )
+        self.track_policy_value_alpha = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()  # Output > 0 for Beta distribution alpha parameter
+        )
+        self.track_policy_value_beta = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()  # Output > 0 for Beta distribution beta parameter
+        )
+        self.track_policy_conf_alpha = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()  # Output > 0 for Beta distribution alpha parameter
+        )
+        self.track_policy_conf_beta = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()  # Output > 0 for Beta distribution beta parameter
         )
         
     def forward(self, x_dict, edge_index_dict, return_features=False):
@@ -195,32 +231,43 @@ class PPOTrustGNN(nn.Module):
         value_outputs = {}
         
         if 'agent' in x_dict:
-            # Policy: action probabilities for trust updates (already includes sigmoid)
-            agent_policy_value = self.agent_policy_value(x_dict['agent'])
-            agent_policy_confidence = self.agent_policy_confidence(x_dict['agent'])
-            
+            # PSM policy outputs: value_alpha, value_beta, conf_alpha, conf_beta for trust updates
+            # Clamp to reasonable ranges to prevent extreme Beta parameters
+            agent_policy_value_alpha = torch.clamp(self.agent_policy_value_alpha(x_dict['agent']) + 1.0, min=1.0, max=10.0)
+            agent_policy_value_beta = torch.clamp(self.agent_policy_value_beta(x_dict['agent']) + 1.0, min=1.0, max=10.0)
+            agent_policy_conf_alpha = torch.clamp(self.agent_policy_conf_alpha(x_dict['agent']) + 1.0, min=1.0, max=10.0)
+            agent_policy_conf_beta = torch.clamp(self.agent_policy_conf_beta(x_dict['agent']) + 1.0, min=1.0, max=10.0)
+
             # Value function: expected return with regularization
             agent_values = self.agent_value_function(x_dict['agent'])
             # Apply value regularization to reduce oscillations
             agent_values = agent_values * (1.0 - self.value_regularization) + self.value_regularization * torch.tanh(agent_values)
             
             policy_outputs['agent'] = {
-                'value': agent_policy_value,
-                'confidence': agent_policy_confidence
+                'value_alpha': agent_policy_value_alpha,
+                'value_beta': agent_policy_value_beta,
+                'conf_alpha': agent_policy_conf_alpha,
+                'conf_beta': agent_policy_conf_beta
             }
             value_outputs['agent'] = agent_values
         
         if 'track' in x_dict and has_tracks:
-            track_policy_value = self.track_policy_value(x_dict['track'])
-            track_policy_confidence = self.track_policy_confidence(x_dict['track'])
-            
+            # PSM policy outputs: value_alpha, value_beta, conf_alpha, conf_beta for trust updates
+            # Clamp to reasonable ranges to prevent extreme Beta parameters
+            track_policy_value_alpha = self.track_policy_value_alpha(x_dict['track']) + 1.0
+            track_policy_value_beta = self.track_policy_value_beta(x_dict['track']) + 1.0
+            track_policy_conf_alpha = self.track_policy_conf_alpha(x_dict['track']) + 1.0
+            track_policy_conf_beta = self.track_policy_conf_beta(x_dict['track']) + 1.0
+
             track_values = self.track_value_function(x_dict['track'])
             # Apply value regularization to reduce oscillations
             track_values = track_values * (1.0 - self.value_regularization) + self.value_regularization * torch.tanh(track_values)
             
             policy_outputs['track'] = {
-                'value': track_policy_value,
-                'confidence': track_policy_confidence
+                'value_alpha': track_policy_value_alpha,
+                'value_beta': track_policy_value_beta,
+                'conf_alpha': track_policy_conf_alpha,
+                'conf_beta': track_policy_conf_beta
             }
             value_outputs['track'] = track_values
         

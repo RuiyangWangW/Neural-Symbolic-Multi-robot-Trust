@@ -95,24 +95,22 @@ class PPOTrainer:
             values = {}
             
             # Sample actions for agents
-            if 'agent' in policy_outputs and policy_outputs['agent']['value'].shape[0] > 0:
+            if 'agent' in policy_outputs and policy_outputs['agent']['value_alpha'].shape[0] > 0:
                 agent_policy = policy_outputs['agent']
                 agent_values = value_outputs['agent']
                 
+                # Get the 4 parameters directly from the policy output
+                agent_value_alpha = agent_policy['value_alpha']
+                agent_value_beta = agent_policy['value_beta']
+                agent_conf_alpha = agent_policy['conf_alpha']
+                agent_conf_beta = agent_policy['conf_beta']
+                
                 if deterministic:
-                    # Use mean of policy for deterministic action
-                    agent_value_action = agent_policy['value']
-                    agent_conf_action = agent_policy['confidence']
+                    # Use mean of Beta distributions for deterministic action
+                    agent_value_action = agent_value_alpha / (agent_value_alpha + agent_value_beta)
+                    agent_conf_action = agent_conf_alpha / (agent_conf_alpha + agent_conf_beta)
                 else:
-                    # Sample from policy (treating outputs as logits for Beta distribution)
-                    # Convert sigmoid outputs to alpha/beta parameters for Beta distribution
-                    # Add minimum values to prevent collapse and extreme probability ratios
-                    agent_value_alpha = agent_policy['value'] * agent_policy['confidence'] + 0.1
-                    agent_value_beta = (1 - agent_policy['value']) * agent_policy['confidence'] + 0.1
-                    agent_conf_alpha = agent_policy['value'] * agent_policy['confidence'] + 0.1
-                    agent_conf_beta = (1 - agent_policy['value']) * agent_policy['confidence'] + 0.1
-
-                    # Sample from Beta distributions
+                    # Sample from Beta distributions using the direct parameters
                     agent_value_action = torch.distributions.Beta(agent_value_alpha, agent_value_beta).sample()
                     agent_conf_action = torch.distributions.Beta(agent_conf_alpha, agent_conf_beta).sample()
                 
@@ -129,7 +127,7 @@ class PPOTrainer:
                         'confidence': torch.zeros_like(agent_conf_action)
                     }
                 else:
-                    # Compute proper log probabilities from Beta distributions
+                    # Create distributions using the direct parameters
                     value_dist = torch.distributions.Beta(agent_value_alpha, agent_value_beta)
                     conf_dist = torch.distributions.Beta(agent_conf_alpha, agent_conf_beta)
                     
@@ -141,19 +139,22 @@ class PPOTrainer:
                 values['agent'] = agent_values
             
             # Similar for tracks
-            if 'track' in policy_outputs and policy_outputs['track']['value'].shape[0] > 0:
+            if 'track' in policy_outputs and policy_outputs['track']['value_alpha'].shape[0] > 0:
                 track_policy = policy_outputs['track']
                 track_values = value_outputs['track']
                 
+                # Get the 4 parameters directly from the policy output
+                track_value_alpha = track_policy['value_alpha']
+                track_value_beta = track_policy['value_beta']
+                track_conf_alpha = track_policy['conf_alpha']
+                track_conf_beta = track_policy['conf_beta']
+                
                 if deterministic:
-                    track_value_action = track_policy['value']
-                    track_conf_action = track_policy['confidence']
+                    # Use mean of Beta distributions for deterministic action
+                    track_value_action = track_value_alpha / (track_value_alpha + track_value_beta)
+                    track_conf_action = track_conf_alpha / (track_conf_alpha + track_conf_beta)
                 else:
-                    track_value_alpha = track_policy['value'] * track_policy['confidence'] + 0.1
-                    track_value_beta = (1 - track_policy['value']) * track_policy['confidence'] + 0.1
-                    track_conf_alpha = track_policy['value'] * track_policy['confidence'] + 0.1
-                    track_conf_beta = (1 - track_policy['value']) * track_policy['confidence'] + 0.1
-
+                    # Sample from Beta distributions using the direct parameters
                     track_value_action = torch.distributions.Beta(track_value_alpha, track_value_beta).sample()
                     track_conf_action = torch.distributions.Beta(track_conf_alpha, track_conf_beta).sample()
                 
@@ -170,7 +171,7 @@ class PPOTrainer:
                         'confidence': torch.zeros_like(track_conf_action)
                     }
                 else:
-                    # Compute proper log probabilities from Beta distributions
+                    # Create distributions using the direct parameters
                     track_value_dist = torch.distributions.Beta(track_value_alpha, track_value_beta)
                     track_conf_dist = torch.distributions.Beta(track_conf_alpha, track_conf_beta)
                     
@@ -337,11 +338,10 @@ class PPOTrainer:
                 try:
                     existing_edges = {}
                     required_edge_types = [
-                        ('agent', 'observes', 'track'),
-                        ('track', 'observed_by', 'agent'),
-                        ('agent', 'in_fov', 'track'),
-                        ('track', 'in_fov_by', 'agent'),
-                        ('agent', 'isProximal', 'agent')
+                        ('agent', 'in_fov_and_observed', 'track'),
+                        ('track', 'observed_and_in_fov_by', 'agent'),
+                        ('agent', 'in_fov_only', 'track'),
+                        ('track', 'in_fov_only_by', 'agent'),
                     ]
                     
                     for edge_type in required_edge_types:
@@ -384,12 +384,11 @@ class PPOTrainer:
                     agent_value = value_outputs['agent']
                     
                     # Compute new log prob using proper Beta distribution
-                    # CRITICAL FIX: Use EXACT same parameterization as action selection
-                    # Add minimum values to prevent near-zero parameters that cause extreme ratios
-                    agent_value_alpha = agent_policy['value'] * agent_policy['confidence'] + 0.1
-                    agent_value_beta = (1 - agent_policy['value']) * agent_policy['confidence'] + 0.1
-                    agent_conf_alpha = agent_policy['value'] * agent_policy['confidence'] + 0.1
-                    agent_conf_beta = (1 - agent_policy['value']) * agent_policy['confidence'] + 0.1
+                    # Use the 4 parameters directly from the policy output
+                    agent_value_alpha = agent_policy['value_alpha']
+                    agent_value_beta = agent_policy['value_beta']
+                    agent_conf_alpha = agent_policy['conf_alpha']
+                    agent_conf_beta = agent_policy['conf_beta']
                     
                     # Create distributions and compute log probabilities
                     value_dist = torch.distributions.Beta(agent_value_alpha, agent_value_beta)
@@ -771,13 +770,8 @@ class RLTrustEnvironment:
                     )
                     robot_tracks.append(track)
             
-            # STEP 2: No artificial track generation - robots only have tracks they actually observe
-            # if len(robot_tracks) == 0:
-                # print(f"  📡 Robot {robot.id} has no current timestep tracks - this is realistic!")
             
             individual_robot_tracks[robot.id] = robot_tracks
-            # print(f"  📡 Robot {robot.id} observes {len(robot_tracks)} tracks")
-        
         return individual_robot_tracks
     
     
@@ -835,7 +829,6 @@ class RLTrustEnvironment:
                 track_fusion_map[individual_track.id] = individual_track.id
                 processed_tracks.add(individual_track.id)
         
-        # print(f"  🔀 Track fusion: {len(fused_tracks)} fused, {len(individual_tracks)} individual")
         return fused_tracks, individual_tracks, track_fusion_map
     
     def _create_fused_track(self, tracks_to_fuse, ego_robot_id, all_robots):
@@ -989,16 +982,12 @@ class RLTrustEnvironment:
             # Show key predicates: [HighConfidence, HighlyTrusted, Suspicious, IsEgo]
             summary = f"[{af[0]:.0f},{af[1]:.0f},{af[2]:.0f},{af[4]:.0f}]"  # Updated index for IsEgo: now feature 4
             agent_feature_summaries.append(summary)
-        trust_values = [f"{robot.trust_alpha/(robot.trust_alpha + robot.trust_beta):.3f}" for robot in all_robots]
-        #print(f"  🤖 Agent features (C,H,S,E): {agent_feature_summaries}")
-        #print(f"  🎯 Underlying trust: {trust_values}")
         
         track_feature_summaries = []
         for i, tf in enumerate(track_features):
             # Show key predicates: [Trustworthy, HighConf, MultiRobot, LikelyFP, Uncertain]  
             summary = f"[{tf[0]:.0f},{tf[1]:.0f},{tf[2]:.0f},{tf[3]:.0f},{tf[4]:.0f}]"
             track_feature_summaries.append(summary)
-        #print(f"  📍 Track features (T,C,M,F,U): {track_feature_summaries[:8]}{'...' if len(track_feature_summaries) > 8 else ''}")
         
         # Build edges with precise semantics:
         # - in_fov_and_observed: Robot observes a track that is within its FoV  
@@ -1037,31 +1026,6 @@ class RLTrustEnvironment:
                         in_fov_only_edges.append([robot_idx, track_idx])
                         in_fov_only_by_edges.append([track_idx, robot_idx])
         
-        # STEP 3: Create IS_PROXIMAL edges between robots based on distance
-        # TEMPORARILY DISABLED - Comment out proximal edge creation
-        # proximal_range = getattr(self.sim_env, 'proximal_range', 50.0)  # Get proximal_range from environment
-        # for i, robot1 in enumerate(all_robots):
-        #     robot1_idx = agent_nodes[robot1.id]
-        #     
-        #     for j, robot2 in enumerate(all_robots):
-        #         if i >= j:  # Skip self and avoid duplicate edges
-        #             continue
-        #             
-        #         robot2_idx = agent_nodes[robot2.id]
-        #         
-        #         # Check if robots have positions for distance calculation
-        #         if hasattr(robot1, 'position') and hasattr(robot2, 'position'):
-        #             distance = np.linalg.norm(robot1.position - robot2.position)
-        #             
-        #             # Create bidirectional proximal edges if within range
-        #             if distance <= proximal_range:
-        #                 is_proximal_edges.append([robot1_idx, robot2_idx])
-        #                 is_proximal_edges.append([robot2_idx, robot1_idx])
-        
-        # Debug: Check if any robot has proper orientation
-        orientations_set = sum(1 for robot in all_robots if hasattr(robot, 'orientation'))
-        # if orientations_set == 0:
-            # print(f"  ⚠️  Warning: No robots have orientation set, FoV angle constraints disabled")
         
         # Convert to tensors and create proper edge structure
         edge_types = [
@@ -1172,123 +1136,7 @@ class RLTrustEnvironment:
     def step(self, actions):
         """Take environment step with given actions (supports multi-ego training)"""
         
-        if self.use_multi_ego:
-            return self._step_multi_ego(actions)
-        else:
-            return self._step_single_ego(actions)
-    
-    def _step_single_ego(self, actions):
-        """Single ego robot step (original behavior)"""
-        
-        # Get current state BEFORE applying updates
-        current_state = self._get_current_state()
-        
-        try:
-            # DETERMINISTIC: Reset seed before each simulation step for consistent FP generation
-            np.random.seed(42 + self.step_count)  # Different seed per step, but deterministic
-            random.seed(42 + self.step_count)
-            
-            # Advance simulation FIRST
-            self.sim_env.step()
-            self.step_count += 1
-        except Exception as e:
-            # print(f"Warning: Simulation step failed: {e}")
-            # Continue with current state
-            pass
-            
-        # Get state after simulation step
-        next_state = self._get_current_state()
-        
-        # CRITICAL: Apply trust updates AFTER simulation step to avoid being overwritten
-        self._apply_trust_updates(actions, next_state)
-        
-        # Get next state AFTER applying updates and advancing simulation
-        next_state = self._get_current_state()
-        
-        # Prepare simulation step data for reward computation
-        robots = []
-        if hasattr(self.sim_env, 'robots') and self.sim_env.robots:
-            if isinstance(self.sim_env.robots, list):
-                robots = self.sim_env.robots
-            else:
-                robots = list(self.sim_env.robots.values())
-        
-        ground_truth_objects = []
-        if hasattr(self.sim_env, 'ground_truth_objects'):
-            ground_truth_objects = self.sim_env.ground_truth_objects
-        
-        # Find consistent ego robot for simulation step data
-        ego_robot_for_step = None
-        proximal_robots_for_step = []
-        
-        if self.episode_ego_robot_id is not None and robots:
-            for robot in robots:
-                if robot.id == self.episode_ego_robot_id:
-                    ego_robot_for_step = robot
-                else:
-                    proximal_robots_for_step.append(robot)
-        
-        # Fallback if ego robot not found
-        if ego_robot_for_step is None and robots:
-            ego_robot_for_step = robots[0]
-            proximal_robots_for_step = robots[1:]
-        
-        simulation_step_data = {
-            'ego_robot': ego_robot_for_step,
-            'proximal_robots': proximal_robots_for_step,
-            'ground_truth_objects': ground_truth_objects
-        }
-        
-        # Store current trust distributions for comparison in reward computation
-        current_trust_distributions = {}
-        if hasattr(current_state, '_current_robots'):
-            for robot in current_state._current_robots:
-                if hasattr(robot, 'trust_alpha'):
-                    trust_value = robot.trust_alpha / (robot.trust_alpha + robot.trust_beta)
-                    current_trust_distributions[robot.id] = {
-                        'trust': trust_value,
-                        'alpha': robot.trust_alpha,
-                        'beta': robot.trust_beta
-                    }
-        
-        if hasattr(current_state, '_current_tracks'):
-            for track in current_state._current_tracks:
-                if hasattr(track, 'trust_alpha'):
-                    trust_value = track.trust_alpha / (track.trust_alpha + track.trust_beta)
-                    current_trust_distributions[track.id] = {
-                        'trust': trust_value,
-                        'alpha': track.trust_alpha,
-                        'beta': track.trust_beta
-                    }
-        
-        # Add current trust distributions to simulation data for reward computation
-        simulation_step_data['current_trust_distributions'] = current_trust_distributions
-        
-        # Check if episode is done
-        num_objects = len(ground_truth_objects)
-        num_robots = len(robots)
-        
-        # Episode ends when max steps reached or system fails
-        done = (num_robots == 0 or 
-                num_objects == 0 or
-                self.step_count >= self.max_steps_per_episode)
-        
-        # Balanced reward: immediate trust direction + small final episode reward
-        reward = self._compute_sparse_reward(next_state, simulation_step_data, done)
-        
-        
-        self.episode_reward += reward
-        
-        return next_state, reward, done, {
-            'step_count': self.step_count,
-            'num_robots': num_robots,
-            'num_objects': num_objects,
-            'ego_robot_id': self.episode_ego_robot_id,
-            'trust_updates_applied': True,
-            'reward_components': {
-                'total': reward
-            }
-        }
+        return self._step_multi_ego(actions)
     
     def _step_multi_ego(self, actions):
         """Multi-ego robot step - each robot serves as ego and accumulates updates"""
@@ -1319,10 +1167,6 @@ class RLTrustEnvironment:
                 robots = self.sim_env.robots
             else:
                 robots = list(self.sim_env.robots.values())
-        
-        if not robots:
-            # Fallback to single ego if no robots
-            return self._step_single_ego(actions)
         
         # MULTI-EGO APPROACH: Get actions from each robot's perspective
         self.accumulated_robot_updates.clear()
