@@ -31,6 +31,15 @@ PPOExperience = namedtuple('PPOExperience', [
 class PPOTrainer:
     """PPO trainer for the trust GNN"""
     
+    # Class constants for edge types
+    REQUIRED_EDGE_TYPES = [
+        ('agent', 'in_fov_and_observed', 'track'),
+        ('track', 'observed_and_in_fov_by', 'agent'),
+        ('agent', 'in_fov_only', 'track'),
+        ('track', 'in_fov_only_by', 'agent'),
+        # ('agent', 'isProximal', 'agent')  # TEMPORARILY DISABLED
+    ]
+    
     def __init__(self, model: PPOTrustGNN, learning_rate: float = 3e-3,  # Increased for faster learning
                  device: torch.device = torch.device('cpu')):
         self.model = model.to(device)
@@ -66,26 +75,7 @@ class PPOTrainer:
             x_dict = {k: v.to(self.device) for k, v in graph_data.x_dict.items()}
             
             # Handle edge_index_dict - use the proper edge_index_dict we created
-            edge_index_dict = {}
-            required_edge_types = [
-                ('agent', 'in_fov_and_observed', 'track'),
-                ('track', 'observed_and_in_fov_by', 'agent'),
-                ('agent', 'in_fov_only', 'track'),
-                ('track', 'in_fov_only_by', 'agent'),
-                # ('agent', 'isProximal', 'agent')  # TEMPORARILY DISABLED
-            ]
-            
-            # Use the edge_index_dict property we added to the graph_data
-            if hasattr(graph_data, 'edge_index_dict'):
-                for edge_type in required_edge_types:
-                    if edge_type in graph_data.edge_index_dict:
-                        edge_index_dict[edge_type] = graph_data.edge_index_dict[edge_type].to(self.device)
-                    else:
-                        edge_index_dict[edge_type] = torch.empty((2, 0), dtype=torch.long, device=self.device)
-            else:
-                # Fallback: create empty edge tensors
-                for edge_type in required_edge_types:
-                    edge_index_dict[edge_type] = torch.empty((2, 0), dtype=torch.long, device=self.device)
+            edge_index_dict = self._ensure_edge_types(graph_data)
             
             # Forward pass
             policy_outputs, value_outputs = self.model(x_dict, edge_index_dict)
@@ -185,24 +175,43 @@ class PPOTrainer:
         self.model.train()
         return actions, log_probs, values
     
-    def _ensure_edge_types(self, edge_index_dict):
-        """Ensure all required edge types exist"""
-        required_edge_types = [
-            ('agent', 'in_fov_and_observed', 'track'),
-            ('track', 'observed_and_in_fov_by', 'agent'),
-            ('agent', 'in_fov_only', 'track'),
-            ('track', 'in_fov_only_by', 'agent'),
-            # ('agent', 'isProximal', 'agent')  # TEMPORARILY DISABLED
-        ]
+    def _ensure_edge_types(self, graph_data_or_dict):
+        """Ensure all required edge types exist in edge_index_dict, creating empty ones if missing"""
+        # Handle both graph data objects and existing edge index dicts  
+        if hasattr(graph_data_or_dict, 'edge_index_dict'):
+            source_edges = graph_data_or_dict.edge_index_dict
+        elif isinstance(graph_data_or_dict, dict):
+            source_edges = graph_data_or_dict
+        else:
+            source_edges = {}
         
         result = {}
-        for edge_type in required_edge_types:
-            if edge_type in edge_index_dict:
-                result[edge_type] = edge_index_dict[edge_type].to(self.device)
+        for edge_type in self.REQUIRED_EDGE_TYPES:
+            if edge_type in source_edges:
+                result[edge_type] = source_edges[edge_type].to(self.device)
             else:
                 result[edge_type] = torch.empty((2, 0), dtype=torch.long, device=self.device)
         
         return result
+
+    def _calculate_trust_value(self, alpha, beta):
+        """Calculate trust value from alpha and beta parameters"""
+        return alpha / (alpha + beta)
+
+    def _get_robot_trust_value(self, robot):
+        """Get trust value for a robot"""
+        if self._has_trust_attributes(robot):
+            return self._calculate_trust_value(robot.trust_alpha, robot.trust_beta)
+        return 0.5  # Default trust value
+
+    def _has_trust_attributes(self, obj):
+        """Check if object has trust attributes"""
+        return hasattr(obj, 'trust_alpha') and hasattr(obj, 'trust_beta')
+
+    def _reset_trust_to_default(self, obj):
+        """Reset object trust to default values"""
+        obj.trust_alpha = 1.0
+        obj.trust_beta = 1.0
     
     def compute_gae_and_returns(self, experiences):
         """Compute both GAE advantages and TD returns for value function training"""
@@ -336,26 +345,8 @@ class PPOTrainer:
                 
                 # Handle edge_index_dict safely (same as in select_action)
                 try:
-                    existing_edges = {}
-                    required_edge_types = [
-                        ('agent', 'in_fov_and_observed', 'track'),
-                        ('track', 'observed_and_in_fov_by', 'agent'),
-                        ('agent', 'in_fov_only', 'track'),
-                        ('track', 'in_fov_only_by', 'agent'),
-                    ]
-                    
-                    for edge_type in required_edge_types:
-                        try:
-                            if hasattr(experience.graph_data, '_edge_store_dict') and edge_type in experience.graph_data._edge_store_dict:
-                                edge_data = experience.graph_data[edge_type]
-                                if hasattr(edge_data, 'edge_index'):
-                                    existing_edges[edge_type] = edge_data.edge_index
-                        except:
-                            pass  # Skip if edge type doesn't exist
-                    
-                    edge_index_dict = self._ensure_edge_types(existing_edges)
-                    
-                except Exception as e:
+                    edge_index_dict = self._ensure_edge_types(experience.graph_data)
+                except Exception:
                     # Fallback: create all empty edges
                     edge_index_dict = self._ensure_edge_types({})
                 
@@ -524,6 +515,33 @@ class PPOTrainer:
 class RLTrustEnvironment:
     """Environment wrapper for RL training"""
     
+    def _get_robots_list(self):
+        """Get robots as a consistent list format"""
+        if not hasattr(self.sim_env, 'robots') or not self.sim_env.robots:
+            return []
+        if isinstance(self.sim_env.robots, list):
+            return self.sim_env.robots
+        return list(self.sim_env.robots.values())
+
+    def _calculate_trust_value(self, alpha, beta):
+        """Calculate trust value from alpha and beta parameters"""
+        return alpha / (alpha + beta)
+
+    def _get_robot_trust_value(self, robot):
+        """Get trust value for a robot"""
+        if self._has_trust_attributes(robot):
+            return self._calculate_trust_value(robot.trust_alpha, robot.trust_beta)
+        return 0.5  # Default trust value
+
+    def _has_trust_attributes(self, obj):
+        """Check if object has trust attributes"""
+        return hasattr(obj, 'trust_alpha') and hasattr(obj, 'trust_beta')
+
+    def _reset_trust_to_default(self, obj):
+        """Reset object trust to default values"""
+        obj.trust_alpha = 1.0
+        obj.trust_beta = 1.0
+    
     def __init__(self, num_robots=5, num_targets=10, adversarial_ratio=0.3, scenario_config=None, max_steps_per_episode=500, fov_range=50.0, fov_angle=np.pi/3):
         if scenario_config is not None:
             # Use diverse scenario configuration
@@ -623,7 +641,7 @@ class RLTrustEnvironment:
         """Verify that all trust values start fresh for the episode"""
         if hasattr(self.sim_env, 'robots'):
             for robot in self.sim_env.robots:
-                if hasattr(robot, 'trust_alpha') and hasattr(robot, 'trust_beta'):
+                if self._has_trust_attributes(robot):
                     if robot.trust_alpha != 1.0 or robot.trust_beta != 1.0:
                         # print(f"  ⚠️  WARNING: Robot {robot.id} trust not reset! α={robot.trust_alpha:.3f}, β={robot.trust_beta:.3f}")
                         # Force reset to default values
@@ -640,18 +658,12 @@ class RLTrustEnvironment:
     def _select_episode_ego_robot(self):
         """Select and fix ego robot for entire episode"""
         # Get available robots
-        if hasattr(self.sim_env, 'robots') and self.sim_env.robots:
-            if isinstance(self.sim_env.robots, list):
-                robots = self.sim_env.robots
-            else:
-                robots = list(self.sim_env.robots.values()) if self.sim_env.robots else []
-            
-            if robots:
-                # Select first robot as ego robot for this episode
-                self.episode_ego_robot_id = robots[0].id
-                # print(f"  🎯 Selected Robot {self.episode_ego_robot_id} as ego robot for this episode")
-            else:
-                self.episode_ego_robot_id = None
+        robots = self._get_robots_list()
+        
+        if robots:
+            # Select first robot as ego robot for this episode
+            self.episode_ego_robot_id = robots[0].id
+            # print(f"  🎯 Selected Robot {self.episode_ego_robot_id} as ego robot for this episode")
         else:
             self.episode_ego_robot_id = None
     
@@ -661,18 +673,9 @@ class RLTrustEnvironment:
     
     def _get_current_state_with_ego(self, ego_robot_id):
         """Get current state with specific robot as ego robot"""
-        # Check if simulation has robots
-        if not hasattr(self.sim_env, 'robots') or not self.sim_env.robots:
-            return self._get_empty_graph()
         
         # Get robots (handle both list and dict formats)
-        if isinstance(self.sim_env.robots, list):
-            robots = self.sim_env.robots
-        else:
-            robots = list(self.sim_env.robots.values()) if self.sim_env.robots else []
-        
-        if not robots:
-            return self._get_empty_graph()
+        robots = self._get_robots_list()
         
         # Find the specified ego robot
         ego_robot = None
@@ -846,7 +849,7 @@ class RLTrustEnvironment:
             # Only proximal robots involved - highest trust robot takes priority
             robot_trusts = {}
             for robot in all_robots:
-                robot_trusts[robot.id] = robot.trust_alpha / (robot.trust_alpha + robot.trust_beta)
+                robot_trusts[robot.id] = self._get_robot_trust_value(robot)
             
             # Find track from highest trust proximal robot
             best_track = None
@@ -909,7 +912,7 @@ class RLTrustEnvironment:
             agent_nodes[robot.id] = i
             
             # Compute trust-based predicates
-            robot_trust = robot.trust_alpha / (robot.trust_alpha + robot.trust_beta)
+            robot_trust = self._get_robot_trust_value(robot)
             
             # Feature 1: HighConfidence(robot) - robot confidence > 0.7
             robot_confidence = getattr(robot, 'confidence', robot_trust)  # Use robot.confidence if available, fallback to trust
@@ -946,7 +949,7 @@ class RLTrustEnvironment:
             track_nodes[track.id] = i
             
             # Compute trust and confidence based predicates
-            track_trust = track.trust_alpha / (track.trust_alpha + track.trust_beta)
+            track_trust = self._calculate_trust_value(track.trust_alpha, track.trust_beta)
             track_confidence = getattr(track, 'confidence', 0.5)
             
             # Feature 1: Trustworthy(track) - basic trust > 0.5
@@ -1107,34 +1110,8 @@ class RLTrustEnvironment:
             # If no orientation info, only use distance constraint
             return True
     
-    def _get_empty_graph(self):
-        """Create empty graph when simulation state is invalid"""
-        from torch_geometric.data import HeteroData
-        import torch
-        
-        graph_data = HeteroData()
-        graph_data['agent'].x = torch.empty((0, 1), dtype=torch.float)
-        graph_data['track'].x = torch.empty((0, 1), dtype=torch.float)
-        
-        required_edge_types = [
-            ('agent', 'in_fov_and_observed', 'track'),
-            ('track', 'observed_and_in_fov_by', 'agent'),
-            ('agent', 'in_fov_only', 'track'),
-            ('track', 'in_fov_only_by', 'agent'),
-            # ('agent', 'isProximal', 'agent')  # TEMPORARILY DISABLED
-        ]
-        
-        for edge_type in required_edge_types:
-            graph_data[edge_type].edge_index = torch.empty((2, 0), dtype=torch.long)
-        
-        graph_data.agent_nodes = {}
-        graph_data.track_nodes = {}
-        
-        return graph_data
-    
     def step(self, actions):
         """Take environment step with given actions (supports multi-ego training)"""
-        
         return self._step_multi_ego(actions)
     
     def _step_multi_ego(self, actions):
@@ -1160,12 +1137,7 @@ class RLTrustEnvironment:
             pass
             
         # Get robots for multi-ego processing
-        robots = []
-        if hasattr(self.sim_env, 'robots') and self.sim_env.robots:
-            if isinstance(self.sim_env.robots, list):
-                robots = self.sim_env.robots
-            else:
-                robots = list(self.sim_env.robots.values())
+        robots = self._get_robots_list()
         
         # MULTI-EGO APPROACH: Get actions from each robot's perspective
         self.accumulated_robot_updates.clear()
@@ -1224,7 +1196,7 @@ class RLTrustEnvironment:
         if hasattr(current_state, '_current_robots'):
             for robot in current_state._current_robots:
                 if hasattr(robot, 'trust_alpha'):
-                    trust_value = robot.trust_alpha / (robot.trust_alpha + robot.trust_beta)
+                    trust_value = self._get_robot_trust_value(robot)
                     current_trust_distributions[robot.id] = {
                         'trust': trust_value,
                         'alpha': robot.trust_alpha,
@@ -1305,7 +1277,7 @@ class RLTrustEnvironment:
         
         # Apply accumulated robot updates
         if hasattr(self.sim_env, 'robots') and self.sim_env.robots:
-            robots = self.sim_env.robots if isinstance(self.sim_env.robots, list) else list(self.sim_env.robots.values())
+            robots = self._get_robots_list()
             
             for robot in robots:
                 if robot.id in self.accumulated_robot_updates and hasattr(robot, 'trust_alpha'):
@@ -1458,7 +1430,7 @@ class RLTrustEnvironment:
         correctly_identified_legitimate = 0
         
         for robot in all_robots:
-            if hasattr(robot, 'trust_alpha') and hasattr(robot, 'trust_beta'):
+            if self._has_trust_attributes(robot):
                 total_robots += 1
                 final_trust = robot.trust_alpha / (robot.trust_alpha + robot.trust_beta)
                 is_adversarial = getattr(robot, 'is_adversarial', False)
@@ -1537,7 +1509,7 @@ class RLTrustEnvironment:
         object_trust_groups = {}
         for track in ground_truth_tracks:
             object_id = track.object_id
-            track_trust = track.trust_alpha / (track.trust_alpha + track.trust_beta)
+            track_trust = self._calculate_trust_value(track.trust_alpha, track.trust_beta)
             if object_id not in object_trust_groups:
                 object_trust_groups[object_id] = []
             object_trust_groups[object_id].append(track_trust)
@@ -1546,7 +1518,7 @@ class RLTrustEnvironment:
         false_positive_groups = {}
         for track in false_positive_tracks:
             object_id = track.object_id
-            track_trust = track.trust_alpha / (track.trust_alpha + track.trust_beta)
+            track_trust = self._calculate_trust_value(track.trust_alpha, track.trust_beta)
             if object_id not in false_positive_groups:
                 false_positive_groups[object_id] = []
             false_positive_groups[object_id].append(track_trust)
@@ -1748,7 +1720,7 @@ class RLTrustEnvironment:
         
         # Store robot trust distributions
         for robot in all_robots:
-            if hasattr(robot, 'trust_alpha') and hasattr(robot, 'trust_beta'):
+            if self._has_trust_attributes(robot):
                 self._previous_trust_distributions[robot.id] = {
                     'alpha': robot.trust_alpha,
                     'beta': robot.trust_beta
