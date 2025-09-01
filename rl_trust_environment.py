@@ -279,6 +279,8 @@ class RLTrustEnvironment:
                 highly_trusted_pred,     # Feature 2  
                 suspicious_pred,         # Feature 3
                 high_connectivity_pred,  # Feature 4
+                robot.trust_alpha,       # Feature 5: Alpha parameter
+                robot.trust_beta,        # Feature 6: Beta parameter
             ])
         
         graph_data['agent'].x = torch.tensor(agent_features, dtype=torch.float)
@@ -311,6 +313,8 @@ class RLTrustEnvironment:
                 highly_trusted_pred,     # Feature 2
                 multi_robot_pred,        # Feature 3  
                 suspicious_pred,         # Feature 4
+                track.trust_alpha,       # Feature 5: Alpha parameter
+                track.trust_beta,        # Feature 6: Beta parameter
             ])
         
         graph_data['track'].x = torch.tensor(track_features, dtype=torch.float)

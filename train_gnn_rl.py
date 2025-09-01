@@ -80,7 +80,7 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=500, device='cpu', s
     
     # Initialize PPO model with simplified neural-symbolic features
     # print("🤖 Initializing PPO model...")
-    ppo_model = PPOTrustGNN(agent_features=4, track_features=4, hidden_dim=64)  # Updated feature counts
+    ppo_model = PPOTrustGNN(agent_features=6, track_features=6, hidden_dim=64)  # 4 predicates + alpha + beta
     trainer = PPOTrainer(ppo_model, device=device)
     
     # IMPORTANT: Pass trainer to environment for multi-ego action selection

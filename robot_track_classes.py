@@ -61,11 +61,24 @@ class Track:
         """Compute trust value from Beta distribution parameters."""
         return self.trust_alpha / (self.trust_alpha + self.trust_beta)
     
-    def update_trust(self, delta_alpha: float, delta_beta: float):
-        """Update trust distribution parameters."""
+    def update_trust(self, delta_alpha: float, delta_beta: float, target_sum: float = 5.0):
+        """Update trust distribution parameters with normalization."""
         self.trust_alpha += delta_alpha
         self.trust_beta += delta_beta
+        self._normalize_trust_parameters(target_sum)
         self.last_updated = time.time()
+    
+    def _normalize_trust_parameters(self, target_sum: float = 5.0):
+        """Normalize alpha and beta parameters to prevent unbounded growth."""
+        current_sum = self.trust_alpha + self.trust_beta
+        if current_sum > target_sum:
+            scale = target_sum / max(current_sum, 1e-6)
+            self.trust_alpha *= scale
+            self.trust_beta *= scale
+        
+        # Ensure minimum values to prevent degenerate distributions
+        self.trust_alpha = max(self.trust_alpha, 0.1)
+        self.trust_beta = max(self.trust_beta, 0.1)
     
     def update_state(self, position: np.ndarray, velocity: np.ndarray, timestamp: float):
         """Update track state estimates."""
@@ -155,10 +168,23 @@ class Robot:
         """Compute robot trust value from Beta distribution parameters."""
         return self.trust_alpha / (self.trust_alpha + self.trust_beta)
     
-    def update_trust(self, delta_alpha: float, delta_beta: float):
-        """Update robot trust distribution parameters."""
+    def update_trust(self, delta_alpha: float, delta_beta: float, target_sum: float = 5.0):
+        """Update robot trust distribution parameters with normalization."""
         self.trust_alpha += delta_alpha
         self.trust_beta += delta_beta
+        self._normalize_trust_parameters(target_sum)
+    
+    def _normalize_trust_parameters(self, target_sum: float = 5.0):
+        """Normalize alpha and beta parameters to prevent unbounded growth."""
+        current_sum = self.trust_alpha + self.trust_beta
+        if current_sum > target_sum:
+            scale = target_sum / max(current_sum, 1e-6)
+            self.trust_alpha *= scale
+            self.trust_beta *= scale
+        
+        # Ensure minimum values to prevent degenerate distributions
+        self.trust_alpha = max(self.trust_alpha, 0.1)
+        self.trust_beta = max(self.trust_beta, 0.1)
     
     def update_state(self, position: np.ndarray, velocity: np.ndarray = None):
         """Update robot position and velocity."""
@@ -327,12 +353,34 @@ if __name__ == "__main__":
     robot1.update_track("obj_1", position=[6, 6], velocity=[1.2, 0.1])
     print(f"  Updated track: {robot1.get_track('obj_1')}")
     
-    # Test trust updates
-    print("Testing trust updates:")
+    # Test trust updates with normalization
+    print("Testing trust updates with normalization:")
     track = robot1.get_track("obj_1")
     original_trust = track.trust_value
-    track.update_trust(0.5, 0.2)
-    print(f"  Trust changed from {original_trust:.3f} to {track.trust_value:.3f}")
+    original_alpha = track.trust_alpha
+    original_beta = track.trust_beta
+    original_sum = original_alpha + original_beta
+    
+    print(f"  Original: alpha={original_alpha:.3f}, beta={original_beta:.3f}, sum={original_sum:.3f}, trust={original_trust:.3f}")
+    
+    # Simulate large updates that would cause unbounded growth
+    track.update_trust(5.0, 3.0)  # Large update
+    new_alpha = track.trust_alpha
+    new_beta = track.trust_beta
+    new_sum = new_alpha + new_beta
+    new_trust = track.trust_value
+    
+    print(f"  After normalization: alpha={new_alpha:.3f}, beta={new_beta:.3f}, sum={new_sum:.3f}, trust={new_trust:.3f}")
+    print(f"  Trust value maintained ratio while sum was normalized from {original_sum + 8.0:.3f} to {new_sum:.3f}")
+    
+    # Test robot trust normalization too
+    robot1_orig_trust = robot1.trust_value
+    robot1_orig_sum = robot1.trust_alpha + robot1.trust_beta
+    robot1.update_trust(10.0, 5.0)  # Very large update
+    robot1_new_sum = robot1.trust_alpha + robot1.trust_beta
+    robot1_new_trust = robot1.trust_value
+    
+    print(f"  Robot trust normalized: sum {robot1_orig_sum + 15.0:.3f} → {robot1_new_sum:.3f}, trust {robot1_orig_trust:.3f} → {robot1_new_trust:.3f}")
     
     # Test current timestep tracking
     print("\nTesting current timestep tracking:")

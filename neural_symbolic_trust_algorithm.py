@@ -303,8 +303,9 @@ class NeuralSymbolicTrustAlgorithm(TrustAlgorithm):
             # Load checkpoint
             checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
             
-            # Create model with correct architecture (5 agent features, 5 track features)
-            self.gnn_model = PPOTrustGNN(agent_features=5, track_features=5, hidden_dim=64)
+            # Create model with correct architecture (6 agent features, 6 track features)
+            # Features: 4 original neural-symbolic predicates + alpha + beta
+            self.gnn_model = PPOTrustGNN(agent_features=6, track_features=6, hidden_dim=64)
             
             # Load model weights with strict=False to handle architecture differences
             self.gnn_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
