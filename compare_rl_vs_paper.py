@@ -12,8 +12,8 @@ import matplotlib.pyplot as plt
 import time
 from collections import defaultdict
 
-from train_gnn_rl import PPOTrustGNN, PPOTrainer, RLTrustEnvironment, _generate_diverse_scenarios
-from neural_symbolic_trust_algorithm import TrustGNN, NeuralSymbolicTrustAlgorithm
+from train_gnn_rl import PPOTrustGNN, PPOTrainer, RLTrustEnvironment
+from neural_symbolic_trust_algorithm import PPOTrustGNN as NeuralPPOTrustGNN, NeuralSymbolicTrustAlgorithm
 from paper_trust_algorithm import PaperTrustAlgorithm
 from simulation_environment import SimulationEnvironment
 
@@ -24,12 +24,11 @@ class SimpleTrustComparison:
     def __init__(self, model_path='ppo_trust_gnn.pth'):
         self.model_path = model_path
         
-        # Load RL model
+        # Load RL model with correct architecture (6 features: 4 predicates + alpha + beta)
         checkpoint = torch.load(self.model_path, map_location='cpu', weights_only=False)
-        base_gnn = TrustGNN(agent_features=1, track_features=1, hidden_dim=64)
-        self.rl_model = PPOTrustGNN(base_gnn)
+        self.rl_model = PPOTrustGNN(agent_features=6, track_features=6, hidden_dim=64)
         self.rl_trainer = PPOTrainer(self.rl_model, device=torch.device('cpu'))
-        self.rl_model.load_state_dict(checkpoint['model_state_dict'])
+        self.rl_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         print(f"✅ Loaded RL model: Episode {checkpoint['episode']}, Best reward: {checkpoint['best_reward']:.2f}")
         
         # Paper algorithm
@@ -56,8 +55,7 @@ class SimpleTrustComparison:
             num_targets=scenario_config['num_objects'],
             world_size=world_size,
             adversarial_ratio=scenario_config['adversarial_ratio'],
-            proximal_range=proximal_range,
-            trust_algorithm=None  # We'll manage trust updates ourselves
+            proximal_range=proximal_range
         )
         
         # Print ground truth
@@ -76,8 +74,7 @@ class SimpleTrustComparison:
         rl_robot_trusts = {r.id: {'alpha': 1.0, 'beta': 1.0} for r in sim_env.robots}
         paper_robot_trusts = {r.id: {'alpha': 1.0, 'beta': 1.0} for r in sim_env.robots}
         
-        # Initialize the paper algorithm for this scenario
-        self.paper_algo.initialize(sim_env.robots)
+        # Paper algorithm is ready to use without initialization
         
         # Run simulation steps
         for step in range(max_steps):
@@ -86,7 +83,7 @@ class SimpleTrustComparison:
             
             # Extract current robot states and track observations
             robot_states = {r.id: r for r in sim_env.robots}
-            robot_tracks = sim_env.tracks  # Dict[robot_id, List[Track]]
+            robot_tracks = {r.id: r.get_all_tracks() for r in sim_env.robots}  # Dict[robot_id, List[Track]]
             
             # === RL ALGORITHM ===
             # Convert simulation data to RL format and get RL decisions
@@ -255,32 +252,23 @@ class SimpleTrustComparison:
     def _apply_paper_algorithm(self, paper_robot_trusts, robot_states, robot_tracks, sim_env):
         """Apply paper algorithm trust updates using the actual algorithm"""
         try:
-            # Make sure all robot IDs are in the paper algorithm's robot_object_trust
-            for robot_id in robot_states.keys():
-                if robot_id not in self.paper_algo.robot_object_trust:
-                    self.paper_algo.robot_object_trust[robot_id] = {}
-            
             # Set robot trust values before calling paper algorithm
             for robot_id, trust_data in paper_robot_trusts.items():
                 robot = robot_states[robot_id]
                 robot.trust_alpha = trust_data['alpha']
                 robot.trust_beta = trust_data['beta']
             
-            # Set track trust values
+            # Set track trust values  
             for robot_id, tracks in robot_tracks.items():
                 for track in tracks:
                     if not hasattr(track, 'trust_alpha'):
                         track.trust_alpha = 2.0
                         track.trust_beta = 1.0
             
-            # Call the actual paper trust algorithm
+            # Call the actual paper trust algorithm (simplified signature)
             trust_updates = self.paper_algo.update_trust(
                 list(robot_states.values()), 
-                robot_tracks, 
-                sim_env.robot_object_tracks, 
-                sim_env.time,
-                sim_env.robot_current_tracks,
-                sim_env
+                environment=sim_env
             )
             
             # Extract updated trust values back to our tracking
@@ -319,24 +307,52 @@ class SimpleTrustComparison:
         
         return extracted
     
+    def _generate_diverse_scenarios(self):
+        """Generate diverse test scenarios"""
+        return [
+            {
+                'name': 'Dense Small Scale',
+                'num_robots': 4,
+                'num_objects': 12,
+                'adversarial_ratio': 0.25,
+                'max_steps': 80,
+                'world_size': (40.0, 40.0),
+                'proximal_range': 40.0
+            },
+            {
+                'name': 'Sparse Medium Scale',
+                'num_robots': 6,
+                'num_objects': 18,
+                'adversarial_ratio': 0.33,
+                'max_steps': 100,
+                'world_size': (60.0, 60.0), 
+                'proximal_range': 45.0
+            },
+            {
+                'name': 'High Adversarial',
+                'num_robots': 5,
+                'num_objects': 15,
+                'adversarial_ratio': 0.6,
+                'max_steps': 120,
+                'world_size': (50.0, 50.0),
+                'proximal_range': 35.0
+            },
+            {
+                'name': 'Large Scale Low Adversarial',
+                'num_robots': 8,
+                'num_objects': 30,
+                'adversarial_ratio': 0.125,
+                'max_steps': 150,
+                'world_size': (80.0, 80.0),
+                'proximal_range': 60.0
+            }
+        ]
+    
     def run_all_scenarios(self, use_diverse=False):
         """Run comparison across multiple scenarios"""
         if use_diverse:
             print("🌈 Using diverse scenario generation...")
-            diverse_scenarios = _generate_diverse_scenarios(4)  # Generate 4 diverse scenarios
-            scenarios = []
-            for i, scenario in enumerate(diverse_scenarios):
-                scenarios.append({
-                    'name': f'Diverse Scenario {i+1}',
-                    'num_robots': scenario['num_robots'],
-                    'num_objects': scenario['num_targets'],
-                    'adversarial_ratio': scenario['adversarial_ratio'],
-                    'max_steps': 100,
-                    'world_size': scenario['world_size'],
-                    'false_positive_rate': scenario['false_positive_rate'],
-                    'false_negative_rate': scenario['false_negative_rate'],
-                    'proximal_range': scenario['proximal_range']
-                })
+            scenarios = self._generate_diverse_scenarios()
         else:
             scenarios = [
                 {
