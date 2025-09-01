@@ -379,7 +379,7 @@ class SimulationEnvironment:
                 fp_obj.position[1] = np.clip(fp_obj.position[1], 0, self.world_size[1])
         
         # Random FP spawning (small probability)
-        if random.random() < 0.1: 
+        if random.random() < 0.2: 
             # Pick a random adversarial robot to create FP near
             target_robot = random.choice(adversarial_robots)
             
@@ -484,9 +484,8 @@ class SimulationEnvironment:
                 object_id = f"gt_obj_{gt_obj.id}"
                 
                 # Legitimate robots detect with minimal noise
-                noisy_pos = gt_obj.position + np.random.normal(0, noise_std * 0.5, 3)
-                noisy_vel = gt_obj.velocity + np.random.normal(0, 0.2, 3)
-                covariance = np.eye(6) * (noise_std * 0.5)**2
+                noisy_pos = gt_obj.position
+                noisy_vel = gt_obj.velocity
                 
                 # Initialize with neutral Beta(1,1) prior
                 trust_alpha = 1.0
@@ -502,8 +501,6 @@ class SimulationEnvironment:
                     existing_track.update_state(noisy_pos, noisy_vel, self.time)
                     # DO NOT update trust here - trust is managed by the trust algorithm
                     # Set additional attributes that are used by the simulation
-                    existing_track.covariance = covariance
-                    existing_track.confidence = random.uniform(0.85, 0.98)
                     track = existing_track
                 else:
                     # Create new track using the new Track class
@@ -518,8 +515,6 @@ class SimulationEnvironment:
                         timestamp=self.time
                     )
                     # Set additional attributes that are used by the simulation
-                    track.covariance = covariance
-                    track.confidence = random.uniform(0.85, 0.98)
                     # Add new track to robot's local tracks
                     robot.add_track(track)
                 detections.append(track)
@@ -532,8 +527,6 @@ class SimulationEnvironment:
         
         # Parameters for adversarial behavior
         false_negative_rate = self.false_negative_rate
-        position_noise_std = noise_std * 0.5
-        velocity_noise_std = 0.2
         
         # True objects in FOV
         true_objects_in_fov = [gt for gt in self.ground_truth_objects if robot.is_in_fov(gt.position)]
@@ -544,10 +537,9 @@ class SimulationEnvironment:
                 continue
             
             object_id = f"gt_obj_{gt_obj.id}"
-            noisy_pos = gt_obj.position + np.random.normal(0, position_noise_std, 3)
-            noisy_vel = gt_obj.velocity + np.random.normal(0, velocity_noise_std, 3)
-            covariance = np.eye(6) * position_noise_std**2
-            
+            noisy_pos = gt_obj.position
+            noisy_vel = gt_obj.velocity
+
             # Initialize trust values
             trust_alpha = 1.0
             trust_beta = 1.0
@@ -561,8 +553,6 @@ class SimulationEnvironment:
                 existing_track.update_state(noisy_pos, noisy_vel, self.time)
                 # DO NOT update trust here - trust is managed by the trust algorithm
                 # Set additional attributes that are used by the simulation
-                existing_track.covariance = covariance
-                existing_track.confidence = random.uniform(0.85, 0.98)
                 track = existing_track
             else:
                 # Create new track using the new Track class
@@ -577,14 +567,10 @@ class SimulationEnvironment:
                     timestamp=self.time
                 )
                 # Set additional attributes that are used by the simulation
-                track.covariance = covariance
-                track.confidence = random.uniform(0.85, 0.98)
                 # Add new track to robot's local tracks
                 robot.add_track(track)
             tracks.append(track)
-        
-        # FP objects are now managed globally, just detect visible ones
-        
+                
         # Generate tracks for visible FP objects (now using same structure as ground truth)
         for fp_obj in self.shared_fp_objects:
             if robot.is_in_fov(fp_obj.position):
@@ -602,8 +588,6 @@ class SimulationEnvironment:
                     existing_track.update_state(fp_obj.position.copy(), fp_obj.velocity.copy(), self.time)
                     # DO NOT update trust here - trust is managed by the trust algorithm
                     # Set additional attributes that are used by the simulation
-                    existing_track.covariance = np.eye(6) * 1e-6
-                    existing_track.confidence = random.uniform(0.95, 0.99)
                     track = existing_track
                 else:
                     # Create new track using the new Track class
@@ -617,9 +601,6 @@ class SimulationEnvironment:
                         trust_beta=trust_beta,
                         timestamp=self.time
                     )
-                    # Set additional attributes that are used by the simulation
-                    track.covariance = np.eye(6) * 1e-6
-                    track.confidence = random.uniform(0.95, 0.99)
                     # Add new track to robot's local tracks
                     robot.add_track(track)
                 

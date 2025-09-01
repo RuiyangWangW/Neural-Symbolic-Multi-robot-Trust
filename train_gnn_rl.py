@@ -21,7 +21,7 @@ from rl_trust_environment import RLTrustEnvironment
 from embedding_analysis import compare_trained_vs_untrained_embeddings, run_embedding_analysis_on_trained_model
 
 def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', save_path='ppo_trust_gnn.pth', 
-                       enable_visualization=True, visualize_frequency=5, visualize_steps=[0, 5, 10, 15],
+                       enable_visualization=True, visualize_frequency=5, visualize_steps=[0, 20, 40, 60],
                        # Environment parameters
                        num_robots=5, num_targets=20, adversarial_ratio=0.5,
                        world_size=(60, 60), false_positive_rate=0.5, false_negative_rate=0.0,
@@ -103,15 +103,7 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
     def get_model_checksum(model):
         return sum(p.sum().item() for p in model.parameters() if p.requires_grad)
     
-    initial_checksum = get_model_checksum(ppo_model)
-    print(f"🧠 Initial model parameter checksum: {initial_checksum:.6f}")
-    
     for episode in range(episodes):
-        
-        # Debug: Check model persistence every 10 episodes
-        if episode % 10 == 0 and episode > 0:
-            current_checksum = get_model_checksum(ppo_model)
-            print(f"🧠 Episode {episode} model checksum: {current_checksum:.6f} (change: {current_checksum - initial_checksum:.6f})")
         
         # Reset environment
         state = env.reset()
@@ -157,11 +149,6 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
         
         # Update policy when we have enough episodes collected
         losses = trainer.update_policy()  # This handles the min_episodes check internally
-        
-        # Debug: Show when policy updates happen
-        if losses:
-            current_checksum = get_model_checksum(ppo_model)
-            print(f"🔄 Policy updated after Episode {episode} - Model checksum: {current_checksum:.6f}")
         
         episode_rewards.append(episode_reward)
         
@@ -222,14 +209,14 @@ def main():
     
     # Environment configuration parameters  
     num_robots = 5
-    num_targets = 10
+    num_targets = 20
     adversarial_ratio = 0.5
     world_size = (100, 100)
-    false_positive_rate = 0.3  # Reduced from 0.5 for more realistic simulation
-    false_negative_rate = 0.1  # Increased from 0.0 to add missed detections  
+    false_positive_rate = 0.5  # Reduced from 0.5 for more realistic simulation
+    false_negative_rate = 0.0  # Increased from 0.0 to add missed detections  
     movement_speed = 1.0
     proximal_range = 100.0      # Reduced from 100.0 to match world size better
-    fov_range = 50.0           # Reduced from 50.0 for more realistic observation patterns
+    fov_range = 100.0           # Reduced from 50.0 for more realistic observation patterns
     fov_angle = np.pi/3
     
     # Parse all arguments

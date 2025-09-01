@@ -15,122 +15,68 @@ from typing import List, Dict, Optional
 from trust_algorithm import TrustAlgorithm, RobotState, Track
 
 
-class HybridSAGEGATConv(nn.Module):
+class HeteroHybridConv(nn.Module):
     """
-    Hybrid GraphSAGE + GAT layer for trust-based multi-robot systems.
+    Proper heterogeneous convolution layer for multi-robot trust systems.
     
-    Uses GraphSAGE for efficient neighborhood aggregation and GAT for attention-based
-    feature selection. This combination is particularly good for trust networks where:
-    - SAGE handles large neighborhoods efficiently
-    - GAT focuses on most relevant trust relationships
+    Handles different node types (agents, tracks) with different edge relationships
+    using PyTorch Geometric's HeteroConv for proper heterogeneous graph processing.
     """
     
-    def __init__(self, in_channels: int, out_channels: int, heads: int = 4, dropout: float = 0.1):
+    def __init__(self, node_types_channels: Dict[str, int], out_channels: int, heads: int = 4):
         super().__init__()
         
-        # GraphSAGE component for efficient neighborhood aggregation
-        self.sage = SAGEConv(in_channels, out_channels // 2, aggr='mean')
+        # Define edge types for trust networks
+        edge_types = [
+            ('agent', 'in_fov_and_observed', 'track'),
+            ('track', 'observed_and_in_fov_by', 'agent'),
+            ('agent', 'in_fov_only', 'track'),
+            ('track', 'in_fov_only_by', 'agent'),
+        ]
         
-        # GAT component for attention-based selection
-        self.gat = GATConv(in_channels, out_channels // 2, heads=heads, 
-                          concat=False, dropout=dropout, add_self_loops=False)
-        
-        # Fusion layer to combine SAGE and GAT outputs
-        self.fusion = nn.Linear(out_channels, out_channels)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x, edge_index, *args, **kwargs):
-        # Handle different input formats from HeteroConv
-        if isinstance(x, tuple):
-            # HeteroConv passes (x_src, x_dst) tuple for heterogeneous edges
-            x_src, x_dst = x
-            # For heterogeneous edges, we need to handle source and destination separately
-            # But for now, let's use a simpler approach - use source features
-            x = x_src
-        
-        # Debug: Check tensor dimensions
-        # print(f"DEBUG HybridSAGEGATConv: x.shape={x.shape}, edge_index.shape={edge_index.shape}")
-        
-        # GraphSAGE path - efficient neighborhood sampling and aggregation
-        sage_out = F.relu(self.sage(x, edge_index))
-        
-        # GAT path - attention-based feature selection
-        gat_out = F.relu(self.gat(x, edge_index))
-        
-        # Combine both paths
-        combined = torch.cat([sage_out, gat_out], dim=-1)
-        
-        # Final fusion with residual connection
-        fused = self.fusion(combined)
-        fused = self.dropout(fused)
-        
-        # Optional residual connection if dimensions match
-        if x.shape[-1] == fused.shape[-1]:
-            fused = fused + x
+        # Create convolution dictionary for each edge type
+        conv_dict = {}
+        for src_type, relation, dst_type in edge_types:
+            src_dim = node_types_channels[src_type]
             
-        return fused
-
-
-class PPOTrustGNN_SAGE(nn.Module):
-    """
-    Pure GraphSAGE version of the trust GNN for comparison.
+            if 'observed' in relation:
+                # Use GAT for trust-based observation relationships
+                conv_dict[(src_type, relation, dst_type)] = GATConv(
+                    in_channels=src_dim,
+                    out_channels=out_channels // 2,
+                    heads=heads,
+                    concat=False,
+                    add_self_loops=False
+                )
+            else:
+                # Use SAGE for proximity relationships  
+                conv_dict[(src_type, relation, dst_type)] = SAGEConv(
+                    in_channels=src_dim,
+                    out_channels=out_channels // 2
+                )
+        
+        # Create the heterogeneous convolution
+        self.hetero_conv = HeteroConv(conv_dict, aggr='mean')
+        
+        # Fusion layers for each node type to combine different edge types
+        self.fusion_layers = nn.ModuleDict()
+        for node_type in node_types_channels.keys():
+            self.fusion_layers[node_type] = nn.Sequential(
+                nn.Linear(out_channels // 2, out_channels),  # Adjust based on actual input
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            )
     
-    This version uses only GraphSAGE layers for efficient neighborhood aggregation,
-    which can be more scalable for larger trust networks.
-    """
-    
-    def __init__(self, agent_features: int, track_features: int, hidden_dim: int = 64):
-        super(PPOTrustGNN_SAGE, self).__init__()
+    def forward(self, x_dict, edge_index_dict):
+        # Apply heterogeneous convolution
+        out_dict = self.hetero_conv(x_dict, edge_index_dict)
         
-        self.hidden_dim = hidden_dim
+        # Apply fusion for each node type
+        for node_type in out_dict:
+            if node_type in self.fusion_layers:
+                out_dict[node_type] = self.fusion_layers[node_type](out_dict[node_type])
         
-        # Node embedding layers
-        self.agent_embedding = Linear(agent_features, hidden_dim)
-        self.track_embedding = Linear(track_features, hidden_dim)
-        
-        # Pure GraphSAGE heterogeneous convolution layers
-        self.conv1 = HeteroConv({
-            ('agent', 'in_fov_and_observed', 'track'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-            ('track', 'observed_and_in_fov_by', 'agent'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-            ('agent', 'in_fov_only', 'track'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-            ('track', 'in_fov_only_by', 'agent'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-        })
-        
-        self.conv2 = HeteroConv({
-            ('agent', 'in_fov_and_observed', 'track'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-            ('track', 'observed_and_in_fov_by', 'agent'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-            ('agent', 'in_fov_only', 'track'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-            ('track', 'in_fov_only_by', 'agent'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-        })
-        
-        self.conv3 = HeteroConv({
-            ('agent', 'in_fov_and_observed', 'track'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-            ('track', 'observed_and_in_fov_by', 'agent'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-            ('agent', 'in_fov_only', 'track'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-            ('track', 'in_fov_only_by', 'agent'): SAGEConv(hidden_dim, hidden_dim, aggr='mean'),
-        })
-        
-        # Rest of the architecture (same as original)
-        # Batch normalization layers for stability
-        self.norm1 = nn.ModuleDict({
-            'agent': nn.BatchNorm1d(hidden_dim),
-            'track': nn.BatchNorm1d(hidden_dim)
-        })
-        self.norm2 = nn.ModuleDict({
-            'agent': nn.BatchNorm1d(hidden_dim),
-            'track': nn.BatchNorm1d(hidden_dim)
-        })
-        self.norm3 = nn.ModuleDict({
-            'agent': nn.BatchNorm1d(hidden_dim),
-            'track': nn.BatchNorm1d(hidden_dim)
-        })
-        
-        # Copy the rest of the policy and value networks from the original class
-        # (Same implementation as PPOTrustGNN)
-    
-    # The forward method would be identical to the original PPOTrustGNN
-    # This is just a demonstration of how to use pure GraphSAGE
-
+        return out_dict
 
 class PPOTrustGNN(nn.Module):
     """
@@ -147,28 +93,26 @@ class PPOTrustGNN(nn.Module):
         self.agent_embedding = Linear(agent_features, hidden_dim)
         self.track_embedding = Linear(track_features, hidden_dim)
         
-        # Use pure GraphSAGE layers for heterogeneous graphs (more stable)
-        self.conv1 = HeteroConv({
-            ('agent', 'in_fov_and_observed', 'track'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-            ('track', 'observed_and_in_fov_by', 'agent'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-            ('agent', 'in_fov_only', 'track'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-            ('track', 'in_fov_only_by', 'agent'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-        })
+        # Use our new HeteroHybridConv layers for better heterogeneous graph processing
+        # Define node type channels for each layer
+        initial_channels = {'agent': hidden_dim, 'track': hidden_dim}
         
-        self.conv2 = HeteroConv({
-            ('agent', 'in_fov_and_observed', 'track'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-            ('track', 'observed_and_in_fov_by', 'agent'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-            ('agent', 'in_fov_only', 'track'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-            ('track', 'in_fov_only_by', 'agent'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-        })
+        # Layer 1: Initial feature processing with hybrid SAGE+GAT
+        self.conv1 = HeteroHybridConv(initial_channels, hidden_dim, heads=4)
         
-        # Add third conv layer for deeper representation
-        self.conv3 = HeteroConv({
-            ('agent', 'in_fov_and_observed', 'track'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-            ('track', 'observed_and_in_fov_by', 'agent'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-            ('agent', 'in_fov_only', 'track'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-            ('track', 'in_fov_only_by', 'agent'): GATConv(hidden_dim, hidden_dim, add_self_loops=False),
-        })
+        # Layer 2: Deeper feature refinement
+        self.conv2 = HeteroHybridConv(
+            {'agent': hidden_dim, 'track': hidden_dim}, 
+            hidden_dim, 
+            heads=4
+        )
+        
+        # Layer 3: Final feature processing before policy heads
+        self.conv3 = HeteroHybridConv(
+            {'agent': hidden_dim, 'track': hidden_dim}, 
+            hidden_dim, 
+            heads=4
+        )
         
         # Batch normalization layers for stability
         self.norm1 = nn.ModuleDict({

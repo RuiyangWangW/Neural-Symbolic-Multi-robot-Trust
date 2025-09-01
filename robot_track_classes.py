@@ -63,14 +63,16 @@ class Track:
     
     def update_trust(self, delta_alpha: float, delta_beta: float):
         """Update trust distribution parameters."""
-        self.normalize_trust_parameters()
-        self.trust_alpha += delta_alpha
-        self.trust_beta += delta_beta
+        scale = self.normalize_trust_parameters()
+        self.trust_alpha += delta_alpha * scale
+        self.trust_beta += delta_beta * scale
         # Increment observation count since this represents another observation/update
         self.observation_count += 1
     
     def normalize_trust_parameters(self, max_sum: float = 5.0):
         current_sum = self.trust_alpha + self.trust_beta
+        scale = 1.0  # Initialize scale to 1.0 (no scaling by default)
+        
         if current_sum > max_sum:
             scale = max_sum / max(current_sum, 1e-6)
             self.trust_alpha *= scale
@@ -79,6 +81,7 @@ class Track:
         # Ensure minimum values to prevent degenerate distributions
         self.trust_alpha = max(self.trust_alpha, 0.1)
         self.trust_beta = max(self.trust_beta, 0.1)
+        return scale
 
     def update_state(self, position: np.ndarray, velocity: np.ndarray, timestamp: float):
         """Update track state estimates."""
@@ -142,6 +145,12 @@ class Robot:
         self.position = np.array(position)
         self.velocity = np.array(velocity) if velocity is not None else np.zeros(2)
         
+        # Calculate initial orientation from velocity
+        if velocity is not None and (velocity[0] != 0 or velocity[1] != 0):
+            self.orientation = np.arctan2(velocity[1], velocity[0])
+        else:
+            self.orientation = 0.0  # Default facing east
+        
         # Robot trust distribution parameters
         self.trust_alpha = trust_alpha
         self.trust_beta = trust_beta
@@ -169,13 +178,15 @@ class Robot:
     
     def update_trust(self, delta_alpha: float, delta_beta: float):
         """Update robot trust distribution parameters."""
-        self.normalize_trust_parameters()
-        self.trust_alpha += delta_alpha
-        self.trust_beta += delta_beta
+        scale = self.normalize_trust_parameters()
+        self.trust_alpha += delta_alpha * scale
+        self.trust_beta += delta_beta * scale
 
     def normalize_trust_parameters(self, max_sum: float = 5.0):
         """Normalize alpha and beta parameters to prevent unbounded growth."""
         current_sum = self.trust_alpha + self.trust_beta
+        scale = 1.0  # Initialize scale to 1.0 (no scaling by default)
+        
         if current_sum > max_sum:
             scale = max_sum / max(current_sum, 1e-6)
             self.trust_alpha *= scale
@@ -185,11 +196,16 @@ class Robot:
         self.trust_alpha = max(self.trust_alpha, 0.1)
         self.trust_beta = max(self.trust_beta, 0.1)
 
+        return scale
+
     def update_state(self, position: np.ndarray, velocity: np.ndarray = None):
-        """Update robot position and velocity."""
+        """Update robot position, velocity, and orientation."""
         self.position = np.array(position)
         if velocity is not None:
             self.velocity = np.array(velocity)
+            # Update orientation based on velocity (direction of movement)
+            if velocity[0] != 0 or velocity[1] != 0:
+                self.orientation = np.arctan2(velocity[1], velocity[0])
         self.timestamp = time.time()
     
     def add_track(self, track: Track):
@@ -260,28 +276,20 @@ class Robot:
     
     def is_in_fov(self, target_position: np.ndarray) -> bool:
         """Check if a position is within this robot's field of view."""
-        # Distance check
-        distance = np.linalg.norm(target_position - self.position)
+        # Calculate relative position
+        rel_pos = target_position - self.position
+        distance = np.linalg.norm(rel_pos[:2])  # 2D distance
+
         if distance > self.fov_range:
             return False
         
-        # Angle check (simplified - assumes robot faces forward)
-        direction_to_target = target_position - self.position
-        if np.linalg.norm(direction_to_target) < 1e-6:
-            return True  # Target at robot position
-        
-        # For simplicity, assume robot always has 360-degree FOV
-        # In practice, you'd check against robot's heading direction
-        return True
-    
-    def get_tracks_in_fov(self) -> List[Track]:
-        """Get all tracks that are within field of view."""
-        tracks_in_fov = []
-        for track in self.local_tracks.values():
-            if self.is_in_fov(track.position):
-                tracks_in_fov.append(track)
-        return tracks_in_fov
-    
+        # Check angle constraint
+        target_angle = np.arctan2(rel_pos[1], rel_pos[0])
+        angle_diff = abs(target_angle - self.orientation)
+        angle_diff = min(angle_diff, 2*np.pi - angle_diff)  # Wrap around
+
+        return angle_diff <= self.fov_angle / 2
+
     def start_new_timestep(self, timestep: float):
         """Start a new timestep and clear current timestep tracks."""
         self.current_timestep = timestep

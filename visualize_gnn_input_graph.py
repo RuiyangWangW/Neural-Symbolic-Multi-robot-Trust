@@ -29,39 +29,6 @@ def visualize_gnn_input(graph_data, episode=None, timestep=None, save_dir="gnn_i
     # Ensure save directory exists
     os.makedirs(save_dir, exist_ok=True)
     
-    # Extract graph information
-    print(f"Graph Structure:")
-    if hasattr(graph_data, 'agent_nodes'):
-        print(f"  Agent nodes: {len(graph_data.agent_nodes)} - {list(graph_data.agent_nodes.keys())}")
-    else:
-        print("  Agent nodes: Not available")
-    
-    if hasattr(graph_data, 'track_nodes'):
-        track_keys = list(graph_data.track_nodes.keys())
-        print(f"  Track nodes: {len(track_keys)} - {track_keys[:8]}{'...' if len(track_keys) > 8 else ''}")
-    else:
-        print("  Track nodes: Not available")
-    
-    # Print node features WITH VALUES
-    hetero_data = graph_data
-    if 'agent' in hetero_data.node_types:
-        agent_features = hetero_data['agent'].x
-        print(f"  Agent features shape: {agent_features.shape}")
-        print(f"  Agent features values: {agent_features.flatten().tolist()}")
-    
-    if 'track' in hetero_data.node_types:
-        track_features = hetero_data['track'].x
-        print(f"  Track features shape: {track_features.shape}")
-        print(f"  Track features values: {track_features.flatten().tolist()[:10]}{'...' if track_features.numel() > 10 else ''}")  # Show first 10
-    
-    # Print edge information
-    edge_types = list(hetero_data.edge_types) if hasattr(hetero_data, 'edge_types') else []
-    print(f"  Edge types: {edge_types}")
-    
-    for edge_type in edge_types:
-        edge_index = hetero_data[edge_type].edge_index
-        print(f"    {edge_type} edges: {edge_index.shape[1]} edges")
-    
     # Create NetworkX graph for visualization
     G = create_networkx_graph(graph_data)
     
@@ -253,12 +220,6 @@ def draw_gnn_edges(G, pos):
         legend_elements.append(Line2D([0], [0], color='red', lw=3.0, 
                                      label=f'InFoV & Observed ({len(in_fov_and_observed)})'))
     
-    # Print edge statistics  
-    print(f"\n📊 Edge Statistics:")
-    print(f"  Robot-Robot Proximal: {len(proximal_edges)}")
-    print(f"  InFoV Only (can see, no observe): {len(in_fov_only)}")
-    print(f"  InFoV & Observed (active sensing): {len(in_fov_and_observed)}")
-    print(f"  Total agent-track relationships: {len(agent_track_relationships)}")
     
     return legend_elements
 

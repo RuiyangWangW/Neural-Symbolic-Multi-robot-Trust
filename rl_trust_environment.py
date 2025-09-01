@@ -8,6 +8,7 @@ for reinforcement learning training of the trust GNN.
 import numpy as np
 import torch
 import random
+import math
 from typing import Dict, List, Optional
 from simulation_environment import SimulationEnvironment
 # Robot and Track classes are imported through simulation_environment
@@ -53,6 +54,24 @@ class RLTrustEnvironment:
         self.accumulated_robot_updates = {}  # robot_id -> list of (delta_alpha, delta_beta)
         self.accumulated_track_updates = {}  # track_id -> list of (delta_alpha, delta_beta)
     
+    def _calculate_beta_std(self, alpha: float, beta: float) -> float:
+        """
+        Calculate the standard deviation of a Beta(alpha, beta) distribution.
+        
+        The standard deviation of Beta(α, β) is: σ = √(αβ/((α+β)²(α+β+1)))
+        This represents the uncertainty/confidence in the trust estimate.
+        
+        Args:
+            alpha: Alpha parameter of Beta distribution
+            beta: Beta parameter of Beta distribution
+            
+        Returns:
+            Standard deviation of the Beta distribution
+        """
+        alpha_plus_beta = alpha + beta
+        variance = (alpha * beta) / ((alpha_plus_beta ** 2) * (alpha_plus_beta + 1))
+        return math.sqrt(variance)
+    
     def reset(self):
         """Reset environment for new episode"""
         # Clear and reset all trust distributions for fresh start each episode
@@ -91,7 +110,6 @@ class RLTrustEnvironment:
             self.sim_env.step()
             for robot in self.sim_env.robots:
                 robot.update_current_timestep_tracks()
-            print(f"   🎯 Initial simulation step completed - robots should have tracks now")
         except Exception as e:
             print(f"   ⚠️ Warning: Initial simulation step failed: {e}")
             
@@ -162,8 +180,6 @@ class RLTrustEnvironment:
             robot_tracks = robot.get_all_current_tracks()  # Returns List[Track]
             individual_robot_tracks[robot.id] = robot_tracks
             total_tracks += len(robot_tracks)
-            
-# Debug removed - tracks generation working correctly
             
         return individual_robot_tracks
     
@@ -270,9 +286,11 @@ class RLTrustEnvironment:
             # Compute trust-based predicates using Robot.trust_value property
             robot_trust = robot.trust_value
             
-            # Feature 1: HighConfidence(robot) - robot confidence > 0.7
-            # Use robot trust as confidence measure since Robot class doesn't have separate confidence
-            high_confidence_pred = 1.0 if robot_trust > 0.7 else 0.0
+            # Feature 1: HighConfidence(robot) - robot confidence > 5.0
+            # Calculate confidence as inverse of Beta distribution standard deviation
+            robot_std = self._calculate_beta_std(robot.trust_alpha, robot.trust_beta)
+            robot_confidence = 1.0 / (robot_std + 1e-6)  # Inverse std with epsilon for stability
+            high_confidence_pred = 1.0 if robot_confidence > 5.0 else 0.0
             
             # Feature 2: HighlyTrusted(robot) - confident positive classification
             highly_trusted_pred = 1.0 if robot_trust > 0.5 else 0.0
@@ -305,9 +323,11 @@ class RLTrustEnvironment:
             # Compute trust and confidence based predicates using Track.trust_value property
             track_trust = track.trust_value
             
-            # Feature 1: HighConfidence(track) - track trust > 0.7
-            # Track class doesn't have separate confidence, use trust value
-            high_confidence_pred = 1.0 if track_trust > 0.7 else 0.0
+            # Feature 1: HighConfidence(track) - track confidence > 5.0
+            # Calculate confidence as inverse of Beta distribution standard deviation
+            track_std = self._calculate_beta_std(track.trust_alpha, track.trust_beta)
+            track_confidence = 1.0 / (track_std + 1e-6)  # Inverse std with epsilon for stability
+            high_confidence_pred = 1.0 if track_confidence > 5.0 else 0.0
 
             # Feature 2: highly_trusted_pred(track) - basic trust > 0.8
             highly_trusted_pred = 1.0 if track_trust > 0.5 else 0.0
@@ -345,14 +365,17 @@ class RLTrustEnvironment:
         # CRITICAL: Create edges to maintain same connectivity as original
         observed_count = 0
         fov_only_count = 0
-        
-# Debug removed - edge building working correctly
+                
+        # Debug tracking
+        total_possible_observations = 0
+        actual_observations = 0
         
         for robot in robots:
             robot_idx = agent_nodes[robot.id]
             
             for track in all_tracks:
                 track_idx = track_nodes[track.track_id]
+                total_possible_observations += 1
                 
                 # Check if robot observes this track (based on ownership/contribution)
                 observes_track = self._robot_observes_track(robot, track, fused_tracks, individual_tracks, track_fusion_map)
@@ -360,22 +383,18 @@ class RLTrustEnvironment:
                 # Check if track is in robot's field of view (distance/angle based)
                 in_fov_by_distance = self._track_in_robot_fov(robot, track)
                 
-                # ORIGINAL LOGIC: A track is in FoV if: robot observes it OR it's within FoV distance
-                # This ensures we maintain the same total edge count as before
-                original_in_fov = observes_track or in_fov_by_distance
-                
-                if original_in_fov:
-                    # Now categorize based on precise semantics
-                    if observes_track:
-                        # Robot observes the track (and it must be in some form of FoV)
-                        in_fov_and_observed_edges.append([robot_idx, track_idx])
-                        observed_and_in_fov_by_edges.append([track_idx, robot_idx])
-                        observed_count += 1
-                    else:
-                        # Track is in FoV by distance but robot doesn't observe it
-                        in_fov_only_edges.append([robot_idx, track_idx])
-                        in_fov_only_by_edges.append([track_idx, robot_idx])
-                        fov_only_count += 1
+                # Now categorize based on precise semantics
+                if observes_track:
+                    # Robot observes the track (and it must be in some form of FoV)
+                    in_fov_and_observed_edges.append([robot_idx, track_idx])
+                    observed_and_in_fov_by_edges.append([track_idx, robot_idx])
+                    observed_count += 1
+                    actual_observations += 1
+                elif in_fov_by_distance:
+                    # Track is in FoV by distance but robot doesn't observe it
+                    in_fov_only_edges.append([robot_idx, track_idx])
+                    in_fov_only_by_edges.append([track_idx, robot_idx])
+                    fov_only_count += 1
         
         # Convert to tensors and create proper edge structure
         edge_types = [
@@ -417,15 +436,20 @@ class RLTrustEnvironment:
         """Determine if robot observes this track (based on fusion logic)"""
         # Check individual tracks first
         if track in individual_tracks:
-            return track.robot_id == robot.id 
+            return track.robot_id == robot.id
         
         # Check if this is a fused track and robot contributed to it
         if track in fused_tracks:
-            # CRITICAL FIX: Match the actual track ID format which is "{robot_id}_{object_id}"
+            # Debug: Show the mapping logic
+            found_contribution = False
             for original_id, fused_id in track_fusion_map.items():
-                if fused_id == track.track_id and original_id.startswith(f"{robot.id}_"):
-                    return True
-            return False
+                if fused_id == track.track_id:
+                    # Check if this robot contributed to the fused track
+                    if original_id.startswith(f"{robot.id}_"):
+                        found_contribution = True
+                        break
+            
+            return found_contribution
         
         return False
     
@@ -442,20 +466,7 @@ class RLTrustEnvironment:
         # Get current state BEFORE applying updates (using original ego for initial state)
         current_state = self._get_current_state()
         self.step_count = step_count
-        try:
-            # DETERMINISTIC: Reset seed before each simulation step for consistent FP generation
-            np.random.seed(42 + self.step_count)  # Different seed per step, but deterministic
-            random.seed(42 + self.step_count)
-            
-            # Advance simulation FIRST
-            self.sim_env.step()
-            for robot in self.sim_env.robots:
-                robot.update_current_timestep_tracks()
-        except Exception as e:
-            # print(f"Warning: Simulation step failed: {e}")
-            # Continue with current state
-            pass
-            
+
         # Get robots for multi-ego processing
         robots = self._get_robots_list()
         
@@ -493,7 +504,16 @@ class RLTrustEnvironment:
         
         # Apply all accumulated updates at once
         self._apply_accumulated_trust_updates()
-        
+
+        np.random.seed(42 + self.step_count)  # Different seed per step, but deterministic
+        random.seed(42 + self.step_count)
+            
+        # Advance simulation FIRST
+        self.sim_env.step() 
+
+        for robot in self.sim_env.robots:
+            robot.update_current_timestep_tracks()
+            
         # Get final state after all updates applied
         next_state = self._get_current_state()
         
@@ -528,25 +548,8 @@ class RLTrustEnvironment:
         done = (num_robots == 0 or 
                 num_objects == 0 or
                 self.step_count >= self.max_steps_per_episode-1)
-        # Compute reward using multi-ego enhanced data
         reward = self._compute_sparse_reward(next_state, simulation_step_data, done)
-        # Debug summary of current trust state
-        #print(f"📊 [STEP {self.step_count}] Step Summary:")
-        #robots = self._get_robots_list()
-        #for robot in robots:
-        #    is_adversarial = getattr(robot, 'is_adversarial', False)
-        #    adv_marker = "🟥" if is_adversarial else "🟩"
-        #    tracks = robot.get_all_tracks()
-        #    num_tracks = len(tracks)
-        #    if num_tracks > 0:
-        #        track_trusts = [t.trust_value for t in tracks]
-        #        avg_track_trust = sum(track_trusts) / len(track_trusts)
-        #        print(f"  {adv_marker} Robot {robot.id} Trust: {robot.trust_value:.3f}, Tracks: {num_tracks} (avg: {avg_track_trust:.3f})")
-        #    else:
-        #        print(f"  {adv_marker} Robot {robot.id} Trust: {robot.trust_value:.3f}, Tracks: 0")
-        #print(f"💰 Step Reward: {reward:.3f}")
-        #print("-" * 50)
-        
+
         return next_state, reward, done, {
             'step_count': self.step_count,
             'num_robots': num_robots,
