@@ -297,80 +297,54 @@ def create_gnn_node_labels(graph_data, current_state=None):
             if track_count >= 15:  # Limit labels for readability
                 break
             
-            # Create short label based on track type
-            if 'fused' in track_id:
-                # Extract object info from fused track ID: fused_0_1_gt_obj_1 or fused_0_1_1
-                parts = track_id.split('_')
-                if len(parts) >= 4 and parts[-2] == 'obj':
-                    # Format: fused_0_1_gt_obj_1 -> F_gt_obj_1
-                    obj_info = '_'.join(parts[-3:])  # gt_obj_1
-                    short_name = f"F_{obj_info}"
-                else:
-                    # Simple format: fused_0_1_1 -> F_1
-                    short_name = f"F_{parts[-1]}"
-            elif '_fp_' in track_id or 'fp_' in track_id:
-                # Handle false positive tracks
-                if 'current_robot_' in track_id:
-                    # current_robot_2_obj_fp_1_0 -> FP_2_1_0
-                    parts = track_id.split('_')
-                    robot_id = parts[2] if len(parts) > 2 else '?'
-                    fp_parts = [p for p in parts if p.startswith('fp')]
-                    if fp_parts:
-                        # Extract FP ID: fp_1_0 -> 1_0
-                        fp_id = '_'.join(fp_parts[0].split('_')[1:]) if '_' in fp_parts[0] else fp_parts[0][3:]
-                        short_name = f"FP_R{robot_id}_{fp_id}"
-                    else:
-                        short_name = f"FP_R{robot_id}"
-                else:
-                    # Simple FP format
-                    parts = track_id.split('_')
-                    short_name = f"FP_{parts[-1]}" if parts else "FP_?"
-            elif track_id.startswith('current_robot_'):
-                # Extract robot ID and object ID from current_robot_{robot_id}_obj_{object_id}
-                # Handle complex object IDs like gt_obj_1
-                parts = track_id.split('_')
-                robot_id = parts[2] if len(parts) > 2 else '?'
+            # Determine if this is a ground truth or false positive track based on object_id
+            # We need to get the track object to check its object_id
+            track_obj = None
+            if current_state:
+                # Look for the track in _fused_tracks and _individual_tracks
+                all_available_tracks = []
+                if hasattr(current_state, '_fused_tracks'):
+                    all_available_tracks.extend(current_state._fused_tracks)
+                if hasattr(current_state, '_individual_tracks'):
+                    all_available_tracks.extend(current_state._individual_tracks)
                 
-                # Find the object part after '_obj_'
-                obj_start_idx = None
-                for i, part in enumerate(parts):
-                    if part == 'obj' and i < len(parts) - 1:
-                        obj_start_idx = i + 1
+                # Find the track by track_id
+                for track in all_available_tracks:
+                    if track.track_id == track_id:
+                        track_obj = track
                         break
+            
+            if track_obj and hasattr(track_obj, 'object_id'):
+                # Check if it's a ground truth or false positive based on object_id
+                object_id_str = str(track_obj.object_id)
                 
-                if obj_start_idx:
-                    obj_parts = parts[obj_start_idx:]
-                    if len(obj_parts) >= 3 and obj_parts[0] == 'gt' and obj_parts[1] == 'obj':
-                        # gt_obj_1 format -> standardize as GT
-                        obj_num = obj_parts[2]
-                        short_name = f"GT_R{robot_id}_O{obj_num}"
-                    elif len(obj_parts) >= 1 and obj_parts[0].startswith('fp'):
-                        # Handle FP in current_robot format
-                        fp_id = '_'.join(obj_parts[0].split('_')[1:]) if '_' in obj_parts[0] else obj_parts[0][3:]
-                        short_name = f"FP_R{robot_id}_{fp_id}"
+                if 'gt_obj_' in object_id_str:
+                    # Ground truth track - extract object number
+                    obj_num = object_id_str.replace('gt_obj_', '')
+                    short_name = f"GT_{obj_num}"
+                elif 'fp_obj_' in object_id_str or object_id_str.startswith('fp_'):
+                    # False positive track - extract object number  
+                    if 'fp_obj_' in object_id_str:
+                        obj_num = object_id_str.replace('fp_obj_', '')
                     else:
-                        # Simple object ID or other format
-                        obj_id = '_'.join(obj_parts)
-                        short_name = f"R{robot_id}_{obj_id}"
+                        obj_num = object_id_str.replace('fp_', '')
+                    short_name = f"FP_{obj_num}"
                 else:
-                    obj_id = '?'
-                    short_name = f"R{robot_id}_{obj_id}"
-            elif track_id.startswith('gt_robot_'):
-                # Extract robot ID and object ID from gt_robot_{robot_id}_obj_{object_id}
-                parts = track_id.split('_')
-                robot_id = parts[2] if len(parts) > 2 else '?'
-                obj_id = parts[4] if len(parts) > 4 else '?'
-                short_name = f"GT_R{robot_id}_O{obj_id}"
-            elif track_id.startswith('dummy_robot_'):
-                # dummy_robot_0 -> Dummy_R0
-                parts = track_id.split('_')
-                robot_id = parts[2] if len(parts) > 2 else '?'
-                short_name = f"Dummy_R{robot_id}"
-            elif '_proximal_' in track_id:
-                short_name = f"P_{track_id.split('_')[-1]}"
+                    # Default fallback - check track_id patterns for classification
+                    if 'gt' in track_id.lower():
+                        obj_num = track_id.split('_')[-1]
+                        short_name = f"GT_{obj_num}"
+                    else:  # Must be false positive
+                        obj_num = track_id.split('_')[-1]
+                        short_name = f"FP_{obj_num}"
             else:
-                # Fallback for unknown formats
-                short_name = f"T_{track_id.split('_')[-1]}"
+                # Fallback: Use track_id patterns to determine type
+                if 'gt' in track_id.lower() or 'ground' in track_id.lower():
+                    obj_num = track_id.split('_')[-1]
+                    short_name = f"GT_{obj_num}"
+                else:  # Must be false positive
+                    obj_num = track_id.split('_')[-1]
+                    short_name = f"FP_{obj_num}"
             
             # Add actual trust value to label
             trust_value = None
@@ -427,7 +401,8 @@ def save_gnn_input_visualization(G, graph_data, episode, timestep, save_dir, cur
     
     # Categorize track nodes by type and ownership
     fused_tracks = []
-    fp_tracks = []
+    fp_tracks = []  # False positive tracks (red)
+    gt_tracks = []  # Ground truth tracks (green)
     proximal_tracks = []
     ego_tracks = []
     current_tracks = []
@@ -453,19 +428,26 @@ def save_gnn_input_visualization(G, graph_data, episode, timestep, save_dir, cur
         
         if 'fused' in track_id:
             fused_tracks.append(n)
-        elif '_fp_' in track_id:
+        elif '_fp_' in track_id or 'fp_' in track_id:
             fp_tracks.append(n)
         elif '_proximal_' in track_id:
             proximal_tracks.append(n)
         elif track_id.startswith('current_robot_') or track_id.startswith('gt_robot_'):
-            # Check if this is ego robot's track or proximal robot's track
-            parts = track_id.split('_')
-            robot_id = parts[2] if len(parts) > 2 else None
-            
-            if robot_id == ego_robot_id:
-                ego_tracks.append(n)
+            # Check if this is a ground truth track or false positive
+            if '_fp_' in track_id or 'fp_' in track_id:
+                fp_tracks.append(n)
+            elif 'gt_obj' in track_id or track_id.startswith('gt_robot_'):
+                # This is a ground truth track
+                gt_tracks.append(n)
             else:
-                current_tracks.append(n)  # Proximal robot tracks
+                # Check if this is ego robot's track or proximal robot's track
+                parts = track_id.split('_')
+                robot_id = parts[2] if len(parts) > 2 else None
+                
+                if robot_id == ego_robot_id:
+                    ego_tracks.append(n)
+                else:
+                    current_tracks.append(n)  # Proximal robot tracks
         else:
             current_tracks.append(n)  # Other tracks
     
@@ -484,6 +466,10 @@ def save_gnn_input_visualization(G, graph_data, episode, timestep, save_dir, cur
     if fused_tracks:
         nx.draw_networkx_nodes(G, pos, nodelist=fused_tracks, node_color='gold',
                               node_size=900, alpha=0.8, node_shape='s')
+    if gt_tracks:
+        # Ground truth tracks - bright green
+        nx.draw_networkx_nodes(G, pos, nodelist=gt_tracks, node_color='limegreen',
+                              node_size=800, alpha=0.9, node_shape='s')
     if current_tracks:
         nx.draw_networkx_nodes(G, pos, nodelist=current_tracks, node_color='lightgreen',
                               node_size=800, alpha=0.8, node_shape='s')
@@ -494,8 +480,9 @@ def save_gnn_input_visualization(G, graph_data, episode, timestep, save_dir, cur
         nx.draw_networkx_nodes(G, pos, nodelist=proximal_tracks, node_color='lightblue',
                               node_size=750, alpha=0.8, node_shape='s')
     if fp_tracks:
-        nx.draw_networkx_nodes(G, pos, nodelist=fp_tracks, node_color='lightcoral',
-                              node_size=700, alpha=0.8, node_shape='s')
+        # False positive tracks - bright red
+        nx.draw_networkx_nodes(G, pos, nodelist=fp_tracks, node_color='red',
+                              node_size=700, alpha=0.9, node_shape='s')
     
     # Draw edges
     legend_elements = draw_gnn_edges(G, pos)
@@ -513,11 +500,9 @@ def save_gnn_input_visualization(G, graph_data, episode, timestep, save_dir, cur
                label='Proximal Robots', linewidth=0),
         Line2D([0], [0], marker='s', color='w', markerfacecolor='gold', markersize=10, 
                label=f'Fused Tracks ({len(fused_tracks)})', linewidth=0),
-        Line2D([0], [0], marker='s', color='w', markerfacecolor='lightgreen', markersize=9, 
-               label=f'Proximal Robot Tracks ({len(current_tracks)})', linewidth=0),
-        Line2D([0], [0], marker='s', color='w', markerfacecolor='lightcyan', markersize=9, 
-               label=f'Ego Tracks ({len(ego_tracks)})', linewidth=0),
-        Line2D([0], [0], marker='s', color='w', markerfacecolor='lightcoral', markersize=8, 
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='limegreen', markersize=9, 
+               label=f'Ground Truth Tracks ({len(gt_tracks)})', linewidth=0),
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='red', markersize=8, 
                label=f'False Positive Tracks ({len(fp_tracks)})', linewidth=0)
     ]
     

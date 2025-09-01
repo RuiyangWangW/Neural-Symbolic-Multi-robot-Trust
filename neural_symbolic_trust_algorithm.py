@@ -220,9 +220,6 @@ class PPOTrustGNN(nn.Module):
         # Add skip connection from second layer
         x_dict = {key: x_dict_3[key] + x_dict_2[key] for key in x_dict_3}
         
-        # Apply symbolic reasoning
-        x_dict = self._apply_symbolic_reasoning(x_dict)
-        
         if return_features:
             return x_dict
         
@@ -233,10 +230,10 @@ class PPOTrustGNN(nn.Module):
         if 'agent' in x_dict:
             # PSM policy outputs: value_alpha, value_beta, conf_alpha, conf_beta for trust updates
             # Clamp to reasonable ranges to prevent extreme Beta parameters
-            agent_policy_value_alpha = torch.clamp(self.agent_policy_value_alpha(x_dict['agent']) + 1.0, min=1.0, max=10.0)
-            agent_policy_value_beta = torch.clamp(self.agent_policy_value_beta(x_dict['agent']) + 1.0, min=1.0, max=10.0)
-            agent_policy_conf_alpha = torch.clamp(self.agent_policy_conf_alpha(x_dict['agent']) + 1.0, min=1.0, max=10.0)
-            agent_policy_conf_beta = torch.clamp(self.agent_policy_conf_beta(x_dict['agent']) + 1.0, min=1.0, max=10.0)
+            agent_policy_value_alpha = self.agent_policy_value_alpha(x_dict['agent']) + 1.0
+            agent_policy_value_beta = self.agent_policy_value_beta(x_dict['agent']) + 1.0
+            agent_policy_conf_alpha = self.agent_policy_conf_alpha(x_dict['agent']) + 1.0
+            agent_policy_conf_beta = self.agent_policy_conf_beta(x_dict['agent']) + 1.0
 
             # Value function: expected return with regularization
             agent_values = self.agent_value_function(x_dict['agent'])
@@ -272,56 +269,6 @@ class PPOTrustGNN(nn.Module):
             value_outputs['track'] = track_values
         
         return policy_outputs, value_outputs
-    
-    def _apply_symbolic_reasoning(self, x_dict):
-        """Apply symbolic reasoning rules based on trust principles"""
-        
-        # Rule 1: Agent consistency - agents with similar feature patterns are more trustworthy
-        if 'agent' in x_dict and x_dict['agent'].shape[0] > 1:
-            agent_features = x_dict['agent']
-            
-            # Compute pairwise similarity between agents
-            agent_similarity = torch.mm(agent_features, agent_features.t())
-            agent_similarity = F.softmax(agent_similarity, dim=1)
-            
-            # Apply consistency boost based on similarity to other agents
-            consistency_boost = torch.mm(agent_similarity, agent_features)
-            consistency_factor = torch.sigmoid(torch.norm(consistency_boost - agent_features, dim=1, keepdim=True))
-            
-            x_dict['agent'] = agent_features + 0.1 * consistency_factor * consistency_boost
-        
-        # Rule 2: Track reliability - tracks with consistent features across observations are more reliable
-        if 'track' in x_dict and x_dict['track'].shape[0] > 1:
-            track_features = x_dict['track']
-            
-            # Compute feature variance across tracks (lower variance = more consistent = more trustworthy)
-            track_mean = torch.mean(track_features, dim=0, keepdim=True)
-            track_variance = torch.mean((track_features - track_mean) ** 2, dim=1, keepdim=True)
-            
-            # Reliability boost inversely proportional to variance
-            reliability_factor = torch.sigmoid(-track_variance + 1.0)  # Higher for lower variance
-            reliability_adjustment = reliability_factor * track_mean
-            
-            x_dict['track'] = track_features + 0.1 * reliability_adjustment
-        
-        # Rule 3: Cross-modal consistency - ensure agent and track features are compatible
-        if 'agent' in x_dict and 'track' in x_dict and x_dict['track'].shape[0] > 0:
-            # Project both to same space for consistency check
-            agent_projected = torch.mean(x_dict['agent'], dim=0, keepdim=True)
-            track_projected = torch.mean(x_dict['track'], dim=0, keepdim=True)
-            
-            # Cross-modal consistency score
-            consistency_score = F.cosine_similarity(agent_projected, track_projected, dim=1)
-            
-            # Apply consistency adjustment
-            if x_dict['agent'].shape[0] > 0:
-                x_dict['agent'] = x_dict['agent'] + 0.05 * consistency_score.unsqueeze(1) * agent_projected
-            
-            if x_dict['track'].shape[0] > 0:
-                x_dict['track'] = x_dict['track'] + 0.05 * consistency_score.unsqueeze(1) * track_projected
-        
-        return x_dict
-
 
 class NeuralSymbolicTrustAlgorithm(TrustAlgorithm):
     """Trust algorithm using neural symbolic GNN for comparison purposes"""
