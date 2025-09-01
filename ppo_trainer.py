@@ -214,12 +214,22 @@ class PPOTrainer:
             rewards.append(exp.reward)
             dones.append(exp.done)
             
-            # Extract value for this experience (handle both agent and track values)
+            # Extract value for this experience (proper weighted combination)
+            total_nodes = 0
             exp_value = 0.0
-            if 'agent' in exp.value:
-                exp_value += torch.mean(exp.value['agent']).item()
+
+            if 'agent' in exp.value and exp.value['agent'].numel() > 0:
+                agent_count = exp.value['agent'].numel()
+                exp_value += torch.sum(exp.value['agent']).item()  # Sum, not mean
+                total_nodes += agent_count
+
             if 'track' in exp.value and exp.value['track'].numel() > 0:
-                exp_value += torch.mean(exp.value['track']).item()
+                track_count = exp.value['track'].numel()
+                exp_value += torch.sum(exp.value['track']).item()  # Sum, not mean  
+                total_nodes += track_count
+
+            # Final weighted average across all nodes in the graph
+            exp_value = exp_value / max(total_nodes, 1)
             values.append(exp_value)
         
         # Compute GAE advantages
@@ -229,7 +239,7 @@ class PPOTrainer:
         
         for i in reversed(range(len(experiences))):
             if i == len(experiences) - 1:
-                next_value = 0.0 if dones[i] else values[i]
+                next_value = 0.0
             else:
                 next_value = values[i + 1]
             
@@ -327,10 +337,11 @@ class PPOTrainer:
             # CRITICAL: Ensure model is in training mode
             self.model.train()
             
-            # Accumulate losses for batch update
-            epoch_policy_losses = []
-            epoch_value_losses = []
-            epoch_entropy_losses = []
+            # Accumulate losses for batch update (scalar accumulation to avoid deep graphs)
+            epoch_policy_loss = 0.0
+            epoch_value_loss = 0.0
+            epoch_entropy_loss = 0.0
+            valid_experience_count = 0
             
             for i, experience in enumerate(all_experiences):
                 # Move data to device
@@ -506,27 +517,30 @@ class PPOTrainer:
                     # Entropy loss (negative because we want to maximize entropy)
                     entropy_loss = entropy_loss - total_entropy if isinstance(entropy_loss, torch.Tensor) else -total_entropy
                 
-                # Accumulate losses for this epoch
+                # Accumulate losses for this epoch (scalar accumulation to avoid deep graphs)
                 if isinstance(policy_loss, torch.Tensor) and policy_loss.numel() > 0:
-                    epoch_policy_losses.append(policy_loss)
+                    epoch_policy_loss += policy_loss
+                    valid_experience_count += 1
                 elif policy_loss != 0.0:
-                    epoch_policy_losses.append(torch.tensor(policy_loss, device=self.device, requires_grad=True))
+                    epoch_policy_loss += torch.tensor(policy_loss, device=self.device, requires_grad=True)
+                    valid_experience_count += 1
                     
                 if isinstance(value_loss, torch.Tensor) and value_loss.numel() > 0:
-                    epoch_value_losses.append(value_loss)
+                    epoch_value_loss += value_loss
                 elif value_loss != 0.0:
-                    epoch_value_losses.append(torch.tensor(value_loss, device=self.device, requires_grad=True))
+                    epoch_value_loss += torch.tensor(value_loss, device=self.device, requires_grad=True)
                     
                 if isinstance(entropy_loss, torch.Tensor) and entropy_loss.numel() > 0:
-                    epoch_entropy_losses.append(entropy_loss)
+                    epoch_entropy_loss += entropy_loss
                 elif entropy_loss != 0.0:
-                    epoch_entropy_losses.append(torch.tensor(entropy_loss, device=self.device, requires_grad=True))
+                    epoch_entropy_loss += torch.tensor(entropy_loss, device=self.device, requires_grad=True)
             
             # BATCH UPDATE: One optimizer step per epoch, not per experience
-            if epoch_policy_losses:
-                epoch_policy_loss = torch.stack(epoch_policy_losses).mean()
-                epoch_value_loss = torch.stack(epoch_value_losses).mean() if epoch_value_losses else torch.tensor(0.0, device=self.device)
-                epoch_entropy_loss = torch.stack(epoch_entropy_losses).mean() if epoch_entropy_losses else torch.tensor(0.0, device=self.device)
+            if valid_experience_count > 0:
+                # Average losses across valid experiences
+                epoch_policy_loss = epoch_policy_loss / max(valid_experience_count, 1)
+                epoch_value_loss = epoch_value_loss / max(valid_experience_count, 1) if isinstance(epoch_value_loss, torch.Tensor) else torch.tensor(0.0, device=self.device)
+                epoch_entropy_loss = epoch_entropy_loss / max(valid_experience_count, 1) if isinstance(epoch_entropy_loss, torch.Tensor) else torch.tensor(0.0, device=self.device)
                 
                 # Compute total loss for this epoch
                 total_epoch_loss = epoch_policy_loss + self.value_coef * epoch_value_loss + self.entropy_coef * epoch_entropy_loss
