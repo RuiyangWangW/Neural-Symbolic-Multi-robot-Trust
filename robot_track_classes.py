@@ -63,9 +63,11 @@ class Track:
     
     def update_trust(self, delta_alpha: float, delta_beta: float):
         """Update trust distribution parameters."""
+        self.normalize_trust_parameters()
         self.trust_alpha += delta_alpha
         self.trust_beta += delta_beta
-        self.normalize_trust_parameters()
+        # Increment observation count since this represents another observation/update
+        self.observation_count += 1
     
     def normalize_trust_parameters(self, max_sum: float = 5.0):
         current_sum = self.trust_alpha + self.trust_beta
@@ -82,7 +84,6 @@ class Track:
         """Update track state estimates."""
         self.position = np.array(position)
         self.velocity = np.array(velocity)
-        self.observation_count += 1
         self.last_updated = timestamp 
         self.timestamp = self.last_updated  # Update timestamp to latest update time
     
@@ -168,9 +169,9 @@ class Robot:
     
     def update_trust(self, delta_alpha: float, delta_beta: float):
         """Update robot trust distribution parameters."""
+        self.normalize_trust_parameters()
         self.trust_alpha += delta_alpha
         self.trust_beta += delta_beta
-        self.normalize_trust_parameters()
 
     def normalize_trust_parameters(self, max_sum: float = 5.0):
         """Normalize alpha and beta parameters to prevent unbounded growth."""

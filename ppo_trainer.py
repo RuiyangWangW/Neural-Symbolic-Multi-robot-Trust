@@ -78,41 +78,37 @@ class PPOTrainer:
                 agent_policy = policy_outputs['agent']
                 agent_values = value_outputs['agent']
                 
-                # Get the 4 parameters directly from the policy output
+                # Get the parameters from the policy output
                 agent_value_alpha = agent_policy['value_alpha']
                 agent_value_beta = agent_policy['value_beta']
-                agent_conf_alpha = agent_policy['conf_alpha']
-                agent_conf_beta = agent_policy['conf_beta']
+                agent_confidence = agent_policy['confidence']  # Pre-computed confidence
                 
                 if deterministic:
-                    # Use mean of Beta distributions for deterministic action
+                    # Use mean of Beta distribution for deterministic action
                     agent_value_action = agent_value_alpha / (agent_value_alpha + agent_value_beta)
-                    agent_conf_action = agent_conf_alpha / (agent_conf_alpha + agent_conf_beta)
                 else:
-                    # Sample from Beta distributions using the direct parameters
+                    # Sample from Beta distribution using the direct parameters
                     agent_value_action = torch.distributions.Beta(agent_value_alpha, agent_value_beta).sample()
-                    agent_conf_action = torch.distributions.Beta(agent_conf_alpha, agent_conf_beta).sample()
                 
                 actions['agent'] = {
                     'value': agent_value_action,
-                    'confidence': agent_conf_action
+                    'confidence': agent_confidence  # Use pre-computed confidence directly
                 }
                 
-                # Compute log probabilities using proper Beta distribution
+                # Compute log probabilities using proper Beta distribution for value only
                 if deterministic:
                     # For deterministic actions, use small variance around the mean
                     log_probs['agent'] = {
                         'value': torch.zeros_like(agent_value_action),
-                        'confidence': torch.zeros_like(agent_conf_action)
+                        'confidence': torch.zeros_like(agent_confidence)
                     }
                 else:
-                    # Create distributions using the direct parameters
+                    # Create distribution using the direct parameters
                     value_dist = torch.distributions.Beta(agent_value_alpha, agent_value_beta)
-                    conf_dist = torch.distributions.Beta(agent_conf_alpha, agent_conf_beta)
                     
                     log_probs['agent'] = {
                         'value': value_dist.log_prob(agent_value_action).sum(),
-                        'confidence': conf_dist.log_prob(agent_conf_action).sum()
+                        'confidence': torch.zeros_like(agent_confidence)  # No sampling for confidence
                     }
                 
                 values['agent'] = agent_values
@@ -122,41 +118,37 @@ class PPOTrainer:
                 track_policy = policy_outputs['track']
                 track_values = value_outputs['track']
                 
-                # Get the 4 parameters directly from the policy output
+                # Get the parameters from the policy output
                 track_value_alpha = track_policy['value_alpha']
                 track_value_beta = track_policy['value_beta']
-                track_conf_alpha = track_policy['conf_alpha']
-                track_conf_beta = track_policy['conf_beta']
+                track_confidence = track_policy['confidence']  # Pre-computed confidence
                 
                 if deterministic:
-                    # Use mean of Beta distributions for deterministic action
+                    # Use mean of Beta distribution for deterministic action
                     track_value_action = track_value_alpha / (track_value_alpha + track_value_beta)
-                    track_conf_action = track_conf_alpha / (track_conf_alpha + track_conf_beta)
                 else:
-                    # Sample from Beta distributions using the direct parameters
+                    # Sample from Beta distribution using the direct parameters
                     track_value_action = torch.distributions.Beta(track_value_alpha, track_value_beta).sample()
-                    track_conf_action = torch.distributions.Beta(track_conf_alpha, track_conf_beta).sample()
                 
                 actions['track'] = {
                     'value': track_value_action,
-                    'confidence': track_conf_action
+                    'confidence': track_confidence  # Use pre-computed confidence directly
                 }
                 
-                # Compute log probabilities using proper Beta distribution
+                # Compute log probabilities using proper Beta distribution for value only
                 if deterministic:
                     # For deterministic actions, use small variance around the mean
                     log_probs['track'] = {
                         'value': torch.zeros_like(track_value_action),
-                        'confidence': torch.zeros_like(track_conf_action)
+                        'confidence': torch.zeros_like(track_confidence)
                     }
                 else:
-                    # Create distributions using the direct parameters
+                    # Create distribution using the direct parameters
                     track_value_dist = torch.distributions.Beta(track_value_alpha, track_value_beta)
-                    track_conf_dist = torch.distributions.Beta(track_conf_alpha, track_conf_beta)
                     
                     log_probs['track'] = {
                         'value': track_value_dist.log_prob(track_value_action).sum(),
-                        'confidence': track_conf_dist.log_prob(track_conf_action).sum()
+                        'confidence': torch.zeros_like(track_confidence)  # No sampling for confidence
                     }
                 
                 values['track'] = track_values
@@ -238,15 +230,18 @@ class PPOTrainer:
         gae = 0.0
         
         for i in reversed(range(len(experiences))):
-            if i == len(experiences) - 1:
+            # Proper terminal state handling
+            if i == len(experiences) - 1 or dones[i]:
+                # Terminal state: no next value
                 next_value = 0.0
             else:
+                # Non-terminal state: use next state's value
                 next_value = values[i + 1]
             
-            # TD error
-            delta = rewards[i] + self.gamma * next_value - values[i]
+            # TD error with proper terminal handling
+            delta = rewards[i] + self.gamma * next_value * (1.0 - float(dones[i])) - values[i]
             
-            # GAE computation
+            # GAE computation - resets when episode ends
             gae = delta + self.gamma * self.lam * gae * (1.0 - float(dones[i]))
             advantages.insert(0, gae)
             
@@ -337,13 +332,33 @@ class PPOTrainer:
             # CRITICAL: Ensure model is in training mode
             self.model.train()
             
+            # SMART SHUFFLING: Shuffle episodes but preserve within-episode order
+            # This maintains temporal structure while reducing correlation
+            import random
+            episode_indices = list(range(len(self.episode_experiences)))
+            random.shuffle(episode_indices)  # Shuffle episode order only
+            
+            # Build shuffled experience list maintaining episode boundaries
+            shuffled_experiences = []
+            shuffled_advantages = []
+            shuffled_returns = []
+            
+            for episode_idx in episode_indices:
+                episode = self.episode_experiences[episode_idx]
+                episode_start = sum(len(self.episode_experiences[i]) for i in range(episode_idx))
+                episode_end = episode_start + len(episode)
+                
+                shuffled_experiences.extend(episode)
+                shuffled_advantages.extend(advantages[episode_start:episode_end])
+                shuffled_returns.extend(returns[episode_start:episode_end])
+            
             # Accumulate losses for batch update (scalar accumulation to avoid deep graphs)
             epoch_policy_loss = 0.0
             epoch_value_loss = 0.0
             epoch_entropy_loss = 0.0
             valid_experience_count = 0
             
-            for i, experience in enumerate(all_experiences):
+            for i, experience in enumerate(shuffled_experiences):
                 # Move data to device
                 x_dict = {k: v.to(self.device) for k, v in experience.graph_data.x_dict.items()}
                 
@@ -377,19 +392,17 @@ class PPOTrainer:
                     # Use the 4 parameters directly from the policy output
                     agent_value_alpha = agent_policy['value_alpha']
                     agent_value_beta = agent_policy['value_beta']
-                    agent_conf_alpha = agent_policy['conf_alpha']
-                    agent_conf_beta = agent_policy['conf_beta']
+                    agent_confidence = agent_policy['confidence']  # Pre-computed confidence
                     
-                    # Create distributions and compute log probabilities
+                    # Create distributions and compute log probabilities for value only
                     value_dist = torch.distributions.Beta(agent_value_alpha, agent_value_beta)
-                    conf_dist = torch.distributions.Beta(agent_conf_alpha, agent_conf_beta)
                     
                     new_log_prob_value = value_dist.log_prob(agent_action['value'].to(self.device)).sum()
-                    new_log_prob_conf = conf_dist.log_prob(agent_action['confidence'].to(self.device)).sum()
+                    new_log_prob_conf = torch.zeros_like(new_log_prob_value)  # No sampling for confidence
                     
-                    # PPO ratio using actual old probabilities
+                    # PPO ratio using actual old probabilities (value only)
                     ratio_value = torch.exp(new_log_prob_value - old_value_log_prob)
-                    ratio_conf = torch.exp(new_log_prob_conf - old_conf_log_prob)
+                    ratio_conf = torch.tensor(1.0).to(self.device)  # No policy gradient for confidence
                     
                     
                     # Skip experiences with extreme ratios for stability
@@ -400,7 +413,7 @@ class PPOTrainer:
                         continue
                     
                     # PPO clipped objective - use proper GAE advantage
-                    advantage = advantages[i]
+                    advantage = shuffled_advantages[i]
                     
                     surr1_value = ratio_value * advantage
                     surr2_value = torch.clamp(ratio_value, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
@@ -415,7 +428,7 @@ class PPOTrainer:
                     
                     
                     # Improved value loss with clipping and better target handling
-                    return_target = returns[i].item() if isinstance(returns[i], torch.Tensor) else returns[i]
+                    return_target = shuffled_returns[i].item() if isinstance(shuffled_returns[i], torch.Tensor) else shuffled_returns[i]
                     return_target_tensor = torch.tensor(return_target, device=self.device).float()
                     
                     # Get current value predictions
@@ -434,9 +447,9 @@ class PPOTrainer:
                     value_reg = 0.01 * torch.mean(current_values ** 2)
                     value_loss += torch.mean(value_loss_unclipped) + value_reg
                     
-                    # Compute actual policy entropy for exploration
+                    # Compute actual policy entropy for exploration (value only)
                     value_entropy = value_dist.entropy().sum()
-                    conf_entropy = conf_dist.entropy().sum()
+                    conf_entropy = torch.tensor(0.0).to(self.device)  # No entropy for deterministic confidence
                     total_entropy = value_entropy + conf_entropy
                     
                     # Entropy loss (negative because we want to maximize entropy)
@@ -453,22 +466,20 @@ class PPOTrainer:
                     track_value = value_outputs['track']
                     
                     # Compute new log prob using proper Beta distribution
-                    # Use the 4 parameters directly from the policy output
+                    # Use the parameters directly from the policy output
                     track_value_alpha = track_policy['value_alpha']
                     track_value_beta = track_policy['value_beta']
-                    track_conf_alpha = track_policy['conf_alpha']
-                    track_conf_beta = track_policy['conf_beta']
+                    track_confidence = track_policy['confidence']  # Pre-computed confidence
                     
-                    # Create distributions and compute log probabilities
+                    # Create distributions and compute log probabilities for value only
                     value_dist = torch.distributions.Beta(track_value_alpha, track_value_beta)
-                    conf_dist = torch.distributions.Beta(track_conf_alpha, track_conf_beta)
                     
                     new_log_prob_value = value_dist.log_prob(track_action['value'].to(self.device)).sum()
-                    new_log_prob_conf = conf_dist.log_prob(track_action['confidence'].to(self.device)).sum()
+                    new_log_prob_conf = torch.zeros_like(new_log_prob_value)  # No sampling for confidence
                     
-                    # PPO ratio using actual old probabilities
+                    # PPO ratio using actual old probabilities (value only)
                     ratio_value = torch.exp(new_log_prob_value - old_value_log_prob)
-                    ratio_conf = torch.exp(new_log_prob_conf - old_conf_log_prob)
+                    ratio_conf = torch.tensor(1.0).to(self.device)  # No policy gradient for confidence
                     
                     # Skip experiences with extreme ratios for stability
                     if torch.isnan(ratio_value) or torch.isnan(ratio_conf):
@@ -478,7 +489,7 @@ class PPOTrainer:
                         continue
                     
                     # PPO clipped objective - use proper GAE advantage
-                    advantage = advantages[i]
+                    advantage = shuffled_advantages[i]
                     
                     surr1_value = ratio_value * advantage
                     surr2_value = torch.clamp(ratio_value, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
@@ -492,7 +503,7 @@ class PPOTrainer:
                     policy_loss += track_ppo_loss
                     
                     # Improved value loss with clipping and better target handling
-                    return_target = returns[i].item() if isinstance(returns[i], torch.Tensor) else returns[i]
+                    return_target = shuffled_returns[i].item() if isinstance(shuffled_returns[i], torch.Tensor) else shuffled_returns[i]
                     return_target_tensor = torch.tensor(return_target, device=self.device).float()
                     
                     # Get current values (handle multiple tracks)
@@ -509,9 +520,9 @@ class PPOTrainer:
                     value_reg = 0.01 * torch.mean(current_values ** 2)
                     value_loss += torch.mean(value_loss_unclipped) + value_reg
                     
-                    # Compute actual policy entropy for exploration
+                    # Compute actual policy entropy for exploration (value only)
                     value_entropy = value_dist.entropy().sum()
-                    conf_entropy = conf_dist.entropy().sum()
+                    conf_entropy = torch.tensor(0.0).to(self.device)  # No entropy for deterministic confidence
                     total_entropy = value_entropy + conf_entropy
                     
                     # Entropy loss (negative because we want to maximize entropy)
@@ -568,7 +579,7 @@ class PPOTrainer:
             
             
             # Keep some recent episodes for continued learning, but limit buffer size
-            max_buffer_episodes = 8  # Keep last 8 episodes for continued learning
+            max_buffer_episodes = 20  # Keep last 20 episodes for better learning accumulation
             if len(self.episode_experiences) > max_buffer_episodes:
                 # Remove oldest episodes to maintain buffer size
                 episodes_to_remove = len(self.episode_experiences) - max_buffer_episodes

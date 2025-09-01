@@ -30,7 +30,7 @@ class RLTrustEnvironment:
             return []
         return self.sim_env.robots  # SimulationEnvironment.robots is already a List[Robot]
     
-    def __init__(self, num_robots=5, num_targets=20, adversarial_ratio=0.5, max_steps_per_episode=500, 
+    def __init__(self, num_robots=5, num_targets=20, adversarial_ratio=0.5, max_steps_per_episode=100, 
                  world_size=(60, 60), false_positive_rate=0.5, false_negative_rate=0.0, 
                  movement_speed=1.0, proximal_range=100.0, fov_range=50.0, fov_angle=np.pi/3):
 
@@ -69,6 +69,7 @@ class RLTrustEnvironment:
         torch.manual_seed(42)
         
         # Create new simulation environment (since it doesn't have reset method)
+        # Step once to generate initial observations
         print(f"   🌍 Creating SimulationEnvironment: {self.num_robots} robots, {self.num_targets} targets")
         self.sim_env = SimulationEnvironment(
             num_robots=self.num_robots,
@@ -77,7 +78,7 @@ class RLTrustEnvironment:
             world_size=self.world_size,
             proximal_range=self.proximal_range,
             fov_range=self.fov_range,
-            fov_angle=self.fov_angle
+            fov_angle=self.fov_angle,
         )
         print(f"   📊 SimulationEnvironment created with {len(self.sim_env.robots)} robots")
         
@@ -86,8 +87,15 @@ class RLTrustEnvironment:
         # Verify clean start
         self._verify_clean_trust_reset()
         
-        # CRITICAL FIX: Run multiple simulation steps to populate robot_object_tracks
-        # The issue might be that ground truth detection requires multiple steps
+        try:
+            self.sim_env.step()
+            for robot in self.sim_env.robots:
+                robot.update_current_timestep_tracks()
+            print(f"   🎯 Initial simulation step completed - robots should have tracks now")
+        except Exception as e:
+            print(f"   ⚠️ Warning: Initial simulation step failed: {e}")
+            
+        # Re-seed for consistency 
         np.random.seed(42)
         random.seed(42)
         
@@ -154,6 +162,8 @@ class RLTrustEnvironment:
             robot_tracks = robot.get_all_current_tracks()  # Returns List[Track]
             individual_robot_tracks[robot.id] = robot_tracks
             total_tracks += len(robot_tracks)
+            
+# Debug removed - tracks generation working correctly
             
         return individual_robot_tracks
     
@@ -250,7 +260,7 @@ class RLTrustEnvironment:
         
         graph_data = HeteroData()
         all_tracks = fused_tracks + individual_tracks
-        
+                
         # Create agent nodes for all robots with rich neural-symbolic features
         agent_nodes = {}
         agent_features = []
@@ -265,10 +275,10 @@ class RLTrustEnvironment:
             high_confidence_pred = 1.0 if robot_trust > 0.7 else 0.0
             
             # Feature 2: HighlyTrusted(robot) - confident positive classification
-            highly_trusted_pred = 1.0 if robot_trust > 0.8 else 0.0
+            highly_trusted_pred = 1.0 if robot_trust > 0.5 else 0.0
             
             # Feature 3: Suspicious(robot) - likely adversarial
-            suspicious_pred = 1.0 if robot_trust < 0.3 else 0.0
+            suspicious_pred = 1.0 if robot_trust < 0.5 else 0.0
             
             # Feature 4: HighConnectivity(robot) - observes many tracks
             robot_track_count = sum(1 for track in all_tracks if self._robot_observes_track(robot, track, fused_tracks, individual_tracks, track_fusion_map))
@@ -300,21 +310,25 @@ class RLTrustEnvironment:
             high_confidence_pred = 1.0 if track_trust > 0.7 else 0.0
 
             # Feature 2: highly_trusted_pred(track) - basic trust > 0.8
-            highly_trusted_pred = 1.0 if track_trust > 0.8 else 0.0
+            highly_trusted_pred = 1.0 if track_trust > 0.5 else 0.0
             
             # Feature 3: LikelyFalsePositive(track) - suspicious patterns
-            suspicious_pred = 1.0 if (track_trust < 0.3) else 0.0
+            suspicious_pred = 1.0 if (track_trust < 0.5) else 0.0
 
             # Feature 4: MultiRobotObserved(track) - observed by multiple robots (fused)
-            multi_robot_pred = 1.0 if track in fused_tracks else 0.0
+            multi_robot_pred = 1.0 if track not in individual_tracks else 0.0
+            
+            # Feature 5: WellObserved(track) - track has been observed/updated many times
+            well_observed_pred = 1.0 if track.observation_count > 50 else 0.0
             
             track_features.append([
                 high_confidence_pred,    # Feature 1
                 highly_trusted_pred,     # Feature 2
                 multi_robot_pred,        # Feature 3  
                 suspicious_pred,         # Feature 4
-                track.trust_alpha,       # Feature 5: Alpha parameter
-                track.trust_beta,        # Feature 6: Beta parameter
+                well_observed_pred,      # Feature 5
+                track.trust_alpha,       # Feature 6: Alpha parameter
+                track.trust_beta,        # Feature 7: Beta parameter
             ])
         
         graph_data['track'].x = torch.tensor(track_features, dtype=torch.float)
@@ -331,6 +345,8 @@ class RLTrustEnvironment:
         # CRITICAL: Create edges to maintain same connectivity as original
         observed_count = 0
         fov_only_count = 0
+        
+# Debug removed - edge building working correctly
         
         for robot in robots:
             robot_idx = agent_nodes[robot.id]
@@ -417,7 +433,7 @@ class RLTrustEnvironment:
         """Determine if track is in robot's field of view using Robot's built-in method"""
         return robot.is_in_fov(track.position)  # Use Robot class's is_in_fov method
    
-    def step(self, actions):
+    def step(self, actions, step_count):
         """Multi-ego robot step - each robot serves as ego and accumulates updates"""
         
         # This method is called with actions from ONE ego perspective (current state)
@@ -425,7 +441,7 @@ class RLTrustEnvironment:
         
         # Get current state BEFORE applying updates (using original ego for initial state)
         current_state = self._get_current_state()
-        
+        self.step_count = step_count
         try:
             # DETERMINISTIC: Reset seed before each simulation step for consistent FP generation
             np.random.seed(42 + self.step_count)  # Different seed per step, but deterministic
@@ -433,7 +449,6 @@ class RLTrustEnvironment:
             
             # Advance simulation FIRST
             self.sim_env.step()
-            self.step_count += 1
             for robot in self.sim_env.robots:
                 robot.update_current_timestep_tracks()
         except Exception as e:
@@ -512,11 +527,9 @@ class RLTrustEnvironment:
         
         done = (num_robots == 0 or 
                 num_objects == 0 or
-                self.step_count >= self.max_steps_per_episode)
-        
+                self.step_count >= self.max_steps_per_episode-1)
         # Compute reward using multi-ego enhanced data
         reward = self._compute_sparse_reward(next_state, simulation_step_data, done)
-        
         # Debug summary of current trust state
         #print(f"📊 [STEP {self.step_count}] Step Summary:")
         #robots = self._get_robots_list()
@@ -592,7 +605,7 @@ class RLTrustEnvironment:
     def _apply_accumulated_trust_updates(self):
         """Apply all accumulated trust updates from multiple ego perspectives"""
         
-        print(f"\n🔄 [STEP {self.step_count}] Applying Trust Updates:")
+        #print(f"\n🔄 [STEP {self.step_count}] Applying Trust Updates:")
         
         # Apply accumulated robot updates using Robot.update_trust() method
         robots = self._get_robots_list()
@@ -614,11 +627,11 @@ class RLTrustEnvironment:
                 robot.update_trust(total_delta_alpha, total_delta_beta)
                 
                 # Debug print robot trust update
-                is_adversarial = getattr(robot, 'is_adversarial', False)
-                adv_marker = "🟥" if is_adversarial else "🟩"
-                print(f"  {adv_marker} Robot {robot.id}: {prev_trust:.3f} → {robot.trust_value:.3f} " +
-                      f"(α: {prev_alpha:.2f}→{robot.trust_alpha:.2f}, β: {prev_beta:.2f}→{robot.trust_beta:.2f}) " +
-                      f"Δ=(+{total_delta_alpha:.3f}, +{total_delta_beta:.3f})")
+                #is_adversarial = getattr(robot, 'is_adversarial', False)
+                #adv_marker = "🟥" if is_adversarial else "🟩"
+                #print(f"  {adv_marker} Robot {robot.id}: {prev_trust:.3f} → {robot.trust_value:.3f} " +
+                #      f"(α: {prev_alpha:.2f}→{robot.trust_alpha:.2f}, β: {prev_beta:.2f}→{robot.trust_beta:.2f}) " +
+                #      f"Δ=(+{total_delta_alpha:.3f}, +{total_delta_beta:.3f})")
         
         # Apply accumulated track updates - need to handle fused vs individual tracks properly
         self._apply_accumulated_track_updates()
@@ -695,19 +708,19 @@ class RLTrustEnvironment:
                 track = robot.get_track(object_id)
                 if track is not None:
                     # Store previous trust values for debugging
-                    prev_alpha = track.trust_alpha
-                    prev_beta = track.trust_beta
-                    prev_trust = track.trust_value
+                    #prev_alpha = track.trust_alpha
+                    #prev_beta = track.trust_beta
+                    #prev_trust = track.trust_value
                     
                     # Apply PSM update using Track's built-in method
                     track.update_trust(delta_alpha, delta_beta)
                     
                     # Debug print track trust update
-                    is_false_positive = object_id.startswith('fp_')
-                    track_marker = "🔴" if is_false_positive else "🟢"
-                    print(f"    {track_marker} R{robot_id} Track {object_id}: {prev_trust:.3f} → {track.trust_value:.3f} " +
-                          f"(α: {prev_alpha:.2f}→{track.trust_alpha:.2f}, β: {prev_beta:.2f}→{track.trust_beta:.2f}) " +
-                          f"Δ=(+{delta_alpha:.3f}, +{delta_beta:.3f})")
+                    #is_false_positive = object_id.startswith('fp_')
+                    #track_marker = "🔴" if is_false_positive else "🟢"
+                    #print(f"    {track_marker} R{robot_id} Track {object_id}: {prev_trust:.3f} → {track.trust_value:.3f} " +
+                    #      f"(α: {prev_alpha:.2f}→{track.trust_alpha:.2f}, β: {prev_beta:.2f}→{track.trust_beta:.2f}) " +
+                    #      f"Δ=(+{delta_alpha:.3f}, +{delta_beta:.3f})")
                 break
     
     def _compute_final_episode_reward(self, final_state, simulation_step_data):
@@ -871,8 +884,19 @@ class RLTrustEnvironment:
         
         final_reward = robot_identification_bonus + track_identification_bonus
         
-        # Log detailed classification metrics
+        # Log detailed classification metrics including observation counts
+        track_obs_counts = []
+        well_observed_count = 0
+        for robot in all_robots:
+            for track in robot.get_all_tracks():
+                track_obs_counts.append(track.observation_count)
+                if track.observation_count > 10:
+                    well_observed_count += 1
+        
+        avg_obs_count = sum(track_obs_counts) / len(track_obs_counts) if track_obs_counts else 0
+        
         print(f"  🏆 [FINAL REWARD] Episode Complete: {final_reward:.2f} points (assessed {total_tracks_processed} robot tracks)")
+        print(f"    📊 Track Observations: Avg={avg_obs_count:.1f}, Well-observed={well_observed_count}/{len(track_obs_counts)} tracks")
         print(f"    🤖 Robots: {correct_robot_identifications}/{total_robots} correct ({robot_accuracy:.2%} accuracy)")
         if adversarial_robots > 0:
             adv_acc = correctly_identified_adversarial / adversarial_robots
@@ -911,20 +935,15 @@ class RLTrustEnvironment:
         if done:
             # Meaningful final reward for classification accuracy
             episode_classification_score = self._compute_final_episode_reward(next_state, simulation_step_data)
-            # Keep reasonable scale for final episode signal
-            final_reward = episode_classification_score * 0.1  # Restore meaningful final reward
+            # Make final reward substantial so it's clearly visible
+            final_reward = episode_classification_score * 0.1  # Full weight for final episode reward
         
         total_reward = immediate_reward + final_reward
-        
-        # MODEST SCALING for learning signal without explosion
-        # Reduced from 10x to 2x to prevent reward explosion
-        scaled_reward = total_reward * 2.0  # Much more conservative scaling
-        
+                
         # Final safety clamp to prevent any extreme values
-        scaled_reward = max(-20.0, min(20.0, scaled_reward))
-        
-        return scaled_reward
-    
+
+        return total_reward
+
     def _compute_trust_direction_reward(self, next_state, simulation_step_data):
         """
         Compute immediate reward for trust updates moving in correct direction
@@ -966,11 +985,11 @@ class RLTrustEnvironment:
                 if current_distance < prev_distance:
                     # Moving in correct direction
                     improvement = prev_distance - current_distance
-                    direction_reward += improvement * 0.2  # Very small step reward to prevent accumulation explosion
+                    direction_reward += improvement  
                 elif current_distance > prev_distance:
                     # Moving in wrong direction
                     degradation = current_distance - prev_distance
-                    direction_reward -= degradation * 0.2  # Proportional penalty
+                    direction_reward -= degradation * 2
         
         # === TRACK TRUST DIRECTION REWARD ===
         # Get current tracks from all robots in the next state
@@ -1009,10 +1028,10 @@ class RLTrustEnvironment:
                 
                 if current_distance < prev_distance:
                     improvement = prev_distance - current_distance
-                    direction_reward += improvement * 0.1  # Very small step reward for tracks
+                    direction_reward += improvement * 0.1 
                 elif current_distance > prev_distance:
                     degradation = current_distance - prev_distance
-                    direction_reward -= degradation * 0.1  # Proportional penalty
+                    direction_reward -= degradation * 0.2
         
         # Store current trust distributions for next step comparison
         if not hasattr(self, '_previous_trust_distributions'):
@@ -1031,9 +1050,6 @@ class RLTrustEnvironment:
                 'alpha': track.trust_alpha,
                 'beta': track.trust_beta
             }
-        
-        # Clamp reward to prevent extreme values while preserving learning signal
-        direction_reward = max(-10.0, min(10.0, direction_reward))
         
         return direction_reward
     

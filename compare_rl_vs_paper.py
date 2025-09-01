@@ -24,9 +24,9 @@ class SimpleTrustComparison:
     def __init__(self, model_path='ppo_trust_gnn.pth'):
         self.model_path = model_path
         
-        # Load RL model with correct architecture (6 features: 4 predicates + alpha + beta)
+        # Load RL model with correct architecture (7 track features: 5 predicates + alpha + beta)
         checkpoint = torch.load(self.model_path, map_location='cpu', weights_only=False)
-        self.rl_model = PPOTrustGNN(agent_features=6, track_features=6, hidden_dim=64)
+        self.rl_model = PPOTrustGNN(agent_features=6, track_features=7, hidden_dim=64)
         self.rl_trainer = PPOTrainer(self.rl_model, device=torch.device('cpu'))
         self.rl_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         print(f"✅ Loaded RL model: Episode {checkpoint['episode']}, Best reward: {checkpoint['best_reward']:.2f}")

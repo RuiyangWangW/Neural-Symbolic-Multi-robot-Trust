@@ -20,8 +20,8 @@ from ppo_trainer import PPOTrainer, PPOExperience
 from rl_trust_environment import RLTrustEnvironment
 from embedding_analysis import compare_trained_vs_untrained_embeddings, run_embedding_analysis_on_trained_model
 
-def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=500, device='cpu', save_path='ppo_trust_gnn.pth', 
-                       enable_visualization=True, visualize_frequency=50, visualize_steps=[100, 150, 250, 350],
+def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', save_path='ppo_trust_gnn.pth', 
+                       enable_visualization=True, visualize_frequency=5, visualize_steps=[0, 5, 10, 15],
                        # Environment parameters
                        num_robots=5, num_targets=20, adversarial_ratio=0.5,
                        world_size=(60, 60), false_positive_rate=0.5, false_negative_rate=0.0,
@@ -80,7 +80,7 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=500, device='cpu', s
     
     # Initialize PPO model with simplified neural-symbolic features
     # print("🤖 Initializing PPO model...")
-    ppo_model = PPOTrustGNN(agent_features=6, track_features=6, hidden_dim=64)  # 4 predicates + alpha + beta
+    ppo_model = PPOTrustGNN(agent_features=6, track_features=7, hidden_dim=64)  # 5 predicates + alpha + beta
     trainer = PPOTrainer(ppo_model, device=device)
     
     # IMPORTANT: Pass trainer to environment for multi-ego action selection
@@ -91,11 +91,27 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=500, device='cpu', s
     # Training loop
     print(f"Starting PPO training for {episodes} episodes on {device}")
     print(f"Using multi-ego training mode (all robots serve as ego each timestep)")
+    if enable_visualization:
+        print(f"📊 Visualization enabled: Every {visualize_frequency} episodes at steps {visualize_steps}")
+    else:
+        print(f"📊 Visualization disabled")
     
     episode_rewards = []
     best_reward = float('-inf')
     
+    # Debug: Track model parameter checksum to verify learning persistence
+    def get_model_checksum(model):
+        return sum(p.sum().item() for p in model.parameters() if p.requires_grad)
+    
+    initial_checksum = get_model_checksum(ppo_model)
+    print(f"🧠 Initial model parameter checksum: {initial_checksum:.6f}")
+    
     for episode in range(episodes):
+        
+        # Debug: Check model persistence every 10 episodes
+        if episode % 10 == 0 and episode > 0:
+            current_checksum = get_model_checksum(ppo_model)
+            print(f"🧠 Episode {episode} model checksum: {current_checksum:.6f} (change: {current_checksum - initial_checksum:.6f})")
         
         # Reset environment
         state = env.reset()
@@ -103,23 +119,24 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=500, device='cpu', s
         step_count = 0
         
         # Collect experience for one episode
-        while step_count < max_steps_per_episode:  # Max steps per episode
+        done = False
+        while step_count < max_steps_per_episode:
             # Select action with policy outputs for visualization
             actions, log_probs, values = trainer.select_action(state)
             
             # Visualize GNN input graph if it's time
             if enable_visualization and episode % visualize_frequency == 0 and step_count in visualize_steps:
                 try:
-                    # print(f"🎯 Visualizing GNN input graph - Episode {episode}, Step {step_count}")
+                    print(f"🎯 Visualizing GNN input graph - Episode {episode}, Step {step_count}")
                     visualize_gnn_input(state, episode=episode, timestep=step_count, current_state=state)
                 except Exception as e:
-                    # print(f"Warning: GNN visualization failed: {e}")
+                    print(f"⚠️ Warning: GNN visualization failed: {e}")
                     pass
             
             # Take environment step
-            next_state, reward, done, info = env.step(actions)
+            next_state, reward, done, info = env.step(actions, step_count)
             
-            # Store experience
+            # Store experience (including final step)
             experience = PPOExperience(
                 graph_data=state,
                 action=actions,
@@ -134,15 +151,17 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=500, device='cpu', s
             episode_reward += reward
             step_count += 1
             state = next_state
-            
-            if done:
-                break
         
         # Finish the episode
         trainer.finish_episode()
         
         # Update policy when we have enough episodes collected
         losses = trainer.update_policy()  # This handles the min_episodes check internally
+        
+        # Debug: Show when policy updates happen
+        if losses:
+            current_checksum = get_model_checksum(ppo_model)
+            print(f"🔄 Policy updated after Episode {episode} - Model checksum: {current_checksum:.6f}")
         
         episode_rewards.append(episode_reward)
         
@@ -276,15 +295,39 @@ def main():
         plt.grid(True)
         
         plt.subplot(1, 2, 2)
-        # Moving average
-        window_size = 50
-        if len(rewards) >= window_size:
-            moving_avg = np.convolve(rewards, np.ones(window_size)/window_size, mode='valid')
-            plt.plot(range(window_size-1, len(rewards)), moving_avg)
-            plt.title(f'Moving Average ({window_size} episodes)')
+        # Improved adaptive moving average based on episode count
+        if len(rewards) >= 50:
+            window_size = min(20, len(rewards) // 3)  # Cap at 20 for very long runs
+        elif len(rewards) >= 20:
+            window_size = min(10, len(rewards) // 2)
+        elif len(rewards) >= 10:
+            window_size = min(5, len(rewards) // 2)
+        else:
+            window_size = max(2, len(rewards) // 3)  # Minimum window of 2
+        
+        # Always show both raw rewards and moving average when we have enough data
+        if len(rewards) >= 3 and window_size >= 2:
+            # Calculate moving average using pandas-style rolling mean for better results
+            moving_avg = []
+            for i in range(len(rewards)):
+                start_idx = max(0, i - window_size + 1)
+                end_idx = i + 1
+                avg = np.mean(rewards[start_idx:end_idx])
+                moving_avg.append(avg)
+            plt.plot(rewards, 'b-', alpha=0.4, marker='o', markersize=4, label='Episode Rewards')
+            plt.plot(moving_avg, 'r-', linewidth=2, label=f'Moving Average (window={window_size})')
+            plt.title(f'Training Progress with Moving Average')
             plt.xlabel('Episode')
-            plt.ylabel('Average Reward')
-            plt.grid(True)
+            plt.ylabel('Reward')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+        else:
+            # If very few episodes, show simple trend line
+            plt.plot(rewards, 'o-', alpha=0.8, color='blue', markersize=6)
+            plt.title(f'Episode Rewards ({len(rewards)} episodes)')
+            plt.xlabel('Episode')
+            plt.ylabel('Reward')
+            plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
         plt.savefig('ppo_training_results.png', dpi=300, bbox_inches='tight')
