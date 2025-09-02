@@ -126,8 +126,6 @@ class DataAggregator:
                 timestamp=ego_track.timestamp
             )
             # Set additional attributes for simulation compatibility
-            fused_track.covariance = getattr(ego_track, 'covariance', np.eye(6))
-            fused_track.confidence = min(1.0, sum(getattr(t, 'confidence', 1.0) for t in proximal_tracks_for_object) / len(proximal_tracks_for_object))
             fused_track_map[ego_track.object_id] = fused_track
 
         return fused_track_map
@@ -373,7 +371,7 @@ class PaperTrustAlgorithm:
         agent_expected_trust = proximal_robot.trust_value
         
         # Agent PSM: value = E[ego_fused_track_trust], confidence = 1-V[ego_fused_track_trust] (positive)        
-        agent_value = proximal_track_expected_trust 
+        agent_value = proximal_track_expected_trust
         agent_confidence = 1.0 - proximal_track_trust_variance  # Higher confidence when track trust is certain 
         robot_psms[proximal_robot.id].append((agent_value, agent_confidence))
         

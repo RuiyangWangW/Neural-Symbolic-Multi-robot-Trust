@@ -41,16 +41,17 @@ class SimpleTrustComparison:
         self.rl_model.eval()
         
     def run_comparison(self, scenario_config):
-        """Run both algorithms on the same simulation"""
+        """Run both algorithms on separate but identical simulation environments"""
         print(f"\n🔬 Testing scenario: {scenario_config['name']}")
         print(f"   Robots: {scenario_config['num_robots']}, Objects: {scenario_config['num_objects']}")
         print(f"   Adversarial ratio: {scenario_config['adversarial_ratio']:.2f}")
         
-        # Create ONE simulation environment with scenario parameters
+        # Create simulation parameters
         world_size = scenario_config.get('world_size', (50.0, 50.0))
         proximal_range = scenario_config.get('proximal_range', 50.0)
         
-        sim_env = SimulationEnvironment(
+        # Create one simulation environment for paper algorithm
+        paper_sim_env = SimulationEnvironment(
             num_robots=scenario_config['num_robots'],
             num_targets=scenario_config['num_objects'],
             world_size=world_size,
@@ -58,9 +59,19 @@ class SimpleTrustComparison:
             proximal_range=proximal_range
         )
         
-        # Print ground truth
-        adversarial_ids = [r.id for r in sim_env.robots if r.is_adversarial]
-        legitimate_ids = [r.id for r in sim_env.robots if not r.is_adversarial]
+        # Create RLTrustEnvironment for RL algorithm and set its sim_env to a copy
+        import copy
+        rl_trust_env = RLTrustEnvironment(
+            num_robots=scenario_config['num_robots'],
+            num_targets=scenario_config['num_objects'],
+            adversarial_ratio=scenario_config['adversarial_ratio']
+        )
+        # Replace its simulation with a copy of our paper simulation for fair comparison
+        rl_trust_env.sim_env = copy.deepcopy(paper_sim_env)
+        
+        # Print ground truth (should be identical for both environments)
+        adversarial_ids = [r.id for r in rl_trust_env.sim_env.robots if r.is_adversarial]
+        legitimate_ids = [r.id for r in rl_trust_env.sim_env.robots if not r.is_adversarial]
         print(f"   Ground Truth: Adversarial {adversarial_ids}, Legitimate {legitimate_ids}")
         
         # Run simulation and collect data for both algorithms
@@ -71,50 +82,61 @@ class SimpleTrustComparison:
         paper_trust_evolution = []
         
         # Initialize trust values for both algorithms
-        rl_robot_trusts = {r.id: {'alpha': 1.0, 'beta': 1.0} for r in sim_env.robots}
-        paper_robot_trusts = {r.id: {'alpha': 1.0, 'beta': 1.0} for r in sim_env.robots}
-        
-        # Paper algorithm is ready to use without initialization
+        rl_robot_trusts = {r.id: {'alpha': 1.0, 'beta': 1.0} for r in rl_trust_env.sim_env.robots}
+        paper_robot_trusts = {r.id: {'alpha': 1.0, 'beta': 1.0} for r in paper_sim_env.robots}
         
         # Run simulation steps
         for step in range(max_steps):
-            # Step the simulation
-            step_data = sim_env.step()
-            
-            # Extract current robot states and track observations
-            robot_states = {r.id: r for r in sim_env.robots}
-            robot_tracks = {r.id: r.get_all_tracks() for r in sim_env.robots}  # Dict[robot_id, List[Track]]
+            # Step BOTH simulations independently
+            paper_step_data = paper_sim_env.step()
             
             # === RL ALGORITHM ===
-            # Convert simulation data to RL format and get RL decisions
-            rl_state = self._convert_to_rl_state(robot_states, robot_tracks, rl_robot_trusts, sim_env)
-            if rl_state is not None:
-                try:
-                    # Get RL actions (trust updates)
-                    actions, _, _ = self.rl_trainer.select_action(rl_state, deterministic=True)
-                    # Apply RL trust updates using the proper RL method
-                    self._apply_rl_actions(actions, rl_robot_trusts, robot_states, rl_state)
-                except Exception as e:
-                    print(f"RL algorithm error: {e}")
-                    # Fallback to small increment
-                    for robot_id in robot_states.keys():
-                        if robot_id in rl_robot_trusts:
-                            rl_robot_trusts[robot_id]['alpha'] += 0.001
-                            rl_robot_trusts[robot_id]['beta'] += 0.001
+            # Use RLTrustEnvironment correctly - get state, select actions, apply them
+            try:
+                # Get current RL state using the environment's built-in method
+                all_actions = []
+                rl_state = rl_trust_env._get_current_state()
+                robots = rl_trust_env.sim_env.robots
+                for ego_robot in robots:
+                    try:
+                        # Use the current state as ego state (contains all robots/tracks)
+                        ego_state = rl_state
+                        ego_actions, _, _ = self.rl_trainer.select_action(ego_state)
+                        all_actions.append(ego_actions)
+                    except Exception as e:
+                        print(f"Warning: Failed to get ego action for robot {ego_robot.id}: {e}")
+                        continue
+                _, _, _, _ = rl_trust_env.step(all_actions, step)
+                rl_robot_trusts = {r.id: {'alpha': r.trust_alpha, 'beta': r.trust_beta} for r in rl_trust_env.sim_env.robots}
+                rl_robot_states = {r.id: r for r in rl_trust_env.sim_env.robots}
+            except Exception as e:
+                print(f"RL algorithm error: {e}")
+                # Fallback to small increment
+                rl_robot_states = {r.id: r for r in rl_trust_env.sim_env.robots}
+                for robot_id in rl_robot_states.keys():
+                    if robot_id in rl_robot_trusts:
+                        rl_robot_trusts[robot_id]['alpha'] += 0.001
+                        rl_robot_trusts[robot_id]['beta'] += 0.001
             
             # === PAPER ALGORITHM ===
-            # Apply paper algorithm trust updates
-            self._apply_paper_algorithm(paper_robot_trusts, robot_states, robot_tracks, sim_env)
+            # Extract current robot states from Paper environment
+            paper_robot_states = {r.id: r for r in paper_sim_env.robots}
             
-            # Record trust evolution for both algorithms
+            # Apply paper algorithm trust updates
+            self._apply_paper_algorithm(paper_robot_trusts, paper_robot_states, paper_sim_env)
+            rl_robot_trusts = {r.id: {'alpha': r.trust_alpha, 'beta': r.trust_beta} for r in rl_trust_env.sim_env.robots}
+            rl_robot_states = {r.id: r for r in rl_trust_env.sim_env.robots} 
+
+            paper_robot_trusts = {r.id: {'alpha': r.trust_alpha, 'beta': r.trust_beta} for r in paper_sim_env.robots}
+            paper_robot_states = {r.id: r for r in paper_sim_env.robots} 
             rl_trust_evolution.append({
                 'step': step,
-                'robot_trusts': self._extract_trust_values(rl_robot_trusts, robot_states, 'RL-GNN')
+                'robot_trusts': self._extract_trust_values(rl_robot_trusts, rl_robot_states)
             })
             
             paper_trust_evolution.append({
                 'step': step, 
-                'robot_trusts': self._extract_trust_values(paper_robot_trusts, robot_states, 'Paper')
+                'robot_trusts': self._extract_trust_values(paper_robot_trusts, paper_robot_states)
             })
         
         # Generate results
@@ -136,157 +158,30 @@ class SimpleTrustComparison:
         
         return results
     
-    def _convert_to_rl_state(self, robot_states, robot_tracks, rl_robot_trusts, sim_env):
-        """Convert simulation data to RL state format - use the same method as train_gnn_rl.py"""
-        try:
-            # Create a temporary RL environment to use its graph construction method
-            temp_rl_env = RLTrustEnvironment(
-                num_robots=len(robot_states),
-                num_targets=10, # doesn't matter for state generation
-                adversarial_ratio=0.3
-            )
-            
-            # Replace its simulation with our shared environment
-            temp_rl_env.sim_env = sim_env
-            temp_rl_env.episode_ego_robot_id = list(robot_states.keys())[0]  # Use first robot as ego
-            
-            # Set robot trust values in simulation - CRITICAL: Update the actual simulation robots
-            for robot_id, trust_data in rl_robot_trusts.items():
-                robot = robot_states[robot_id]
-                robot.trust_alpha = trust_data['alpha']
-                robot.trust_beta = trust_data['beta']
-                # Also update in sim_env.robots list
-                for sim_robot in sim_env.robots:
-                    if sim_robot.id == robot_id:
-                        sim_robot.trust_alpha = trust_data['alpha']
-                        sim_robot.trust_beta = trust_data['beta']
-            
-            # Update track trust values as well
-            for robot_id, tracks in robot_tracks.items():
-                for track in tracks:
-                    if not hasattr(track, 'trust_alpha'):
-                        track.trust_alpha = 2.0
-                        track.trust_beta = 1.0
-            
-            # Generate proper RL state using the same method as train_gnn_rl.py
-            rl_state = temp_rl_env._get_current_state()
-            
-            # CRITICAL: Attach current robots to state for action application
-            if rl_state is not None:
-                rl_state._current_robots = list(robot_states.values())
-            
-            return rl_state
-            
-        except Exception as e:
-            print(f"RL state conversion error: {e}")
-            import traceback
-            print(f"Traceback: {traceback.format_exc()}")
-            return None
+    # Removed complex conversion methods - now using RLTrustEnvironment directly!
     
-    def _apply_rl_actions(self, actions, rl_robot_trusts, robot_states, rl_state):
-        """Apply RL trust update actions using the exact same method as train_gnn_rl.py"""
-        try:
-            # Use the same logic as RLTrustEnvironment._apply_trust_updates method
-            if not actions or not rl_state:
-                return
-                
-            # Update robot trust distributions directly in simulation environment
-            if 'agent' in actions and hasattr(rl_state, 'agent_nodes') and hasattr(rl_state, '_current_robots'):
-                agent_actions = actions['agent']
-                current_robots = rl_state._current_robots
-                
-                for robot_id, node_idx in rl_state.agent_nodes.items():
-                    if node_idx < agent_actions['value'].shape[0]:
-                        # Find robot in current robots list
-                        robot = None
-                        for r in current_robots:
-                            if r.id == robot_id:
-                                robot = r
-                                break
-                        
-                        if robot is not None and hasattr(robot, 'trust_alpha'):
-                            # Store original trust for logging
-                            original_alpha = robot.trust_alpha
-                            original_beta = robot.trust_beta
-                            
-                            # Convert GNN action to trust parameter updates
-                            psm_value = agent_actions['value'][node_idx].item()
-                            psm_confidence = agent_actions['confidence'][node_idx].item()
-                            
-                            # Update robot trust using PSM approach (exact same as train_gnn_rl.py)
-                            delta_alpha = psm_confidence * psm_value * 0.05  # Gradual changes
-                            delta_beta = psm_confidence * (1.0 - psm_value) * 0.05
-                            
-                            # Apply updates directly to robot
-                            robot.trust_alpha += delta_alpha
-                            robot.trust_beta += delta_beta
-                            
-                            # Update our tracking dict as well
-                            rl_robot_trusts[robot_id]['alpha'] = robot.trust_alpha
-                            rl_robot_trusts[robot_id]['beta'] = robot.trust_beta
-                            
-                            # Update robot_states dict
-                            robot_states[robot_id].trust_alpha = robot.trust_alpha
-                            robot_states[robot_id].trust_beta = robot.trust_beta
-                            
-                            # Debug logging (same format as train_gnn_rl.py)
-                            print(f"  [TRUST UPDATE] Robot {robot_id}: α {original_alpha:.3f}→{robot.trust_alpha:.3f} (Δ{delta_alpha:+.3f}), β {original_beta:.3f}→{robot.trust_beta:.3f} (Δ{delta_beta:+.3f})")
-            
-            # Update track trust distributions with proper propagation (if needed)
-            # This matches the track trust update logic from train_gnn_rl.py
-            if 'track' in actions and hasattr(rl_state, 'track_nodes'):
-                track_actions = actions['track']
-                # Track trust updates could be implemented here if needed
-                pass
-            
-        except Exception as e:
-            print(f"RL action application error: {e}")
-            import traceback
-            print(f"Traceback: {traceback.format_exc()}")
-            # Fallback to small increment
-            for robot_id in robot_states.keys():
-                if robot_id in rl_robot_trusts:
-                    rl_robot_trusts[robot_id]['alpha'] += 0.001
-                    rl_robot_trusts[robot_id]['beta'] += 0.001
-    
-    def _apply_paper_algorithm(self, paper_robot_trusts, robot_states, robot_tracks, sim_env):
+    def _apply_paper_algorithm(self, paper_robot_trusts, robot_states, sim_env):
         """Apply paper algorithm trust updates using the actual algorithm"""
         try:
-            # Set robot trust values before calling paper algorithm
-            for robot_id, trust_data in paper_robot_trusts.items():
-                robot = robot_states[robot_id]
-                robot.trust_alpha = trust_data['alpha']
-                robot.trust_beta = trust_data['beta']
+            # Robots and tracks already have their current trust values from previous timesteps
+            # No need to set them again - just call the paper algorithm directly
             
-            # Set track trust values  
-            for robot_id, tracks in robot_tracks.items():
-                for track in tracks:
-                    if not hasattr(track, 'trust_alpha'):
-                        track.trust_alpha = 2.0
-                        track.trust_beta = 1.0
-            
-            # Call the actual paper trust algorithm (simplified signature)
-            trust_updates = self.paper_algo.update_trust(
+            # Call the actual paper trust algorithm
+            # The paper algorithm will update both robot and track trust values directly
+            self.paper_algo.update_trust(
                 list(robot_states.values()), 
                 environment=sim_env
             )
             
-            # Extract updated trust values back to our tracking
+            # Extract updated robot trust values back to our tracking dictionary
             for robot_id, robot in robot_states.items():
-                paper_robot_trusts[robot_id]['alpha'] = getattr(robot, 'trust_alpha', paper_robot_trusts[robot_id]['alpha'])
-                paper_robot_trusts[robot_id]['beta'] = getattr(robot, 'trust_beta', paper_robot_trusts[robot_id]['beta'])
+                paper_robot_trusts[robot_id]['alpha'] = robot.trust_alpha
+                paper_robot_trusts[robot_id]['beta'] = robot.trust_beta
                 
         except Exception as e:
-            import traceback
             print(f"Paper algorithm error: {e}")
-            print(f"Traceback: {traceback.format_exc()}")
-            # Fallback to simple increment if paper algorithm fails
-            for robot_id in robot_states.keys():
-                if robot_id in paper_robot_trusts:
-                    paper_robot_trusts[robot_id]['alpha'] += 0.005
-                    paper_robot_trusts[robot_id]['beta'] += 0.005
     
-    def _extract_trust_values(self, robot_trusts, robot_states, algorithm_name):
+    def _extract_trust_values(self, robot_trusts, robot_states):
         """Extract trust values with ground truth labels"""
         extracted = {}
         for robot_id, trust_data in robot_trusts.items():

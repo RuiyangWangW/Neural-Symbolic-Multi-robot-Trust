@@ -586,8 +586,6 @@ class SimulationEnvironment:
                 if existing_track:
                     # Update existing track with new observation
                     existing_track.update_state(fp_obj.position.copy(), fp_obj.velocity.copy(), self.time)
-                    # DO NOT update trust here - trust is managed by the trust algorithm
-                    # Set additional attributes that are used by the simulation
                     track = existing_track
                 else:
                     # Create new track using the new Track class

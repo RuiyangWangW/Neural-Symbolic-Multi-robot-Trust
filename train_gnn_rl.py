@@ -99,10 +99,6 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
     episode_rewards = []
     best_reward = float('-inf')
     
-    # Debug: Track model parameter checksum to verify learning persistence
-    def get_model_checksum(model):
-        return sum(p.sum().item() for p in model.parameters() if p.requires_grad)
-    
     for episode in range(episodes):
         
         # Reset environment
