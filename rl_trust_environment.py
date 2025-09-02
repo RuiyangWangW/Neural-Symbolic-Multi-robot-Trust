@@ -457,53 +457,33 @@ class RLTrustEnvironment:
         """Determine if track is in robot's field of view using Robot's built-in method"""
         return robot.is_in_fov(track.position)  # Use Robot class's is_in_fov method
    
-    def step(self, actions, step_count):
-        """Multi-ego robot step - each robot serves as ego and accumulates updates"""
+    def step(self, all_actions, step_count):
+        """Apply all actions from multi-ego training to the environment"""
         
-        # This method is called with actions from ONE ego perspective (current state)
-        # But we need to get actions from ALL ego perspectives for proper multi-ego training
-        
-        # Get current state BEFORE applying updates (using original ego for initial state)
+        # Get current state BEFORE applying updates
         current_state = self._get_current_state()
         self.step_count = step_count
 
-        # Get robots for multi-ego processing
-        robots = self._get_robots_list()
-        
-        # MULTI-EGO APPROACH: Get actions from each robot's perspective
+        # Clear accumulated updates for this step
         self.accumulated_robot_updates.clear()
         self.accumulated_track_updates.clear()
         
-        all_ego_states = []
-        successful_egos = 0
-        
-        # Import trainer from training context (this is a bit hacky but works)
-        trainer_instance = getattr(self, '_trainer_instance', None)
-        
-        for robot in robots:
-            try:
-                # Get state from current environment state (same for all robots in multi-ego training)
-                robot_state = current_state
-                if robot_state is not None:
-                    all_ego_states.append((robot.id, robot_state))
-                    
-                    # Get actions from this robot's perspective
-                    if trainer_instance:
-                        robot_actions, _, _ = trainer_instance.select_action(robot_state)
-                        # Accumulate trust updates from this robot's actions
-                        self._accumulate_trust_updates(robot_actions, robot_state, robot.id)
-                    else:
-                        # Fallback: use provided actions 
-                        self._accumulate_trust_updates(actions, robot_state, robot.id)
-                        
-                    successful_egos += 1
-                    
-            except Exception as e:
-                # print(f"Warning: Multi-ego processing failed for robot {robot.id}: {e}")
-                continue
-        
-        # Apply all accumulated updates at once
-        self._apply_accumulated_trust_updates()
+        # Apply actions from all ego robots
+        if all_actions and current_state:
+            robots = self._get_robots_list()
+            
+            for i, ego_actions in enumerate(all_actions):
+                if i < len(robots):
+                    ego_robot_id = robots[i].id
+                    try:
+                        # Accumulate trust updates from this ego robot's actions
+                        self._accumulate_trust_updates(ego_actions, current_state, ego_robot_id)
+                    except Exception as e:
+                        print(f"Error applying actions for ego robot {ego_robot_id}: {e}")
+                        continue
+            
+            # Apply all accumulated updates at once
+            self._apply_accumulated_trust_updates()
 
         np.random.seed(42 + self.step_count)  # Different seed per step, but deterministic
         random.seed(42 + self.step_count)
@@ -517,7 +497,8 @@ class RLTrustEnvironment:
         # Get final state after all updates applied
         next_state = self._get_current_state()
         
-        # Prepare simulation step data - no single ego robot
+        # Prepare simulation step data - no single ego robot  
+        robots = self._get_robots_list()
         ground_truth_objects = []
         if hasattr(self.sim_env, 'ground_truth_objects'):
             ground_truth_objects = self.sim_env.ground_truth_objects
@@ -554,9 +535,9 @@ class RLTrustEnvironment:
             'step_count': self.step_count,
             'num_robots': num_robots,
             'num_objects': num_objects,
-            'training_mode': f"multi_ego_{successful_egos}_robots",
+            'training_mode': f"multi_ego_{len(all_actions)}_robots",
             'trust_updates_applied': True,
-            'successful_ego_robots': successful_egos,
+            'successful_ego_robots': len(all_actions),
             'reward_components': {
                 'total': reward
             }

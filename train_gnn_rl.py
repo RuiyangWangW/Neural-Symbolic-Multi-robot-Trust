@@ -113,8 +113,23 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
         # Collect experience for one episode
         done = False
         while step_count < max_steps_per_episode:
-            # Select action with policy outputs for visualization
-            actions, log_probs, values = trainer.select_action(state)
+            # MULTI-EGO TRAINING: Get actions from each robot's ego perspective
+            robots = env.sim_env.robots
+            all_actions = []
+            all_log_probs = []  
+            all_values = []
+            
+            for ego_robot in robots:
+                try:
+                    # Use the current state as ego state (contains all robots/tracks)
+                    ego_state = state
+                    ego_actions, ego_log_probs, ego_values = trainer.select_action(ego_state)
+                    all_actions.append(ego_actions)
+                    all_log_probs.append(ego_log_probs)
+                    all_values.append(ego_values)
+                except Exception as e:
+                    print(f"Warning: Failed to get ego action for robot {ego_robot.id}: {e}")
+                    continue
             
             # Visualize GNN input graph if it's time
             if enable_visualization and episode % visualize_frequency == 0 and step_count in visualize_steps:
@@ -125,20 +140,23 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
                     print(f"⚠️ Warning: GNN visualization failed: {e}")
                     pass
             
-            # Take environment step
-            next_state, reward, done, info = env.step(actions, step_count)
+            # Take environment step with all ego actions
+            next_state, reward, done, info = env.step(all_actions, step_count)
             
             # Store experience (including final step)
-            experience = PPOExperience(
-                graph_data=state,
-                action=actions,
-                reward=reward,
-                log_prob=log_probs,
-                value=values,
-                done=done,
-                next_graph_data=next_state
-            )
-            trainer.add_experience(experience)
+            # Store experiences from all ego robots
+            for i in range(len(all_actions)):
+                if i < len(all_actions) and i < len(all_log_probs) and i < len(all_values):
+                    experience = PPOExperience(
+                        graph_data=state,
+                        action=all_actions[i],
+                        reward=reward,  # Same reward for all ego robots
+                        log_prob=all_log_probs[i],
+                        value=all_values[i],
+                        done=done,
+                        next_graph_data=next_state
+                    )
+                    trainer.add_experience(experience)
             
             episode_reward += reward
             step_count += 1
