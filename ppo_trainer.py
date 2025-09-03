@@ -13,7 +13,7 @@ from typing import Dict, Any, Optional, List
 
 # PPO experience tuple
 PPOExperience = namedtuple('PPOExperience', [
-    'graph_data', 'action', 'reward', 'log_prob', 'value', 'done', 'next_graph_data'
+    'graph_data', 'action', 'reward', 'log_prob', 'value', 'done', 'next_graph_data', 'global_graph_data'
 ])
 
 
@@ -55,106 +55,138 @@ class PPOTrainer:
         self.episode_experiences = []  # List of episode sequences
         self.current_episode = []      # Current episode being collected
         
-    def select_action(self, graph_data, deterministic=False):
-        """Select actions using the current policy"""
+    def select_action_ego(self, ego_graph_data, global_state, deterministic=False):
+        """Select action for a single robot using its ego-graph (CTDE: Decentralized Actor)"""
         self.model.eval()
         
         with torch.no_grad():
-            # Move graph to device
-            x_dict = {k: v.to(self.device) for k, v in graph_data.x_dict.items()}
+            # Use ego-graph for policy (decentralized actor)
+            x_dict = {k: v.to(self.device) for k, v in ego_graph_data.x_dict.items()}
+            edge_index_dict = self._ensure_edge_types(ego_graph_data)
             
-            # Handle edge_index_dict - use the proper edge_index_dict we created
-            edge_index_dict = self._ensure_edge_types(graph_data)
+            # Forward pass for policy using ego-graph (decentralized actor)
+            policy_outputs, _ = self.model(x_dict, edge_index_dict, policy_only=True)
             
-            # Forward pass
-            policy_outputs, value_outputs = self.model(x_dict, edge_index_dict)
+            # Use global state for value function (centralized critic)
+            global_x_dict = {k: v.to(self.device) for k, v in global_state.x_dict.items()}
+            global_edge_index_dict = self._ensure_edge_types(global_state)
+            
+            # Forward pass for value using global graph (centralized critic)
+            _, value_outputs = self.model(global_x_dict, global_edge_index_dict, value_only=True)
             
             actions = {}
             log_probs = {}
             values = {}
             
-            # Sample actions for agents
-            if 'agent' in policy_outputs and policy_outputs['agent']['value_alpha'].shape[0] > 0:
-                agent_policy = policy_outputs['agent']
-                agent_values = value_outputs['agent']
+            # Find ego robot in the ego-graph (should be the first agent)
+            ego_robot_id = ego_graph_data._ego_robot_id
+            ego_agent_idx = None
+            if hasattr(ego_graph_data, 'agent_nodes'):
+                for robot_id, agent_idx in ego_graph_data.agent_nodes.items():
+                    if robot_id == ego_robot_id:
+                        ego_agent_idx = agent_idx
+                        break
+            
+            # Sample action only for the ego robot
+            if ('agent' in policy_outputs and ego_agent_idx is not None and 
+                ego_agent_idx < policy_outputs['agent']['value_alpha'].shape[0]):
                 
-                # Get the parameters from the policy output
-                agent_value_alpha = agent_policy['value_alpha']
-                agent_value_beta = agent_policy['value_beta']
-                agent_confidence = agent_policy['confidence']  # Pre-computed confidence
+                agent_policy = policy_outputs['agent']
+                
+                # Get parameters for ego robot only
+                ego_value_alpha = agent_policy['value_alpha'][ego_agent_idx]
+                ego_value_beta = agent_policy['value_beta'][ego_agent_idx]
+                ego_confidence = agent_policy['confidence'][ego_agent_idx]
                 
                 if deterministic:
-                    # Use mean of Beta distribution for deterministic action
-                    agent_value_action = agent_value_alpha / (agent_value_alpha + agent_value_beta)
+                    ego_value_action = ego_value_alpha / (ego_value_alpha + ego_value_beta)
                 else:
-                    # Sample from Beta distribution using the direct parameters
-                    agent_value_action = torch.distributions.Beta(agent_value_alpha, agent_value_beta).sample()
+                    ego_value_action = torch.distributions.Beta(ego_value_alpha, ego_value_beta).sample()
                 
                 actions['agent'] = {
-                    'value': agent_value_action,
-                    'confidence': agent_confidence  # Use pre-computed confidence directly
+                    'value': ego_value_action.unsqueeze(0),  # Keep batch dimension
+                    'confidence': ego_confidence.unsqueeze(0)
                 }
                 
-                # Compute log probabilities using proper Beta distribution for value only
+                # Compute log probabilities
                 if deterministic:
-                    # For deterministic actions, use small variance around the mean
                     log_probs['agent'] = {
-                        'value': torch.zeros_like(agent_value_action),
-                        'confidence': torch.zeros_like(agent_confidence)
+                        'value': torch.zeros_like(ego_value_action),
+                        'confidence': torch.zeros_like(ego_confidence)
                     }
                 else:
-                    # Create distribution using the direct parameters
-                    value_dist = torch.distributions.Beta(agent_value_alpha, agent_value_beta)
-                    
+                    value_dist = torch.distributions.Beta(ego_value_alpha, ego_value_beta)
                     log_probs['agent'] = {
-                        'value': value_dist.log_prob(agent_value_action).sum(),
-                        'confidence': torch.zeros_like(agent_confidence)  # No sampling for confidence
+                        'value': value_dist.log_prob(ego_value_action),
+                        'confidence': torch.zeros_like(ego_confidence)
                     }
-                
-                values['agent'] = agent_values
             
-            # Similar for tracks
+            # For tracks, include all tracks in ego-graph
             if 'track' in policy_outputs and policy_outputs['track']['value_alpha'].shape[0] > 0:
                 track_policy = policy_outputs['track']
-                track_values = value_outputs['track']
                 
-                # Get the parameters from the policy output
                 track_value_alpha = track_policy['value_alpha']
                 track_value_beta = track_policy['value_beta']
-                track_confidence = track_policy['confidence']  # Pre-computed confidence
+                track_confidence = track_policy['confidence']
                 
                 if deterministic:
-                    # Use mean of Beta distribution for deterministic action
                     track_value_action = track_value_alpha / (track_value_alpha + track_value_beta)
                 else:
-                    # Sample from Beta distribution using the direct parameters
                     track_value_action = torch.distributions.Beta(track_value_alpha, track_value_beta).sample()
                 
                 actions['track'] = {
                     'value': track_value_action,
-                    'confidence': track_confidence  # Use pre-computed confidence directly
+                    'confidence': track_confidence
                 }
                 
-                # Compute log probabilities using proper Beta distribution for value only
                 if deterministic:
-                    # For deterministic actions, use small variance around the mean
                     log_probs['track'] = {
                         'value': torch.zeros_like(track_value_action),
                         'confidence': torch.zeros_like(track_confidence)
                     }
                 else:
-                    # Create distribution using the direct parameters
                     track_value_dist = torch.distributions.Beta(track_value_alpha, track_value_beta)
-                    
                     log_probs['track'] = {
                         'value': track_value_dist.log_prob(track_value_action).sum(),
-                        'confidence': torch.zeros_like(track_confidence)  # No sampling for confidence
+                        'confidence': torch.zeros_like(track_confidence)
                     }
-                
-                values['track'] = track_values
+            
+            # Use centralized critic value (from global state)
+            values = self._extract_global_value(value_outputs, global_state)
         
         self.model.train()
         return actions, log_probs, values
+    
+    def _extract_global_value(self, value_outputs, global_state):
+        """Extract a scalar value from the global state for centralized critic"""
+        # With the new architecture, value_outputs is already a scalar tensor from the centralized critic
+        if isinstance(value_outputs, torch.Tensor):
+            if value_outputs.numel() == 1:
+                return value_outputs
+            else:
+                return value_outputs.mean()
+        elif isinstance(value_outputs, (int, float)):
+            return torch.tensor(value_outputs, device=self.device)
+        else:
+            # Fallback for old format
+            total_value = 0.0
+            total_nodes = 0
+            
+            if isinstance(value_outputs, dict):
+                if 'agent' in value_outputs and hasattr(value_outputs['agent'], 'numel') and value_outputs['agent'].numel() > 0:
+                    agent_values = value_outputs['agent'].squeeze()
+                    total_value += torch.sum(agent_values).item()
+                    total_nodes += agent_values.numel()
+                
+                if 'track' in value_outputs and hasattr(value_outputs['track'], 'numel') and value_outputs['track'].numel() > 0:
+                    track_values = value_outputs['track'].squeeze()
+                    total_value += torch.sum(track_values).item()
+                    total_nodes += track_values.numel()
+                
+                global_value = total_value / max(total_nodes, 1)
+                return torch.tensor(global_value, device=self.device)
+            else:
+                return torch.tensor(0.0, device=self.device)
     
     def _ensure_edge_types(self, graph_data_or_dict):
         """Ensure all required edge types exist in edge_index_dict, creating empty ones if missing"""
@@ -195,58 +227,97 @@ class PPOTrainer:
         obj.trust_beta = 1.0
     
     def compute_gae_and_returns(self, experiences):
-        """Compute both GAE advantages and TD returns for value function training"""
-        rewards = []
-        values = []
-        dones = []
+        """Compute both GAE advantages and TD returns for CTDE value function training
         
-        # Use raw rewards - no normalization to preserve learning signal magnitude
-        for exp in experiences:
-            # Keep original reward values to maintain learning signal
-            rewards.append(exp.reward)
-            dones.append(exp.done)
+        CORRECTED: Ensures robots at same timestep share the same advantage
+        """
+        if not experiences:
+            return [], []
             
-            # Extract value for this experience (proper weighted combination)
-            total_nodes = 0
-            exp_value = 0.0
-
-            if 'agent' in exp.value and exp.value['agent'].numel() > 0:
-                agent_count = exp.value['agent'].numel()
-                exp_value += torch.sum(exp.value['agent']).item()  # Sum, not mean
-                total_nodes += agent_count
-
-            if 'track' in exp.value and exp.value['track'].numel() > 0:
-                track_count = exp.value['track'].numel()
-                exp_value += torch.sum(exp.value['track']).item()  # Sum, not mean  
-                total_nodes += track_count
-
-            # Final weighted average across all nodes in the graph
-            exp_value = exp_value / max(total_nodes, 1)
-            values.append(exp_value)
+        # Group experiences by timestep - assume sequential storage: [R0_t0, R1_t0, ..., R0_t1, R1_t1, ...]
+        # We need to determine number of robots per timestep
+        num_robots = self._estimate_robots_per_timestep(experiences)
         
-        # Compute GAE advantages
-        advantages = []
-        returns = []
+        # Group experiences by timestep
+        timestep_groups = []
+        for i in range(0, len(experiences), num_robots):
+            timestep_group = experiences[i:i + num_robots]
+            if timestep_group:  # Only add non-empty groups
+                timestep_groups.append(timestep_group)
+        
+        # Extract timestep-level data (same for all robots at each timestep)
+        timestep_rewards = []
+        timestep_values = []
+        timestep_dones = []
+        
+        for timestep_group in timestep_groups:
+            # All robots at this timestep should have same reward, value, and done
+            first_exp = timestep_group[0]
+            
+            # Extract reward (should be same for all robots)
+            timestep_rewards.append(first_exp.reward)
+            timestep_dones.append(first_exp.done)
+            
+            # Extract value - use centralized critic value (should be same for all robots)
+            if isinstance(first_exp.value, torch.Tensor):
+                exp_value = first_exp.value.item() if first_exp.value.numel() == 1 else first_exp.value.mean().item()
+            elif isinstance(first_exp.value, (int, float)):
+                exp_value = first_exp.value
+            else:
+                # Legacy fallback for old format
+                total_nodes = 0
+                exp_value = 0.0
+                if isinstance(first_exp.value, dict):
+                    if 'agent' in first_exp.value and hasattr(first_exp.value['agent'], 'numel') and first_exp.value['agent'].numel() > 0:
+                        agent_count = first_exp.value['agent'].numel()
+                        exp_value += torch.sum(first_exp.value['agent']).item()
+                        total_nodes += agent_count
+                    if 'track' in first_exp.value and hasattr(first_exp.value['track'], 'numel') and first_exp.value['track'].numel() > 0:
+                        track_count = first_exp.value['track'].numel()
+                        exp_value += torch.sum(first_exp.value['track']).item()
+                        total_nodes += track_count
+                    exp_value = exp_value / max(total_nodes, 1)
+                else:
+                    exp_value = 0.0
+            
+            timestep_values.append(exp_value)
+        
+        # Compute GAE advantages at timestep level
+        timestep_advantages = []
+        timestep_returns = []
         gae = 0.0
         
-        for i in reversed(range(len(experiences))):
+        for i in reversed(range(len(timestep_groups))):
             # Proper terminal state handling
-            if i == len(experiences) - 1 or dones[i]:
+            if i == len(timestep_groups) - 1 or timestep_dones[i]:
                 # Terminal state: no next value
                 next_value = 0.0
             else:
-                # Non-terminal state: use next state's value
-                next_value = values[i + 1]
+                # Non-terminal state: use next timestep's value
+                next_value = timestep_values[i + 1]
             
             # TD error with proper terminal handling
-            delta = rewards[i] + self.gamma * next_value * (1.0 - float(dones[i])) - values[i]
+            delta = timestep_rewards[i] + self.gamma * next_value * (1.0 - float(timestep_dones[i])) - timestep_values[i]
             
             # GAE computation - resets when episode ends
-            gae = delta + self.gamma * self.lam * gae * (1.0 - float(dones[i]))
-            advantages.insert(0, gae)
+            gae = delta + self.gamma * self.lam * gae * (1.0 - float(timestep_dones[i]))
+            timestep_advantages.insert(0, gae)
             
             # Returns for value function (advantage + value baseline)
-            returns.insert(0, gae + values[i])
+            timestep_returns.insert(0, gae + timestep_values[i])
+        
+        # Replicate timestep advantages/returns to all robots at each timestep
+        advantages = []
+        returns = []
+        
+        for i, timestep_group in enumerate(timestep_groups):
+            timestep_advantage = timestep_advantages[i]
+            timestep_return = timestep_returns[i]
+            
+            # All robots at this timestep get the SAME advantage and return
+            for exp in timestep_group:
+                advantages.append(timestep_advantage)
+                returns.append(timestep_return)
         
         # Convert to tensors and normalize for stability
         advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
@@ -263,11 +334,40 @@ class PPOTrainer:
         
         # Debug: Print advantage and return statistics every few updates
         if self._update_count % 10 == 0:
+            print(f"   [DEBUG] CORRECTED GAE: Timesteps={len(timestep_groups)}, Robots/timestep={num_robots}")
             print(f"   [DEBUG] Advantages: mean={advantages.mean():.4f}, std={advantages.std():.4f}")
             print(f"   [DEBUG] Returns: mean={returns.mean():.2f}, std={returns.std():.2f}, range=[{returns.min():.1f}, {returns.max():.1f}]")
             print(f"   [DEBUG] Raw rewards: {[exp.reward for exp in experiences[:3]]}...")
         
         return advantages, returns
+    
+    def _estimate_robots_per_timestep(self, experiences):
+        """Estimate number of robots per timestep from experience pattern"""
+        if len(experiences) < 2:
+            return 1
+        
+        # Look for reward changes to detect timestep boundaries
+        # Experiences should be stored as: [R0_t0, R1_t0, R2_t0, R0_t1, R1_t1, R2_t1, ...]
+        first_reward = experiences[0].reward
+        robots_per_timestep = 1
+        
+        for i in range(1, min(len(experiences), 20)):  # Check first 20 experiences
+            if experiences[i].reward != first_reward:
+                # Found a timestep boundary
+                robots_per_timestep = i
+                break
+        
+        # Validation: ensure this makes sense
+        if robots_per_timestep * 2 <= len(experiences):
+            # Check if pattern holds for second timestep
+            second_timestep_start = robots_per_timestep
+            if second_timestep_start < len(experiences):
+                second_reward = experiences[second_timestep_start].reward
+                if second_reward != first_reward:
+                    return robots_per_timestep
+        
+        # Fallback: assume single robot if pattern detection fails
+        return 1
     
     def compute_gae_and_returns_by_episode(self, episode_list):
         """Compute GAE and returns respecting episode boundaries"""
@@ -359,24 +459,34 @@ class PPOTrainer:
             valid_experience_count = 0
             
             for i, experience in enumerate(shuffled_experiences):
-                # Move data to device
-                x_dict = {k: v.to(self.device) for k, v in experience.graph_data.x_dict.items()}
+                # FIXED: Use ego-graph for policy, global graph for value (CTDE)
+                # Ego-graph for policy (decentralized actor)
+                ego_x_dict = {k: v.to(self.device) for k, v in experience.graph_data.x_dict.items()}
+                ego_edge_index_dict = self._ensure_edge_types(experience.graph_data)
                 
-                # Handle edge_index_dict safely (same as in select_action)
-                try:
-                    edge_index_dict = self._ensure_edge_types(experience.graph_data)
-                except Exception:
-                    # Fallback: create all empty edges
-                    edge_index_dict = self._ensure_edge_types({})
+                # Global graph for value (centralized critic) 
+                if experience.global_graph_data is not None:
+                    global_x_dict = {k: v.to(self.device) for k, v in experience.global_graph_data.x_dict.items()}
+                    global_edge_index_dict = self._ensure_edge_types(experience.global_graph_data)
+                else:
+                    # Fallback to ego-graph if global not available (backward compatibility)
+                    global_x_dict = ego_x_dict
+                    global_edge_index_dict = ego_edge_index_dict
                 
-                # Forward pass
+                # Forward pass: CTDE with separate graphs
                 self.model.train()  # Force training mode again just before forward pass
-                policy_outputs, value_outputs = self.model(x_dict, edge_index_dict)
+                
+                # Policy outputs from ego-graph (decentralized actor)
+                policy_outputs, _ = self.model(ego_x_dict, ego_edge_index_dict, policy_only=True)
+                
+                # Value outputs from global graph (centralized critic)  
+                _, value_outputs = self.model(global_x_dict, global_edge_index_dict, value_only=True)
                 
                 # Compute policy loss (simplified PPO loss)
                 policy_loss = 0.0
                 value_loss = 0.0
-                entropy_loss = 0.0
+                agent_entropy_loss = 0.0
+                track_entropy_loss = 0.0
                 
                 # Agent policy loss
                 if 'agent' in policy_outputs and 'agent' in experience.action:
@@ -386,76 +496,64 @@ class PPOTrainer:
                     agent_old_log_prob = experience.log_prob['agent']
                     old_value_log_prob = agent_old_log_prob['value']
                     old_conf_log_prob = agent_old_log_prob['confidence']
-                    agent_value = value_outputs['agent']
+                    # Use the centralized global value (scalar)
+                    agent_value = value_outputs
                     
-                    # Compute new log prob using proper Beta distribution
-                    # Use the 4 parameters directly from the policy output
-                    agent_value_alpha = agent_policy['value_alpha']
-                    agent_value_beta = agent_policy['value_beta']
-                    agent_confidence = agent_policy['confidence']  # Pre-computed confidence
+                    # FIXED: Find ego robot in the ego-graph (same logic as in select_action_ego)
+                    ego_robot_id = experience.graph_data._ego_robot_id
+                    ego_agent_idx = None
+                    if hasattr(experience.graph_data, 'agent_nodes'):
+                        for robot_id, agent_idx in experience.graph_data.agent_nodes.items():
+                            if robot_id == ego_robot_id:
+                                ego_agent_idx = agent_idx
+                                break
                     
-                    # Create distributions and compute log probabilities for value only
-                    value_dist = torch.distributions.Beta(agent_value_alpha, agent_value_beta)
-                    
-                    new_log_prob_value = value_dist.log_prob(agent_action['value'].to(self.device)).sum()
-                    new_log_prob_conf = torch.zeros_like(new_log_prob_value)  # No sampling for confidence
-                    
-                    # PPO ratio using actual old probabilities (value only)
-                    ratio_value = torch.exp(new_log_prob_value - old_value_log_prob)
-                    ratio_conf = torch.tensor(1.0).to(self.device)  # No policy gradient for confidence
-                    
-                    
-                    # Skip experiences with extreme ratios for stability
-                    if torch.isnan(ratio_value) or torch.isnan(ratio_conf):
-                        continue
-                    elif (ratio_value > 5.0 or ratio_conf > 5.0 or 
-                          ratio_value < 0.2 or ratio_conf < 0.2):
-                        continue
-                    
-                    # PPO clipped objective - use proper GAE advantage
-                    advantage = shuffled_advantages[i]
-                    
-                    surr1_value = ratio_value * advantage
-                    surr2_value = torch.clamp(ratio_value, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
-                    
-                    surr1_conf = ratio_conf * advantage
-                    surr2_conf = torch.clamp(ratio_conf, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
-                    
-                    # PPO objective: maximize min(ratio * advantage, clipped_ratio * advantage)  
-                    # For loss minimization: negate the objective
-                    ppo_loss = -torch.min(surr1_value, surr2_value) - torch.min(surr1_conf, surr2_conf)
-                    policy_loss += ppo_loss
-                    
-                    
-                    # Improved value loss with clipping and better target handling
-                    return_target = shuffled_returns[i].item() if isinstance(shuffled_returns[i], torch.Tensor) else shuffled_returns[i]
-                    return_target_tensor = torch.tensor(return_target, device=self.device).float()
-                    
-                    # Get current value predictions
-                    current_values = agent_value.squeeze()
-                    if current_values.dim() == 0:
-                        current_values = current_values.unsqueeze(0)
+                    # FIXED: Only proceed if we found the ego robot in the ego-graph
+                    if (ego_agent_idx is not None and 
+                        ego_agent_idx < agent_policy['value_alpha'].shape[0]):
                         
-                    # Expand target to match value shape
-                    if current_values.dim() > 0:
-                        return_target_tensor = return_target_tensor.expand_as(current_values)
-                    
-                    # Clipped value loss (similar to PPO's clipped objective but for values)
-                    value_loss_unclipped = F.mse_loss(current_values, return_target_tensor, reduction='none')
-                    
-                    # Add small regularization to prevent value explosion
-                    value_reg = 0.01 * torch.mean(current_values ** 2)
-                    value_loss += torch.mean(value_loss_unclipped) + value_reg
-                    
-                    # Compute actual policy entropy for exploration (value only)
-                    value_entropy = value_dist.entropy().sum()
-                    conf_entropy = torch.tensor(0.0).to(self.device)  # No entropy for deterministic confidence
-                    total_entropy = value_entropy + conf_entropy
-                    
-                    # Entropy loss (negative because we want to maximize entropy)
-                    entropy_loss = entropy_loss - total_entropy if isinstance(entropy_loss, torch.Tensor) else -total_entropy
+                        # FIXED: Extract ego robot's parameters only
+                        ego_value_alpha = agent_policy['value_alpha'][ego_agent_idx]
+                        ego_value_beta = agent_policy['value_beta'][ego_agent_idx]
+                        ego_confidence = agent_policy['confidence'][ego_agent_idx]
+                        
+                        # FIXED: Create distribution from ego robot's parameters only
+                        ego_value_dist = torch.distributions.Beta(ego_value_alpha, ego_value_beta)
+                        
+                        # FIXED: Compute log prob for ego robot's action only (no .sum() needed)
+                        new_log_prob_value = ego_value_dist.log_prob(agent_action['value'].to(self.device))
+                        new_log_prob_conf = torch.zeros_like(new_log_prob_value)  # No sampling for confidence
+                        
+                        # PPO ratio using actual old probabilities (value only)
+                        ratio_value = torch.exp(new_log_prob_value - old_value_log_prob)
+                        ratio_conf = torch.tensor(1.0).to(self.device)  # No policy gradient for confidence
+                        
+                        # Skip experiences with extreme ratios for stability
+                        if torch.isnan(ratio_value) or torch.isnan(ratio_conf):
+                            continue
+                        elif (ratio_value > 5.0 or ratio_conf > 5.0 or 
+                              ratio_value < 0.2 or ratio_conf < 0.2):
+                            continue
+                        
+                        # PPO clipped objective - use proper GAE advantage
+                        advantage = shuffled_advantages[i]
+                        
+                        surr1_value = ratio_value * advantage
+                        surr2_value = torch.clamp(ratio_value, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
+                        
+                        surr1_conf = ratio_conf * advantage
+                        surr2_conf = torch.clamp(ratio_conf, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
+                        
+                        # PPO objective: maximize min(ratio * advantage, clipped_ratio * advantage)  
+                        # For loss minimization: negate the objective
+                        ppo_loss = -torch.min(surr1_value, surr2_value) - torch.min(surr1_conf, surr2_conf)
+                        policy_loss += ppo_loss
+                        
+                        # FIXED: Compute entropy for ego robot only (accumulate properly)
+                        ego_entropy = ego_value_dist.entropy()
+                        agent_entropy_loss = -ego_entropy  # Negative because we want to maximize entropy
                 
-                # Track policy loss
+                # Track policy loss - ego robot influences all tracks in its ego-graph
                 if 'track' in policy_outputs and 'track' in experience.action:
                     track_policy = policy_outputs['track']
                     track_action = experience.action['track']
@@ -463,70 +561,75 @@ class PPOTrainer:
                     track_old_log_prob = experience.log_prob['track']
                     old_value_log_prob = track_old_log_prob['value']
                     old_conf_log_prob = track_old_log_prob['confidence']
-                    track_value = value_outputs['track']
                     
-                    # Compute new log prob using proper Beta distribution
-                    # Use the parameters directly from the policy output
-                    track_value_alpha = track_policy['value_alpha']
-                    track_value_beta = track_policy['value_beta']
-                    track_confidence = track_policy['confidence']  # Pre-computed confidence
-                    
-                    # Create distributions and compute log probabilities for value only
-                    value_dist = torch.distributions.Beta(track_value_alpha, track_value_beta)
-                    
-                    new_log_prob_value = value_dist.log_prob(track_action['value'].to(self.device)).sum()
-                    new_log_prob_conf = torch.zeros_like(new_log_prob_value)  # No sampling for confidence
-                    
-                    # PPO ratio using actual old probabilities (value only)
-                    ratio_value = torch.exp(new_log_prob_value - old_value_log_prob)
-                    ratio_conf = torch.tensor(1.0).to(self.device)  # No policy gradient for confidence
-                    
-                    # Skip experiences with extreme ratios for stability
-                    if torch.isnan(ratio_value) or torch.isnan(ratio_conf):
-                        continue
-                    elif (ratio_value > 5.0 or ratio_conf > 5.0 or 
-                          ratio_value < 0.2 or ratio_conf < 0.2):
-                        continue
-                    
-                    # PPO clipped objective - use proper GAE advantage
-                    advantage = shuffled_advantages[i]
-                    
-                    surr1_value = ratio_value * advantage
-                    surr2_value = torch.clamp(ratio_value, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
-                    
-                    surr1_conf = ratio_conf * advantage
-                    surr2_conf = torch.clamp(ratio_conf, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
-                    
-                    # PPO objective: maximize min(ratio * advantage, clipped_ratio * advantage)  
-                    # For loss minimization: negate the objective
-                    track_ppo_loss = -torch.min(surr1_value, surr2_value) - torch.min(surr1_conf, surr2_conf)
-                    policy_loss += track_ppo_loss
-                    
-                    # Improved value loss with clipping and better target handling
-                    return_target = shuffled_returns[i].item() if isinstance(shuffled_returns[i], torch.Tensor) else shuffled_returns[i]
-                    return_target_tensor = torch.tensor(return_target, device=self.device).float()
-                    
-                    # Get current values (handle multiple tracks)
-                    current_values = track_value.squeeze() if track_value.numel() > 0 else torch.tensor(0.0, device=self.device)
-                    
-                    # Expand target to match value shape
-                    if current_values.dim() > 0:
-                        return_target_tensor = return_target_tensor.expand_as(current_values)
-                    
-                    # Clipped value loss (similar to PPO's clipped objective but for values)
-                    value_loss_unclipped = F.mse_loss(current_values, return_target_tensor, reduction='none')
-                    
-                    # Add small regularization to prevent value explosion
-                    value_reg = 0.01 * torch.mean(current_values ** 2)
-                    value_loss += torch.mean(value_loss_unclipped) + value_reg
-                    
-                    # Compute actual policy entropy for exploration (value only)
-                    value_entropy = value_dist.entropy().sum()
-                    conf_entropy = torch.tensor(0.0).to(self.device)  # No entropy for deterministic confidence
-                    total_entropy = value_entropy + conf_entropy
-                    
-                    # Entropy loss (negative because we want to maximize entropy)
-                    entropy_loss = entropy_loss - total_entropy if isinstance(entropy_loss, torch.Tensor) else -total_entropy
+                    # FIXED: Ensure dimensions match
+                    if (track_policy['value_alpha'].shape[0] > 0 and
+                        track_action['value'].shape[0] == track_policy['value_alpha'].shape[0]):
+                        
+                        # Extract track policy parameters (all tracks in ego-graph)
+                        track_value_alpha = track_policy['value_alpha']
+                        track_value_beta = track_policy['value_beta']
+                        track_confidence = track_policy['confidence']
+                        
+                        # FIXED: Create distributions for all tracks in ego-graph
+                        track_value_dist = torch.distributions.Beta(track_value_alpha, track_value_beta)
+                        
+                        # FIXED: Compute log prob for all track actions (no incorrect .sum())
+                        new_log_prob_value = track_value_dist.log_prob(track_action['value'].to(self.device)).sum()
+                        new_log_prob_conf = torch.zeros_like(new_log_prob_value)
+                        
+                        # PPO ratio using actual old probabilities (value only)
+                        ratio_value = torch.exp(new_log_prob_value - old_value_log_prob)
+                        ratio_conf = torch.tensor(1.0).to(self.device)
+                        
+                        # Skip experiences with extreme ratios for stability
+                        if torch.isnan(ratio_value) or torch.isnan(ratio_conf):
+                            continue
+                        elif (ratio_value > 5.0 or ratio_conf > 5.0 or 
+                              ratio_value < 0.2 or ratio_conf < 0.2):
+                            continue
+                        
+                        # PPO clipped objective - use proper GAE advantage
+                        advantage = shuffled_advantages[i]
+                        
+                        surr1_value = ratio_value * advantage
+                        surr2_value = torch.clamp(ratio_value, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
+                        
+                        surr1_conf = ratio_conf * advantage
+                        surr2_conf = torch.clamp(ratio_conf, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
+                        
+                        # PPO objective: maximize min(ratio * advantage, clipped_ratio * advantage)  
+                        # For loss minimization: negate the objective
+                        track_ppo_loss = -torch.min(surr1_value, surr2_value) - torch.min(surr1_conf, surr2_conf)
+                        policy_loss += track_ppo_loss
+                        
+                        # FIXED: Compute entropy for all tracks in ego-graph (accumulate properly)
+                        track_entropy = track_value_dist.entropy().sum()  # Sum across all tracks in ego-graph
+                        track_entropy_loss = -track_entropy  # Negative because we want to maximize entropy
+                
+                # FIXED: Compute value loss only once per experience (centralized critic)
+                # Use centralized value for training (scalar)
+                return_target = shuffled_returns[i].item() if isinstance(shuffled_returns[i], torch.Tensor) else shuffled_returns[i]
+                return_target_tensor = torch.tensor(return_target, device=self.device).float()
+                
+                # Get current global value (scalar from centralized critic)
+                if isinstance(value_outputs, torch.Tensor):
+                    if value_outputs.numel() == 1:
+                        current_value = value_outputs
+                    else:
+                        current_value = value_outputs.mean()  # Fallback for old format
+                else:
+                    current_value = torch.tensor(0.0, device=self.device)
+                
+                # Value loss using scalar values (computed once per experience)
+                value_loss_unclipped = F.mse_loss(current_value, return_target_tensor)
+                
+                # Add small regularization
+                value_reg = 0.01 * current_value ** 2
+                value_loss += value_loss_unclipped + value_reg
+                
+                # FIXED: Combine agent and track entropy losses properly
+                total_entropy_loss = agent_entropy_loss + track_entropy_loss
                 
                 # Accumulate losses for this epoch (scalar accumulation to avoid deep graphs)
                 if isinstance(policy_loss, torch.Tensor) and policy_loss.numel() > 0:
@@ -541,10 +644,14 @@ class PPOTrainer:
                 elif value_loss != 0.0:
                     epoch_value_loss += torch.tensor(value_loss, device=self.device, requires_grad=True)
                     
-                if isinstance(entropy_loss, torch.Tensor) and entropy_loss.numel() > 0:
-                    epoch_entropy_loss += entropy_loss
-                elif entropy_loss != 0.0:
-                    epoch_entropy_loss += torch.tensor(entropy_loss, device=self.device, requires_grad=True)
+                # FIXED: Accumulate entropy loss properly (agent + track)
+                if isinstance(total_entropy_loss, torch.Tensor) and total_entropy_loss.numel() > 0:
+                    epoch_entropy_loss += total_entropy_loss
+                elif total_entropy_loss != 0.0:
+                    if isinstance(total_entropy_loss, (int, float)):
+                        epoch_entropy_loss += torch.tensor(total_entropy_loss, device=self.device, requires_grad=True)
+                    else:
+                        epoch_entropy_loss += total_entropy_loss
             
             # BATCH UPDATE: One optimizer step per epoch, not per experience
             if valid_experience_count > 0:

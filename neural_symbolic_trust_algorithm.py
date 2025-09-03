@@ -15,12 +15,10 @@ from typing import List, Dict, Optional
 from trust_algorithm import TrustAlgorithm, RobotState, Track
 
 
-class HeteroHybridConv(nn.Module):
+class HeteroGATConv(nn.Module):
     """
-    Proper heterogeneous convolution layer for multi-robot trust systems.
-    
-    Handles different node types (agents, tracks) with different edge relationships
-    using PyTorch Geometric's HeteroConv for proper heterogeneous graph processing.
+    Simplified heterogeneous GAT layer for multi-robot trust systems.
+    Uses GAT for all edge relationships instead of mixed conv types.
     """
     
     def __init__(self, node_types_channels: Dict[str, int], out_channels: int, heads: int = 4):
@@ -34,58 +32,36 @@ class HeteroHybridConv(nn.Module):
             ('track', 'in_fov_only_by', 'agent'),
         ]
         
-        # Create convolution dictionary for each edge type
+        # Create GAT convolution dictionary for each edge type
         conv_dict = {}
         for src_type, relation, dst_type in edge_types:
             src_dim = node_types_channels[src_type]
             
-            if 'observed' in relation:
-                # Use GAT for trust-based observation relationships
-                conv_dict[(src_type, relation, dst_type)] = GATConv(
-                    in_channels=src_dim,
-                    out_channels=out_channels // 2,
-                    heads=heads,
-                    concat=False,
-                    add_self_loops=False
-                )
-            else:
-                # Use SAGE for proximity relationships  
-                conv_dict[(src_type, relation, dst_type)] = SAGEConv(
-                    in_channels=src_dim,
-                    out_channels=out_channels // 2
-                )
+            # Use GAT for all edge relationships
+            conv_dict[(src_type, relation, dst_type)] = GATConv(
+                in_channels=src_dim,
+                out_channels=out_channels,
+                heads=heads,
+                concat=False,
+                add_self_loops=False,
+                dropout=0.1
+            )
         
         # Create the heterogeneous convolution
         self.hetero_conv = HeteroConv(conv_dict, aggr='mean')
-        
-        # Fusion layers for each node type to combine different edge types
-        self.fusion_layers = nn.ModuleDict()
-        for node_type in node_types_channels.keys():
-            self.fusion_layers[node_type] = nn.Sequential(
-                nn.Linear(out_channels // 2, out_channels),  # Adjust based on actual input
-                nn.ReLU(),
-                nn.Dropout(0.1)
-            )
     
     def forward(self, x_dict, edge_index_dict):
-        # Apply heterogeneous convolution
+        # Apply heterogeneous GAT convolution
         out_dict = self.hetero_conv(x_dict, edge_index_dict)
-        
-        # Apply fusion for each node type
-        for node_type in out_dict:
-            if node_type in self.fusion_layers:
-                out_dict[node_type] = self.fusion_layers[node_type](out_dict[node_type])
-        
         return out_dict
 
-class PPOTrustGNN(nn.Module):
+class SharedGNNEncoder(nn.Module):
     """
-    Standalone GNN for PPO that outputs action probabilities and values
-    instead of direct trust updates
+    Shared GNN encoder for both Actor and Critic in CTDE architecture
     """
     
     def __init__(self, agent_features: int, track_features: int, hidden_dim: int = 64):
-        super(PPOTrustGNN, self).__init__()
+        super(SharedGNNEncoder, self).__init__()
         
         self.hidden_dim = hidden_dim
         
@@ -93,22 +69,22 @@ class PPOTrustGNN(nn.Module):
         self.agent_embedding = Linear(agent_features, hidden_dim)
         self.track_embedding = Linear(track_features, hidden_dim)
         
-        # Use our new HeteroHybridConv layers for better heterogeneous graph processing
+        # Use GAT layers for all convolutions
         # Define node type channels for each layer
         initial_channels = {'agent': hidden_dim, 'track': hidden_dim}
         
-        # Layer 1: Initial feature processing with hybrid SAGE+GAT
-        self.conv1 = HeteroHybridConv(initial_channels, hidden_dim, heads=4)
+        # Layer 1: Initial feature processing with GAT
+        self.conv1 = HeteroGATConv(initial_channels, hidden_dim, heads=4)
         
-        # Layer 2: Deeper feature refinement
-        self.conv2 = HeteroHybridConv(
+        # Layer 2: Deeper feature refinement with GAT
+        self.conv2 = HeteroGATConv(
             {'agent': hidden_dim, 'track': hidden_dim}, 
             hidden_dim, 
             heads=4
         )
         
-        # Layer 3: Final feature processing before policy heads
-        self.conv3 = HeteroHybridConv(
+        # Layer 3: Final feature processing with GAT
+        self.conv3 = HeteroGATConv(
             {'agent': hidden_dim, 'track': hidden_dim}, 
             hidden_dim, 
             heads=4
@@ -127,76 +103,9 @@ class PPOTrustGNN(nn.Module):
             'agent': nn.BatchNorm1d(hidden_dim),
             'track': nn.BatchNorm1d(hidden_dim)
         })
-        
-        
-        # Enhanced value function heads with better architecture for stability
-        self.agent_value_function = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 4, 1)
-        )
-        self.track_value_function = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 4, 1)
-        )
-        
-        # Add value function regularization
-        self.value_regularization = nn.Parameter(torch.tensor(0.01))
-        
-        # Simplified policy heads - only learn trust value, confidence from Beta variance
-        self.agent_policy_value_alpha = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Softplus()  # Output > 0 for Beta distribution alpha parameter
-        )
-        self.agent_policy_value_beta = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Softplus()  # Output > 0 for Beta distribution beta parameter
-        )
-        self.track_policy_value_alpha = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Softplus()  # Output > 0 for Beta distribution alpha parameter
-        )
-        self.track_policy_value_beta = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Softplus()  # Output > 0 for Beta distribution beta parameter
-        )
-        
-    def forward(self, x_dict, edge_index_dict, return_features=False):
-        """Forward pass that returns both policy and value outputs"""
-        
+    
+    def forward(self, x_dict, edge_index_dict):
+        """Encode graph into node embeddings"""
         # Check if we have any tracks
         has_tracks = x_dict['track'].shape[0] > 0
         
@@ -257,53 +166,231 @@ class PPOTrustGNN(nn.Module):
             for key in x_dict_3
         }
         
-        if return_features:
-            return x_dict
+        return x_dict
+
+
+class TrustActor(nn.Module):
+    """
+    Decentralized Actor for MAPPO-EgoGraph
+    Uses ego-graph to produce trust update actions for the ego robot and its observed tracks
+    """
+    
+    def __init__(self, hidden_dim: int = 64):
+        super(TrustActor, self).__init__()
         
-        # Generate policy outputs (action probabilities)
+        # Policy heads for trust value updates (Beta distribution parameters)
+        self.agent_policy_value_alpha = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()  # Output > 0 for Beta distribution alpha parameter
+        )
+        self.agent_policy_value_beta = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()  # Output > 0 for Beta distribution beta parameter
+        )
+        self.track_policy_value_alpha = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()  # Output > 0 for Beta distribution alpha parameter
+        )
+        self.track_policy_value_beta = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softplus()  # Output > 0 for Beta distribution beta parameter
+        )
+    
+    def forward(self, node_embeddings):
+        """
+        Generate policy outputs from node embeddings
+        
+        Args:
+            node_embeddings: Dict of node embeddings from SharedGNNEncoder
+            
+        Returns:
+            policy_outputs: Dict containing action distributions
+        """
         policy_outputs = {}
-        value_outputs = {}
+        has_tracks = node_embeddings['track'].shape[0] > 0
         
-        if 'agent' in x_dict:
+        if 'agent' in node_embeddings:
             # PSM policy outputs: value_alpha, value_beta for trust updates
             # Clamp to reasonable ranges to prevent extreme Beta parameters
-            agent_policy_value_alpha = self.agent_policy_value_alpha(x_dict['agent']) + 1.0
-            agent_policy_value_beta = self.agent_policy_value_beta(x_dict['agent']) + 1.0
+            agent_policy_value_alpha = self.agent_policy_value_alpha(node_embeddings['agent']) + 1.0
+            agent_policy_value_beta = self.agent_policy_value_beta(node_embeddings['agent']) + 1.0
             
             # Calculate confidence as the mean of the Beta distribution: α/(α+β)
             agent_confidence = agent_policy_value_alpha / (agent_policy_value_alpha + agent_policy_value_beta)
-
-            # Value function: expected return with regularization
-            agent_values = self.agent_value_function(x_dict['agent'])
-            # Apply value regularization to reduce oscillations
-            agent_values = agent_values * (1.0 - self.value_regularization) + self.value_regularization * torch.tanh(agent_values)
             
             policy_outputs['agent'] = {
                 'value_alpha': agent_policy_value_alpha,
                 'value_beta': agent_policy_value_beta,
                 'confidence': agent_confidence
             }
-            value_outputs['agent'] = agent_values
         
-        if 'track' in x_dict and has_tracks:
+        if 'track' in node_embeddings and has_tracks:
             # PSM policy outputs: value_alpha, value_beta for trust updates
             # Clamp to reasonable ranges to prevent extreme Beta parameters
-            track_policy_value_alpha = self.track_policy_value_alpha(x_dict['track']) + 1.0
-            track_policy_value_beta = self.track_policy_value_beta(x_dict['track']) + 1.0
+            track_policy_value_alpha = self.track_policy_value_alpha(node_embeddings['track']) + 1.0
+            track_policy_value_beta = self.track_policy_value_beta(node_embeddings['track']) + 1.0
             
             # Calculate confidence as the mean of the Beta distribution: α/(α+β)
             track_confidence = track_policy_value_alpha / (track_policy_value_alpha + track_policy_value_beta)
-
-            track_values = self.track_value_function(x_dict['track'])
-            # Apply value regularization to reduce oscillations
-            track_values = track_values * (1.0 - self.value_regularization) + self.value_regularization * torch.tanh(track_values)
             
             policy_outputs['track'] = {
                 'value_alpha': track_policy_value_alpha,
                 'value_beta': track_policy_value_beta,
                 'confidence': track_confidence
             }
-            value_outputs['track'] = track_values
+        
+        return policy_outputs
+
+
+class TrustCritic(nn.Module):
+    """
+    Centralized Critic for MAPPO-EgoGraph
+    Uses global graph to produce a shared value function for all agents
+    """
+    
+    def __init__(self, hidden_dim: int = 64):
+        super(TrustCritic, self).__init__()
+        
+        # Value function heads - more sophisticated architecture for centralized critic
+        self.agent_value_function = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, 1)
+        )
+        self.track_value_function = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, 1)
+        )
+        
+        # Global value aggregation for permutation-invariant value function
+        self.global_value_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),  # Concat agent + track features
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        # Value function regularization
+        self.value_regularization = nn.Parameter(torch.tensor(0.01))
+    
+    def forward(self, node_embeddings):
+        """
+        Generate value outputs from global node embeddings
+        
+        Args:
+            node_embeddings: Dict of node embeddings from SharedGNNEncoder
+            
+        Returns:
+            value_outputs: Either scalar global value or dict of node values
+        """
+        has_tracks = node_embeddings['track'].shape[0] > 0
+        
+        # Compute global permutation-invariant value
+        agent_features = torch.mean(node_embeddings['agent'], dim=0, keepdim=True)  # [1, hidden_dim]
+        
+        if has_tracks:
+            track_features = torch.mean(node_embeddings['track'], dim=0, keepdim=True)  # [1, hidden_dim]
+        else:
+            # Create zero track features if no tracks
+            device = node_embeddings['agent'].device
+            track_features = torch.zeros(1, node_embeddings['agent'].shape[1], device=device)
+        
+        # Concatenate global features
+        global_features = torch.cat([agent_features, track_features], dim=1)  # [1, hidden_dim * 2]
+        
+        # Global value function (shared across all agents)
+        global_value = self.global_value_head(global_features).squeeze()  # Scalar
+        
+        # Apply value regularization
+        global_value = global_value * (1.0 - self.value_regularization) + self.value_regularization * torch.tanh(global_value)
+        
+        return global_value
+
+
+class PPOTrustGNN(nn.Module):
+    """
+    MAPPO-EgoGraph model with separate Actor and Critic for CTDE
+    """
+    
+    def __init__(self, agent_features: int, track_features: int, hidden_dim: int = 64):
+        super(PPOTrustGNN, self).__init__()
+        
+        # Shared GNN encoder for both actor and critic
+        self.encoder = SharedGNNEncoder(agent_features, track_features, hidden_dim)
+        
+        # Decentralized Actor (uses ego-graphs)
+        self.actor = TrustActor(hidden_dim)
+        
+        # Centralized Critic (uses global graph)
+        self.critic = TrustCritic(hidden_dim)
+        
+    def forward(self, x_dict, edge_index_dict, return_features=False, policy_only=False, value_only=False):
+        """
+        Forward pass using separate Actor and Critic components
+        
+        Args:
+            x_dict: Node features dictionary
+            edge_index_dict: Edge indices dictionary  
+            return_features: If True, return intermediate features
+            policy_only: If True, only compute policy outputs (for decentralized actor)
+            value_only: If True, only compute value outputs (for centralized critic)
+        """
+        
+        # Encode the graph using shared GNN encoder
+        node_embeddings = self.encoder(x_dict, edge_index_dict)
+        
+        if return_features:
+            return node_embeddings
+        
+        policy_outputs = {}
+        value_outputs = {}
+        
+        # Generate policy outputs using Actor (for decentralized execution)
+        if not value_only:
+            policy_outputs = self.actor(node_embeddings)
+        
+        # Generate value outputs using Critic (for centralized training)
+        if not policy_only:
+            # Critic returns a scalar global value
+            global_value = self.critic(node_embeddings)
+            value_outputs = global_value  # Single scalar value for all agents
         
         return policy_outputs, value_outputs
 

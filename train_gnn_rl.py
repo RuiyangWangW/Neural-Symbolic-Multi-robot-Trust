@@ -89,8 +89,10 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
     # print(f"Model parameters: {sum(p.numel() for p in ppo_model.parameters()):,}")
     
     # Training loop
-    print(f"Starting PPO training for {episodes} episodes on {device}")
-    print(f"Using multi-ego training mode (all robots serve as ego each timestep)")
+    print(f"Starting MAPPO-EgoGraph training for {episodes} episodes on {device}")
+    print(f"Using CTDE: Centralized Training, Decentralized Execution")
+    print(f"- Decentralized Actor: Each robot uses ego-graph (within comm range)")
+    print(f"- Centralized Critic: Uses global graph for value function")
     if enable_visualization:
         print(f"📊 Visualization enabled: Every {visualize_frequency} episodes at steps {visualize_steps}")
     else:
@@ -106,23 +108,33 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
         episode_reward = 0.0
         step_count = 0
         
-        # Collect experience for one episode
+        # Collect experience for one episode using MAPPO-EgoGraph with CTDE
         done = False
         while step_count < max_steps_per_episode:
-            # MULTI-EGO TRAINING: Get actions from each robot's ego perspective
+            # CTDE: Get global state for centralized critic and ego graphs for decentralized actors
+            global_state = state  # This is the global state from environment
             robots = env.sim_env.robots
             all_actions = []
             all_log_probs = []  
             all_values = []
+            all_ego_graphs = []
             
             for ego_robot in robots:
                 try:
-                    # Use the current state as ego state (contains all robots/tracks)
-                    ego_state = state
-                    ego_actions, ego_log_probs, ego_values = trainer.select_action(ego_state)
+                    # Build ego-graph for this robot (decentralized observation)
+                    ego_graph = env.build_ego_graph(ego_robot, global_state)
+                    if ego_graph is None:
+                        continue
+                        
+                    # Use CTDE: ego-graph for policy, global state for value
+                    ego_actions, ego_log_probs, ego_values = trainer.select_action_ego(
+                        ego_graph, global_state)
+                    
                     all_actions.append(ego_actions)
                     all_log_probs.append(ego_log_probs)
                     all_values.append(ego_values)
+                    all_ego_graphs.append(ego_graph)
+                    
                 except Exception as e:
                     print(f"Warning: Failed to get ego action for robot {ego_robot.id}: {e}")
                     continue
@@ -131,26 +143,28 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
             if enable_visualization and episode % visualize_frequency == 0 and step_count in visualize_steps:
                 try:
                     print(f"🎯 Visualizing GNN input graph - Episode {episode}, Step {step_count}")
-                    visualize_gnn_input(state, episode=episode, timestep=step_count, current_state=state)
+                    visualize_gnn_input(global_state, episode=episode, timestep=step_count, current_state=global_state)
                 except Exception as e:
                     print(f"⚠️ Warning: GNN visualization failed: {e}")
                     pass
             
-            # Take environment step with all ego actions
-            next_state, reward, done, info = env.step(all_actions, step_count)
+            # Take environment step with all ego actions  
+            # Pass the current global state to ensure temporal consistency
+            next_state, reward, done, info = env.step(all_actions, step_count, global_state)
             
-            # Store experience (including final step)
-            # Store experiences from all ego robots
+            # Store experiences from all ego robots with proper state-action association
             for i in range(len(all_actions)):
                 if i < len(all_actions) and i < len(all_log_probs) and i < len(all_values):
+                    # FIXED: Create experience with both ego-graph and global state for CTDE
                     experience = PPOExperience(
-                        graph_data=state,
-                        action=all_actions[i],
-                        reward=reward,  # Same reward for all ego robots
-                        log_prob=all_log_probs[i],
-                        value=all_values[i],
+                        graph_data=all_ego_graphs[i],  # Store ego-graph for policy updates
+                        action=all_actions[i],         # Action taken by this ego robot
+                        reward=reward,                 # Shared team reward
+                        log_prob=all_log_probs[i],     # Log prob from ego robot's policy
+                        value=all_values[i],           # Value from centralized critic
                         done=done,
-                        next_graph_data=next_state
+                        next_graph_data=next_state,    # Global next state for value bootstrapping
+                        global_graph_data=global_state # IMPORTANT: Current global state for centralized critic training
                     )
                     trainer.add_experience(experience)
             

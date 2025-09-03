@@ -149,14 +149,13 @@ class RLTrustEnvironment:
     
     
     def _get_current_state(self):
-        """Get current state with multi-robot track fusion (no single ego robot)"""
+        """Get current global state for centralized critic"""
         # Get all robots
         robots = self._get_robots_list()
         
         if not robots:
             return None
         
-        # Use all robots equally - no single ego robot
         # Step 1: Generate individual track lists for each robot
         individual_robot_tracks = self._generate_individual_robot_tracks(robots)
         
@@ -164,11 +163,48 @@ class RLTrustEnvironment:
         fused_tracks, individual_tracks, track_fusion_map = self._perform_track_fusion(
             robots, individual_robot_tracks)
         
-        # Step 3: Build graph with all tracks and proper edges
+        # Step 3: Build global graph with all tracks and proper edges
         graph_data = self._build_multi_robot_graph(
             robots, fused_tracks, individual_tracks, track_fusion_map)
         
         return graph_data
+    
+    def build_ego_graph(self, ego_robot, global_state=None):
+        """Build ego-graph for a specific robot containing only local observations within comm range"""
+        robots = self._get_robots_list()
+        
+        if ego_robot not in robots or not robots:
+            return None
+            
+        # Step 1: Find proximal robots within communication range
+        proximal_robots = [ego_robot]  # Always include ego robot
+        for robot in robots:
+            if robot.id != ego_robot.id:
+                # Check if robot is within communication range
+                distance = np.linalg.norm(np.array(ego_robot.position) - np.array(robot.position))
+                if distance <= self.proximal_range:
+                    proximal_robots.append(robot)
+        
+        # Step 2: Get tracks only from proximal robots (ego + proximal)
+        proximal_robot_tracks = {}
+        for robot in proximal_robots:
+            robot_tracks = robot.get_all_current_tracks()
+            proximal_robot_tracks[robot.id] = robot_tracks
+        
+        # Step 3: Perform track fusion only among proximal robots
+        fused_tracks, individual_tracks, track_fusion_map = self._perform_track_fusion(
+            proximal_robots, proximal_robot_tracks)
+        
+        # Step 4: Build ego-graph with only proximal robots and their tracks
+        ego_graph_data = self._build_multi_robot_graph(
+            proximal_robots, fused_tracks, individual_tracks, track_fusion_map)
+        
+        # Mark this as an ego-graph
+        ego_graph_data._is_ego_graph = True
+        ego_graph_data._ego_robot_id = ego_robot.id
+        ego_graph_data._proximal_robots = proximal_robots
+        
+        return ego_graph_data
     
     def _generate_individual_robot_tracks(self, robots):
         """Generate individual track lists for each robot using Robot.get_all_tracks()"""
@@ -457,19 +493,33 @@ class RLTrustEnvironment:
         """Determine if track is in robot's field of view using Robot's built-in method"""
         return robot.is_in_fov(track.position)  # Use Robot class's is_in_fov method
    
-    def step(self, all_actions, step_count):
-        """Apply all actions from multi-ego training to the environment"""
+    def step(self, all_actions, step_count, current_global_state=None):
+        """
+        Apply all actions from MAPPO-EgoGraph training to the environment
         
-        # Get current state BEFORE applying updates
-        current_state = self._get_current_state()
+        Args:
+            all_actions: List of actions from each robot's ego-graph policy
+            step_count: Current step count
+            current_global_state: The global state that was used to generate actions (for consistency)
+        
+        Returns:
+            next_state, reward, done, info
+        """
         self.step_count = step_count
+        
+        # Use the provided global state for consistency, or get current state
+        if current_global_state is not None:
+            reference_state = current_global_state
+        else:
+            reference_state = self._get_current_state()
 
         # Clear accumulated updates for this step
         self.accumulated_robot_updates.clear()
         self.accumulated_track_updates.clear()
         
-        # Apply actions from all ego robots
-        if all_actions and current_state:
+        # IMPORTANT: Apply trust updates BEFORE simulation step
+        # This ensures actions are applied to the same state they were generated from
+        if all_actions and reference_state:
             robots = self._get_robots_list()
             
             for i, ego_actions in enumerate(all_actions):
@@ -477,24 +527,24 @@ class RLTrustEnvironment:
                     ego_robot_id = robots[i].id
                     try:
                         # Accumulate trust updates from this ego robot's actions
-                        self._accumulate_trust_updates(ego_actions, current_state, ego_robot_id)
+                        self._accumulate_trust_updates(ego_actions, reference_state, ego_robot_id)
                     except Exception as e:
                         print(f"Error applying actions for ego robot {ego_robot_id}: {e}")
                         continue
             
-            # Apply all accumulated updates at once
+            # Apply all accumulated trust updates at once
             self._apply_accumulated_trust_updates()
 
+        # Now advance simulation to get next physical state
         np.random.seed(42 + self.step_count)  # Different seed per step, but deterministic
         random.seed(42 + self.step_count)
             
-        # Advance simulation FIRST
         self.sim_env.step() 
 
         for robot in self.sim_env.robots:
             robot.update_current_timestep_tracks()
             
-        # Get final state after all updates applied
+        # Get next state after simulation advancement
         next_state = self._get_current_state()
         
         # Prepare simulation step data - no single ego robot  
@@ -510,8 +560,8 @@ class RLTrustEnvironment:
         
         # Store current trust distributions for reward computation
         current_trust_distributions = {}
-        if hasattr(current_state, '_current_robots'):
-            for robot in current_state._current_robots:
+        if hasattr(reference_state, '_current_robots'):
+            for robot in reference_state._current_robots:
                 # Use Robot's trust_value property (same as paper_trust_algorithm.py)
                 trust_value = robot.trust_value
                 current_trust_distributions[robot.id] = {
@@ -530,7 +580,6 @@ class RLTrustEnvironment:
                 num_objects == 0 or
                 self.step_count >= self.max_steps_per_episode-1)
         reward = self._compute_sparse_reward(next_state, simulation_step_data, done)
-
         return next_state, reward, done, {
             'step_count': self.step_count,
             'num_robots': num_robots,
