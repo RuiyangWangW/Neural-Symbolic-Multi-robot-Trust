@@ -12,8 +12,10 @@ import matplotlib.pyplot as plt
 import time
 from collections import defaultdict
 
-from train_gnn_rl import PPOTrustGNN, PPOTrainer, RLTrustEnvironment
-from neural_symbolic_trust_algorithm import PPOTrustGNN as NeuralPPOTrustGNN, NeuralSymbolicTrustAlgorithm
+# Updated imports for new MAPPO-EgoGraph model
+from neural_symbolic_trust_algorithm import PPOTrustGNN
+from ppo_trainer import PPOTrainer
+from rl_trust_environment import RLTrustEnvironment
 from paper_trust_algorithm import PaperTrustAlgorithm
 from simulation_environment import SimulationEnvironment
 
@@ -24,18 +26,15 @@ class SimpleTrustComparison:
     def __init__(self, model_path='ppo_trust_gnn.pth'):
         self.model_path = model_path
         
-        # Load RL model with correct architecture (7 track features: 5 predicates + alpha + beta)
+        # Load RL model with correct MAPPO-EgoGraph architecture
         checkpoint = torch.load(self.model_path, map_location='cpu', weights_only=False)
         self.rl_model = PPOTrustGNN(agent_features=6, track_features=7, hidden_dim=64)
         self.rl_trainer = PPOTrainer(self.rl_model, device=torch.device('cpu'))
         self.rl_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        print(f"✅ Loaded RL model: Episode {checkpoint['episode']}, Best reward: {checkpoint['best_reward']:.2f}")
+        print(f"✅ Loaded MAPPO-EgoGraph model: Episode {checkpoint['episode']}, Best reward: {checkpoint['best_reward']:.2f}")
         
         # Paper algorithm
         self.paper_algo = PaperTrustAlgorithm()
-        
-        # RL algorithm wrapper (not actually used, but kept for compatibility)
-        self.rl_algo = NeuralSymbolicTrustAlgorithm(learning_mode=False)
         
         # Set model to evaluation mode
         self.rl_model.eval()
@@ -90,27 +89,39 @@ class SimpleTrustComparison:
             # Step BOTH simulations independently
             paper_step_data = paper_sim_env.step()
             
-            # === RL ALGORITHM ===
-            # Use RLTrustEnvironment correctly - get state, select actions, apply them
+            # === RL ALGORITHM (MAPPO-EgoGraph) ===
             try:
-                # Get current RL state using the environment's built-in method
-                all_actions = []
-                rl_state = rl_trust_env._get_current_state()
+                # Get global state for centralized value function
+                global_state = rl_trust_env._get_current_state()
                 robots = rl_trust_env.sim_env.robots
+                all_actions = []
+                
+                # For each robot, build ego-graph and select actions
                 for ego_robot in robots:
                     try:
-                        # Use the current state as ego state (contains all robots/tracks)
-                        ego_state = rl_state
-                        ego_actions, _, _ = self.rl_trainer.select_action(ego_state)
+                        # Build ego-graph for this robot (MAPPO-EgoGraph approach)
+                        ego_graph = rl_trust_env.build_ego_graph(ego_robot, global_state)
+                        if ego_graph is None:
+                            continue
+                        
+                        # Use CTDE: ego-graph for policy, global state for value
+                        ego_actions, _, _ = self.rl_trainer.select_action_ego(ego_graph, global_state, deterministic=True)
                         all_actions.append(ego_actions)
+                        
                     except Exception as e:
                         print(f"Warning: Failed to get ego action for robot {ego_robot.id}: {e}")
                         continue
-                _, _, _, _ = rl_trust_env.step(all_actions, step)
+                
+                # Apply actions to environment
+                if all_actions:
+                    _, _, _, _ = rl_trust_env.step(all_actions, step, global_state)
+                
+                # Extract updated trust values
                 rl_robot_trusts = {r.id: {'alpha': r.trust_alpha, 'beta': r.trust_beta} for r in rl_trust_env.sim_env.robots}
                 rl_robot_states = {r.id: r for r in rl_trust_env.sim_env.robots}
+                
             except Exception as e:
-                print(f"RL algorithm error: {e}")
+                print(f"MAPPO-EgoGraph algorithm error: {e}")
                 # Fallback to small increment
                 rl_robot_states = {r.id: r for r in rl_trust_env.sim_env.robots}
                 for robot_id in rl_robot_states.keys():
