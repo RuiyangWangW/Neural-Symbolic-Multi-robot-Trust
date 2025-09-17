@@ -517,6 +517,9 @@ class RLTrustEnvironment:
         self.accumulated_robot_updates.clear()
         self.accumulated_track_updates.clear()
         
+        # FIXED: Store current trust distributions BEFORE applying actions for reward computation
+        self._store_previous_trust_distributions()
+        
         # IMPORTANT: Apply trust updates BEFORE simulation step
         # This ensures actions are applied to the same state they were generated from
         if all_actions and reference_state:
@@ -592,6 +595,30 @@ class RLTrustEnvironment:
             }
         }
     
+    def _store_previous_trust_distributions(self):
+        """Store current trust distributions for reward computation comparison"""
+        if not hasattr(self, '_previous_trust_distributions'):
+            self._previous_trust_distributions = {}
+        
+        # Store robot trust distributions
+        robots = self._get_robots_list()
+        for robot in robots:
+            self._previous_trust_distributions[robot.id] = {
+                'alpha': robot.trust_alpha,
+                'beta': robot.trust_beta
+            }
+        
+        # Store track trust distributions from all robots
+        current_tracks = []
+        for robot in robots:
+            current_tracks.extend(robot.get_all_tracks())
+        
+        for track in current_tracks:
+            self._previous_trust_distributions[f"track_{track.track_id}"] = {
+                'alpha': track.trust_alpha,
+                'beta': track.trust_beta
+            }
+    
     def _accumulate_trust_updates(self, actions, robot_state, robot_id):
         """Accumulate trust updates from this robot's perspective (don't apply yet)"""
         if not actions or not robot_state:
@@ -603,12 +630,21 @@ class RLTrustEnvironment:
             
             for robot_id, node_idx in robot_state.agent_nodes.items():
                 if node_idx < agent_actions['value'].shape[0]:
-                    # Convert GNN action to PSM updates
+                    # Convert GNN action to PSM updates with proper evidence direction
                     psm_value = agent_actions['value'][node_idx].item()
-                    psm_confidence = agent_actions['confidence'][node_idx].item()
                     
-                    delta_alpha = psm_confidence * psm_value 
-                    delta_beta = psm_confidence * (1.0 - psm_value)
+                    # Use fixed confidence of 1.0 or derive from value distribution
+                    psm_confidence = 1.0  # Fixed confidence for simplified PSM
+                    
+                    # FIXED: Evidence direction based on trust value, amount based on confidence
+                    if psm_value > 0.5:
+                        # Positive evidence (trustworthy)
+                        delta_alpha = psm_confidence
+                        delta_beta = 0.0
+                    else:
+                        # Negative evidence (untrustworthy)
+                        delta_alpha = 0.0
+                        delta_beta = psm_confidence
                     
                     # Store update from this robot's perspective
                     if robot_id not in self.accumulated_robot_updates:
@@ -622,12 +658,21 @@ class RLTrustEnvironment:
             
             for track_id, node_idx in robot_state.track_nodes.items():
                 if node_idx < track_actions['value'].shape[0]:
-                    # Convert GNN action to PSM updates
+                    # Convert GNN action to PSM updates with proper evidence direction
                     psm_value = track_actions['value'][node_idx].item()
-                    psm_confidence = track_actions['confidence'][node_idx].item()
                     
-                    delta_alpha = psm_confidence * psm_value 
-                    delta_beta = psm_confidence * (1.0 - psm_value)
+                    # Use fixed confidence of 1.0 or derive from value distribution
+                    psm_confidence = 1.0  # Fixed confidence for simplified PSM
+                    
+                    # FIXED: Evidence direction based on trust value, amount based on confidence
+                    if psm_value > 0.5:
+                        # Positive evidence (trustworthy)
+                        delta_alpha = psm_confidence
+                        delta_beta = 0.0
+                    else:
+                        # Negative evidence (untrustworthy)
+                        delta_alpha = 0.0
+                        delta_beta = psm_confidence
                     
                     # Store update from this robot's perspective
                     if track_id not in self.accumulated_track_updates:
@@ -1066,23 +1111,7 @@ class RLTrustEnvironment:
                     degradation = current_distance - prev_distance
                     direction_reward -= degradation * 0.2
         
-        # Store current trust distributions for next step comparison
-        if not hasattr(self, '_previous_trust_distributions'):
-            self._previous_trust_distributions = {}
-        
-        # Store robot trust distributions
-        for robot in all_robots:
-            self._previous_trust_distributions[robot.id] = {
-                'alpha': robot.trust_alpha,
-                'beta': robot.trust_beta
-            }
-        
-        # Store track trust distributions
-        for track in current_tracks:
-            self._previous_trust_distributions[f"track_{track.track_id}"] = {
-                'alpha': track.trust_alpha,
-                'beta': track.trust_beta
-            }
+        # Previous trust distributions now stored at beginning of step() method
         
         return direction_reward
     

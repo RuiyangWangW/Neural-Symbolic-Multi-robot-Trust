@@ -871,7 +871,7 @@ def compare_embeddings_over_episode_steps(model_path: str, device: str = 'auto',
                 # Use trained model to select actions
                 from ppo_trainer import PPOTrainer
                 trainer = PPOTrainer(trained_model, device=device)
-                actions, _, _ = trainer.select_action(current_state, deterministic=False)
+                actions, _, _ = trainer.select_action_ego(current_state, current_state, deterministic=False)
                 
                 
                 # Step environment

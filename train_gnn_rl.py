@@ -110,7 +110,8 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
         
         # Collect experience for one episode using MAPPO-EgoGraph with CTDE
         done = False
-        while step_count < max_steps_per_episode:
+        while step_count < max_steps_per_episode and not done:
+            print(f"Episode {episode} | Step {step_count}", end='\r')
             # CTDE: Get global state for centralized critic and ego graphs for decentralized actors
             global_state = state  # This is the global state from environment
             robots = env.sim_env.robots
@@ -119,6 +120,14 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
             all_values = []
             all_ego_graphs = []
             
+            # PERFORMANCE FIX: Compute global value ONCE per timestep for centralized critic
+            with torch.no_grad():
+                global_x_dict = {k: v.to(trainer.device) for k, v in global_state.x_dict.items()}
+                global_edge_index_dict = trainer._ensure_edge_types(global_state)
+                
+                # Single forward pass for centralized critic
+                _, shared_global_value = trainer.model(global_x_dict, global_edge_index_dict, value_only=True)
+            
             for ego_robot in robots:
                 try:
                     # Build ego-graph for this robot (decentralized observation)
@@ -126,13 +135,13 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
                     if ego_graph is None:
                         continue
                         
-                    # Use CTDE: ego-graph for policy, global state for value
-                    ego_actions, ego_log_probs, ego_values = trainer.select_action_ego(
-                        ego_graph, global_state)
+                    # Use CTDE: ego-graph for policy, shared global value for critic
+                    ego_actions, ego_log_probs = trainer.select_action_ego_optimized(
+                        ego_graph, shared_global_value)
                     
                     all_actions.append(ego_actions)
                     all_log_probs.append(ego_log_probs)
-                    all_values.append(ego_values)
+                    all_values.append(shared_global_value)  # Reuse computed global value
                     all_ego_graphs.append(ego_graph)
                     
                 except Exception as e:
@@ -154,19 +163,18 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
             
             # Store experiences from all ego robots with proper state-action association
             for i in range(len(all_actions)):
-                if i < len(all_actions) and i < len(all_log_probs) and i < len(all_values):
-                    # FIXED: Create experience with both ego-graph and global state for CTDE
-                    experience = PPOExperience(
-                        graph_data=all_ego_graphs[i],  # Store ego-graph for policy updates
-                        action=all_actions[i],         # Action taken by this ego robot
-                        reward=reward,                 # Shared team reward
-                        log_prob=all_log_probs[i],     # Log prob from ego robot's policy
-                        value=all_values[i],           # Value from centralized critic
-                        done=done,
-                        next_graph_data=next_state,    # Global next state for value bootstrapping
-                        global_graph_data=global_state # IMPORTANT: Current global state for centralized critic training
-                    )
-                    trainer.add_experience(experience)
+                # FIXED: Create experience with both ego-graph and global state for CTDE
+                experience = PPOExperience(
+                    graph_data=all_ego_graphs[i],  # Store ego-graph for policy updates
+                    action=all_actions[i],         # Action taken by this ego robot
+                    reward=reward,                 # Shared team reward
+                    log_prob=all_log_probs[i],     # Log prob from ego robot's policy
+                    value=all_values[i],           # Value from centralized critic
+                    done=done,
+                    next_graph_data=next_state,    # Global next state for value bootstrapping
+                    global_graph_data=global_state # IMPORTANT: Current global state for centralized critic training
+                )
+                trainer.add_experience(experience)
             
             episode_reward += reward
             step_count += 1
@@ -175,8 +183,8 @@ def train_gnn_with_ppo(episodes=1000, max_steps_per_episode=100, device='cpu', s
         # Finish the episode
         trainer.finish_episode()
         
-        # Update policy when we have enough episodes collected
-        losses = trainer.update_policy()  # This handles the min_episodes check internally
+        # Update policy when we have enough episodes collected - PERFORMANCE FIX: faster updates
+        losses = trainer.update_policy(min_experiences=100, n_epochs=3)  # Reduced for faster training
         
         episode_rewards.append(episode_reward)
         

@@ -39,7 +39,7 @@ class PPOTrainer:
         self.eps_clip = 0.2  # PPO clipping parameter
         self.gamma = 0.99    # Discount factor
         self.lam = 0.95      # GAE lambda
-        self.value_coef = 1.0  # Value function loss coefficient
+        self.value_coef = 2.0  # Increased value function loss coefficient for faster learning
         self.entropy_coef = 0.02  # Higher entropy for better exploration during learning 
         
         # Single unified optimizer for better stability
@@ -104,21 +104,18 @@ class PPOTrainer:
                     ego_value_action = torch.distributions.Beta(ego_value_alpha, ego_value_beta).sample()
                 
                 actions['agent'] = {
-                    'value': ego_value_action.unsqueeze(0),  # Keep batch dimension
-                    'confidence': ego_confidence.unsqueeze(0)
+                    'value': ego_value_action.unsqueeze(0)  # Keep batch dimension, remove confidence
                 }
                 
                 # Compute log probabilities
                 if deterministic:
                     log_probs['agent'] = {
-                        'value': torch.zeros_like(ego_value_action),
-                        'confidence': torch.zeros_like(ego_confidence)
+                        'value': torch.zeros_like(ego_value_action)
                     }
                 else:
                     value_dist = torch.distributions.Beta(ego_value_alpha, ego_value_beta)
                     log_probs['agent'] = {
-                        'value': value_dist.log_prob(ego_value_action),
-                        'confidence': torch.zeros_like(ego_confidence)
+                        'value': value_dist.log_prob(ego_value_action)
                     }
             
             # For tracks, include all tracks in ego-graph
@@ -135,20 +132,17 @@ class PPOTrainer:
                     track_value_action = torch.distributions.Beta(track_value_alpha, track_value_beta).sample()
                 
                 actions['track'] = {
-                    'value': track_value_action,
-                    'confidence': track_confidence
+                    'value': track_value_action  # Remove confidence
                 }
                 
                 if deterministic:
                     log_probs['track'] = {
-                        'value': torch.zeros_like(track_value_action),
-                        'confidence': torch.zeros_like(track_confidence)
+                        'value': torch.zeros_like(track_value_action)
                     }
                 else:
                     track_value_dist = torch.distributions.Beta(track_value_alpha, track_value_beta)
                     log_probs['track'] = {
-                        'value': track_value_dist.log_prob(track_value_action).sum(),
-                        'confidence': torch.zeros_like(track_confidence)
+                        'value': track_value_dist.log_prob(track_value_action).sum()
                     }
             
             # Use centralized critic value (from global state)
@@ -333,11 +327,13 @@ class PPOTrainer:
         self._update_count += 1
         
         # Debug: Print advantage and return statistics every few updates
-        if self._update_count % 10 == 0:
+        if self._update_count % 5 == 0:  # More frequent debugging
             print(f"   [DEBUG] CORRECTED GAE: Timesteps={len(timestep_groups)}, Robots/timestep={num_robots}")
             print(f"   [DEBUG] Advantages: mean={advantages.mean():.4f}, std={advantages.std():.4f}")
-            print(f"   [DEBUG] Returns: mean={returns.mean():.2f}, std={returns.std():.2f}, range=[{returns.min():.1f}, {returns.max():.1f}]")
+            print(f"   [DEBUG] Returns: mean={returns.mean():.4f}, std={returns.std():.4f}, range=[{returns.min():.4f}, {returns.max():.4f}]")
             print(f"   [DEBUG] Raw rewards: {[exp.reward for exp in experiences[:3]]}...")
+            print(f"   [DEBUG] Timestep values: {[timestep_values[i] for i in range(min(3, len(timestep_values)))]}")
+            print(f"   [DEBUG] Value prediction vs returns mismatch: {abs(returns.mean() - 0.4):.4f}")
         
         return advantages, returns
     
@@ -443,10 +439,17 @@ class PPOTrainer:
             shuffled_advantages = []
             shuffled_returns = []
             
+            # Pre-compute episode start/end indices for original order
+            episode_boundaries = []
+            start_idx = 0
+            for episode in self.episode_experiences:
+                end_idx = start_idx + len(episode)
+                episode_boundaries.append((start_idx, end_idx))
+                start_idx = end_idx
+            
             for episode_idx in episode_indices:
                 episode = self.episode_experiences[episode_idx]
-                episode_start = sum(len(self.episode_experiences[i]) for i in range(episode_idx))
-                episode_end = episode_start + len(episode)
+                episode_start, episode_end = episode_boundaries[episode_idx]
                 
                 shuffled_experiences.extend(episode)
                 shuffled_advantages.extend(advantages[episode_start:episode_end])
@@ -457,6 +460,9 @@ class PPOTrainer:
             epoch_value_loss = 0.0
             epoch_entropy_loss = 0.0
             valid_experience_count = 0
+            
+            # Estimate robots per timestep for proper value loss computation
+            num_robots = self._estimate_robots_per_timestep(shuffled_experiences)
             
             for i, experience in enumerate(shuffled_experiences):
                 # FIXED: Use ego-graph for policy, global graph for value (CTDE)
@@ -495,9 +501,6 @@ class PPOTrainer:
                     # Use actual stored log probabilities for PPO ratio calculation
                     agent_old_log_prob = experience.log_prob['agent']
                     old_value_log_prob = agent_old_log_prob['value']
-                    old_conf_log_prob = agent_old_log_prob['confidence']
-                    # Use the centralized global value (scalar)
-                    agent_value = value_outputs
                     
                     # FIXED: Find ego robot in the ego-graph (same logic as in select_action_ego)
                     ego_robot_id = experience.graph_data._ego_robot_id
@@ -515,24 +518,20 @@ class PPOTrainer:
                         # FIXED: Extract ego robot's parameters only
                         ego_value_alpha = agent_policy['value_alpha'][ego_agent_idx]
                         ego_value_beta = agent_policy['value_beta'][ego_agent_idx]
-                        ego_confidence = agent_policy['confidence'][ego_agent_idx]
                         
                         # FIXED: Create distribution from ego robot's parameters only
                         ego_value_dist = torch.distributions.Beta(ego_value_alpha, ego_value_beta)
                         
                         # FIXED: Compute log prob for ego robot's action only (no .sum() needed)
                         new_log_prob_value = ego_value_dist.log_prob(agent_action['value'].to(self.device))
-                        new_log_prob_conf = torch.zeros_like(new_log_prob_value)  # No sampling for confidence
                         
                         # PPO ratio using actual old probabilities (value only)
                         ratio_value = torch.exp(new_log_prob_value - old_value_log_prob)
-                        ratio_conf = torch.tensor(1.0).to(self.device)  # No policy gradient for confidence
                         
                         # Skip experiences with extreme ratios for stability
-                        if torch.isnan(ratio_value) or torch.isnan(ratio_conf):
+                        if torch.isnan(ratio_value):
                             continue
-                        elif (ratio_value > 5.0 or ratio_conf > 5.0 or 
-                              ratio_value < 0.2 or ratio_conf < 0.2):
+                        elif (ratio_value > 5.0 or ratio_value < 0.2):
                             continue
                         
                         # PPO clipped objective - use proper GAE advantage
@@ -541,12 +540,9 @@ class PPOTrainer:
                         surr1_value = ratio_value * advantage
                         surr2_value = torch.clamp(ratio_value, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
                         
-                        surr1_conf = ratio_conf * advantage
-                        surr2_conf = torch.clamp(ratio_conf, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
-                        
                         # PPO objective: maximize min(ratio * advantage, clipped_ratio * advantage)  
                         # For loss minimization: negate the objective
-                        ppo_loss = -torch.min(surr1_value, surr2_value) - torch.min(surr1_conf, surr2_conf)
+                        ppo_loss = -torch.min(surr1_value, surr2_value)
                         policy_loss += ppo_loss
                         
                         # FIXED: Compute entropy for ego robot only (accumulate properly)
@@ -560,7 +556,6 @@ class PPOTrainer:
                     # Use actual stored log probabilities for PPO ratio calculation
                     track_old_log_prob = experience.log_prob['track']
                     old_value_log_prob = track_old_log_prob['value']
-                    old_conf_log_prob = track_old_log_prob['confidence']
                     
                     # FIXED: Ensure dimensions match
                     if (track_policy['value_alpha'].shape[0] > 0 and
@@ -569,24 +564,20 @@ class PPOTrainer:
                         # Extract track policy parameters (all tracks in ego-graph)
                         track_value_alpha = track_policy['value_alpha']
                         track_value_beta = track_policy['value_beta']
-                        track_confidence = track_policy['confidence']
                         
                         # FIXED: Create distributions for all tracks in ego-graph
                         track_value_dist = torch.distributions.Beta(track_value_alpha, track_value_beta)
                         
                         # FIXED: Compute log prob for all track actions (no incorrect .sum())
                         new_log_prob_value = track_value_dist.log_prob(track_action['value'].to(self.device)).sum()
-                        new_log_prob_conf = torch.zeros_like(new_log_prob_value)
                         
                         # PPO ratio using actual old probabilities (value only)
                         ratio_value = torch.exp(new_log_prob_value - old_value_log_prob)
-                        ratio_conf = torch.tensor(1.0).to(self.device)
                         
                         # Skip experiences with extreme ratios for stability
-                        if torch.isnan(ratio_value) or torch.isnan(ratio_conf):
+                        if torch.isnan(ratio_value):
                             continue
-                        elif (ratio_value > 5.0 or ratio_conf > 5.0 or 
-                              ratio_value < 0.2 or ratio_conf < 0.2):
+                        elif (ratio_value > 5.0 or ratio_value < 0.2):
                             continue
                         
                         # PPO clipped objective - use proper GAE advantage
@@ -595,38 +586,39 @@ class PPOTrainer:
                         surr1_value = ratio_value * advantage
                         surr2_value = torch.clamp(ratio_value, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
                         
-                        surr1_conf = ratio_conf * advantage
-                        surr2_conf = torch.clamp(ratio_conf, 1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantage
-                        
                         # PPO objective: maximize min(ratio * advantage, clipped_ratio * advantage)  
                         # For loss minimization: negate the objective
-                        track_ppo_loss = -torch.min(surr1_value, surr2_value) - torch.min(surr1_conf, surr2_conf)
+                        track_ppo_loss = -torch.min(surr1_value, surr2_value)
                         policy_loss += track_ppo_loss
                         
                         # FIXED: Compute entropy for all tracks in ego-graph (accumulate properly)
                         track_entropy = track_value_dist.entropy().sum()  # Sum across all tracks in ego-graph
                         track_entropy_loss = -track_entropy  # Negative because we want to maximize entropy
                 
-                # FIXED: Compute value loss only once per experience (centralized critic)
-                # Use centralized value for training (scalar)
-                return_target = shuffled_returns[i].item() if isinstance(shuffled_returns[i], torch.Tensor) else shuffled_returns[i]
-                return_target_tensor = torch.tensor(return_target, device=self.device).float()
+                # FIXED: Compute value loss only once per timestep (centralized critic)
+                # Only compute for first robot in each timestep to avoid redundant computation
+                is_first_robot_in_timestep = (i % num_robots == 0)
                 
-                # Get current global value (scalar from centralized critic)
-                if isinstance(value_outputs, torch.Tensor):
-                    if value_outputs.numel() == 1:
-                        current_value = value_outputs
+                if is_first_robot_in_timestep:
+                    # Use centralized value for training (scalar)
+                    return_target = shuffled_returns[i].item() if isinstance(shuffled_returns[i], torch.Tensor) else shuffled_returns[i]
+                    return_target_tensor = torch.tensor(return_target, device=self.device).float()
+                    
+                    # Get current global value (scalar from centralized critic)
+                    if isinstance(value_outputs, torch.Tensor):
+                        if value_outputs.numel() == 1:
+                            current_value = value_outputs
+                        else:
+                            current_value = value_outputs.mean()  # Fallback for old format
                     else:
-                        current_value = value_outputs.mean()  # Fallback for old format
-                else:
-                    current_value = torch.tensor(0.0, device=self.device)
-                
-                # Value loss using scalar values (computed once per experience)
-                value_loss_unclipped = F.mse_loss(current_value, return_target_tensor)
-                
-                # Add small regularization
-                value_reg = 0.01 * current_value ** 2
-                value_loss += value_loss_unclipped + value_reg
+                        current_value = torch.tensor(0.0, device=self.device)
+                    
+                    # Value loss using scalar values (computed once per timestep)
+                    value_loss_unclipped = F.mse_loss(current_value, return_target_tensor)
+                    
+                    # Add small regularization
+                    value_reg = 0.01 * current_value ** 2
+                    value_loss += value_loss_unclipped + value_reg
                 
                 # FIXED: Combine agent and track entropy losses properly
                 total_entropy_loss = agent_entropy_loss + track_entropy_loss
@@ -685,8 +677,8 @@ class PPOTrainer:
             total_loss = total_policy_loss + self.value_coef * total_value_loss + self.entropy_coef * total_entropy_loss
             
             
-            # Keep some recent episodes for continued learning, but limit buffer size
-            max_buffer_episodes = 20  # Keep last 20 episodes for better learning accumulation
+            # Keep some recent episodes for continued learning, but limit buffer size - PERFORMANCE FIX
+            max_buffer_episodes = 10  # Reduced from 20 to 10 for faster processing
             if len(self.episode_experiences) > max_buffer_episodes:
                 # Remove oldest episodes to maintain buffer size
                 episodes_to_remove = len(self.episode_experiences) - max_buffer_episodes
@@ -703,3 +695,73 @@ class PPOTrainer:
         
         # If no policy losses were computed, return empty
         return {}
+    
+    def select_action_ego_optimized(self, ego_graph_data, shared_global_value):
+        """
+        Optimized ego action selection that reuses pre-computed global value
+        Note: shared_global_value parameter reserved for future optimization
+        """
+        self.model.eval()
+        
+        with torch.no_grad():
+            # Use ego-graph for policy (decentralized actor) - only policy forward pass needed
+            x_dict = {k: v.to(self.device) for k, v in ego_graph_data.x_dict.items()}
+            edge_index_dict = self._ensure_edge_types(ego_graph_data)
+            
+            # Forward pass for policy using ego-graph (decentralized actor)
+            policy_outputs, _ = self.model(x_dict, edge_index_dict, policy_only=True)
+            
+            actions = {}
+            log_probs = {}
+            
+            # Find ego robot in the ego-graph (should be the first agent)
+            ego_robot_id = ego_graph_data._ego_robot_id
+            ego_agent_idx = None
+            if hasattr(ego_graph_data, 'agent_nodes'):
+                for robot_id, agent_idx in ego_graph_data.agent_nodes.items():
+                    if robot_id == ego_robot_id:
+                        ego_agent_idx = agent_idx
+                        break
+            
+            # Sample action only for the ego robot
+            if ('agent' in policy_outputs and ego_agent_idx is not None and 
+                ego_agent_idx < policy_outputs['agent']['value_alpha'].shape[0]):
+                
+                agent_policy = policy_outputs['agent']
+                
+                # Get parameters for ego robot only
+                ego_value_alpha = agent_policy['value_alpha'][ego_agent_idx]
+                ego_value_beta = agent_policy['value_beta'][ego_agent_idx]
+                
+                ego_value_action = torch.distributions.Beta(ego_value_alpha, ego_value_beta).sample()
+                
+                actions['agent'] = {
+                    'value': ego_value_action.unsqueeze(0)  # Keep batch dimension
+                }
+                
+                # Compute log probabilities
+                value_dist = torch.distributions.Beta(ego_value_alpha, ego_value_beta)
+                log_probs['agent'] = {
+                    'value': value_dist.log_prob(ego_value_action)
+                }
+            
+            # For tracks, include all tracks in ego-graph
+            if 'track' in policy_outputs and policy_outputs['track']['value_alpha'].shape[0] > 0:
+                track_policy = policy_outputs['track']
+                
+                track_value_alpha = track_policy['value_alpha']
+                track_value_beta = track_policy['value_beta']
+                
+                track_value_action = torch.distributions.Beta(track_value_alpha, track_value_beta).sample()
+                
+                actions['track'] = {
+                    'value': track_value_action
+                }
+                
+                track_value_dist = torch.distributions.Beta(track_value_alpha, track_value_beta)
+                log_probs['track'] = {
+                    'value': track_value_dist.log_prob(track_value_action).sum()
+                }
+        
+        self.model.train()
+        return actions, log_probs

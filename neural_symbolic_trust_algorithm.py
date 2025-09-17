@@ -296,13 +296,17 @@ class TrustCritic(nn.Module):
         )
         
         # Global value aggregation for permutation-invariant value function
+        # FIXED: Updated input size for richer state representation (mean + max + std for agents and tracks)
         self.global_value_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),  # Concat agent + track features
+            nn.Linear(hidden_dim * 6, hidden_dim * 2),  # Rich features: 6 * hidden_dim input
+            nn.LayerNorm(hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1)
         )
@@ -322,24 +326,36 @@ class TrustCritic(nn.Module):
         """
         has_tracks = node_embeddings['track'].shape[0] > 0
         
-        # Compute global permutation-invariant value
-        agent_features = torch.mean(node_embeddings['agent'], dim=0, keepdim=True)  # [1, hidden_dim]
+        # FIXED: Compute richer global state representation for value function
+        # Use multiple aggregation methods to preserve state information
+        
+        # Agent features: mean, max, std to capture distribution
+        agent_mean = torch.mean(node_embeddings['agent'], dim=0, keepdim=True)  # [1, hidden_dim]
+        agent_max = torch.max(node_embeddings['agent'], dim=0, keepdim=True)[0]  # [1, hidden_dim]
+        agent_std = torch.std(node_embeddings['agent'], dim=0, keepdim=True)   # [1, hidden_dim]
         
         if has_tracks:
-            track_features = torch.mean(node_embeddings['track'], dim=0, keepdim=True)  # [1, hidden_dim]
+            track_mean = torch.mean(node_embeddings['track'], dim=0, keepdim=True)  # [1, hidden_dim]
+            track_max = torch.max(node_embeddings['track'], dim=0, keepdim=True)[0]  # [1, hidden_dim]
+            track_std = torch.std(node_embeddings['track'], dim=0, keepdim=True)   # [1, hidden_dim]
         else:
             # Create zero track features if no tracks
             device = node_embeddings['agent'].device
-            track_features = torch.zeros(1, node_embeddings['agent'].shape[1], device=device)
+            track_mean = torch.zeros(1, node_embeddings['agent'].shape[1], device=device)
+            track_max = torch.zeros(1, node_embeddings['agent'].shape[1], device=device)
+            track_std = torch.zeros(1, node_embeddings['agent'].shape[1], device=device)
         
-        # Concatenate global features
-        global_features = torch.cat([agent_features, track_features], dim=1)  # [1, hidden_dim * 2]
+        # Concatenate rich global features: mean + max + std for both agents and tracks
+        global_features = torch.cat([
+            agent_mean, agent_max, agent_std,  # 3 * hidden_dim
+            track_mean, track_max, track_std   # 3 * hidden_dim
+        ], dim=1)  # [1, hidden_dim * 6]
         
         # Global value function (shared across all agents)
         global_value = self.global_value_head(global_features).squeeze()  # Scalar
         
-        # Apply value regularization
-        global_value = global_value * (1.0 - self.value_regularization) + self.value_regularization * torch.tanh(global_value)
+        # Remove problematic value regularization that was causing values to stick around 0.4
+        # global_value = global_value * (1.0 - self.value_regularization) + self.value_regularization * torch.tanh(global_value)
         
         return global_value
 
