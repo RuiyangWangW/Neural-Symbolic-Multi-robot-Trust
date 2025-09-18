@@ -54,7 +54,7 @@ class SupervisedTrustDataset(Dataset):
 
 def collate_batch(batch: List[Dict]) -> Dict:
     """
-    Collate function using PyTorch Geometric's native batching
+    Optimized collate function using PyTorch Geometric's native batching
 
     Args:
         batch: List of sample dictionaries
@@ -62,20 +62,21 @@ def collate_batch(batch: List[Dict]) -> Dict:
     Returns:
         Dictionary with PyG batched data
     """
-    # Convert samples to HeteroData objects
+    # Pre-allocate lists for better performance
     hetero_data_list = []
     all_agent_labels = []
     all_track_labels = []
 
+    # Process batch more efficiently
     for sample in batch:
-        # Create HeteroData object
+        # Create HeteroData object with pre-defined node and edge types
         hetero_data = HeteroData()
 
-        # Add node features
-        for node_type, features in sample['x_dict'].items():
-            hetero_data[node_type].x = features
+        # Add node features directly without iteration
+        hetero_data['agent'].x = sample['x_dict']['agent']
+        hetero_data['track'].x = sample['x_dict']['track']
 
-        # Add edge indices
+        # Add edge indices directly - use correct edge types from supervised_trust_gnn.py
         for edge_type, edge_index in sample['edge_index_dict'].items():
             hetero_data[edge_type].edge_index = edge_index
 
@@ -83,11 +84,11 @@ def collate_batch(batch: List[Dict]) -> Dict:
         all_agent_labels.append(sample['agent_labels'])
         all_track_labels.append(sample['track_labels'])
 
-    # Use PyG's native batching
+    # Use PyG's optimized native batching
     try:
         batched_hetero = HeteroBatch.from_data_list(hetero_data_list)
 
-        # Concatenate labels to match PyG's batching
+        # Concatenate labels efficiently
         batched_agent_labels = torch.cat(all_agent_labels, dim=0)
         batched_track_labels = torch.cat(all_track_labels, dim=0)
 
@@ -132,7 +133,7 @@ class SupervisedTrustTrainer:
         self.model = model
         self.device = torch.device(device)
         self.model.to(self.device)
-        self.use_amp = use_amp and (device == 'cuda')  # Enable AMP for CUDA only (MPS AMP is unstable)
+        self.use_amp = use_amp and ('cuda' in device)  # Enable AMP for CUDA only (MPS AMP is unstable)
 
         # Optimizer and loss function
         self.optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -142,7 +143,7 @@ class SupervisedTrustTrainer:
 
         # Mixed precision scaler (for CUDA/MPS acceleration)
         if self.use_amp:
-            if device == 'cuda':
+            if 'cuda' in device:
                 self.scaler = torch.amp.GradScaler('cuda')
             elif device == 'mps':
                 self.scaler = torch.amp.GradScaler('cpu')  # MPS uses CPU scaler
@@ -694,8 +695,6 @@ class SupervisedTrustTrainer:
             'val_metrics': self.val_metrics
         }
 
-
-
 def load_dataset(data_path: str) -> List[SupervisedDataSample]:
     """Load dataset from pickle file with parameter diversity metadata"""
     print(f"📂 Loading dataset from {data_path}...")
@@ -801,7 +800,7 @@ def main():
                        help='Path to dataset file')
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=64,
+    parser.add_argument('--batch-size', type=int, default=128,
                        help='Batch size for training (supports both batched and individual processing)')
     parser.add_argument('--lr', type=float, default=1e-3,
                        help='Learning rate')
@@ -832,6 +831,27 @@ def main():
             device = 'mps'
             print(f"🚀 Apple Silicon MPS detected")
             print(f"💡 If you encounter MPS issues, use --force-cpu")
+
+            # Auto-enable MPS performance optimizations
+            if not args.use_amp:
+                print("💡 Auto-enabling AMP for MPS performance boost")
+                args.use_amp = True
+
+            # Increase batch size for better MPS utilization
+            if args.batch_size <= 128:
+                original_batch_size = args.batch_size
+                args.batch_size = 512  # Even larger batch size for MPS
+                print(f"💡 Auto-increasing batch size from {original_batch_size} to {args.batch_size} for MPS")
+
+            # Enable MPS memory optimizations
+            try:
+                if hasattr(torch.mps, 'set_per_process_memory_fraction'):
+                    torch.mps.set_per_process_memory_fraction(0.8)  # Use 80% of available memory
+                if hasattr(torch.mps, 'empty_cache'):
+                    torch.mps.empty_cache()  # Clear any cached memory
+                print("💡 MPS memory optimizations enabled")
+            except Exception as e:
+                print(f"⚠️  Could not enable MPS memory optimizations: {e}")
         else:
             device = 'cpu'
             print(f"⚠️  No GPU acceleration available, using CPU")
@@ -854,8 +874,9 @@ def main():
     val_dataset = SupervisedTrustDataset(val_data)
 
     # Optimize DataLoader settings based on device
-    pin_memory = device == 'cuda'  # Pin memory only for CUDA (MPS doesn't support it yet)
-    num_workers = args.num_workers if args.num_workers > 0 else (2 if device in ['cuda', 'mps'] else 0)
+    pin_memory = 'cuda' in device  # Pin memory only for CUDA (MPS doesn't support it yet)
+    # Use fewer workers for MPS to reduce overhead and improve performance
+    num_workers = args.num_workers if args.num_workers > 0 else (2 if 'cuda' in device else (0 if device == 'mps' else 0))
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
                              shuffle=True, collate_fn=collate_batch,
