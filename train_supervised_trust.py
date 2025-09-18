@@ -380,7 +380,9 @@ class SupervisedTrustTrainer:
 
         # Forward pass
         if self.use_amp:
-            with torch.autocast(device_type=self.device.type):
+            # Use proper device type for autocast
+            device_type = 'cuda' if 'cuda' in str(self.device) else str(self.device.type)
+            with torch.autocast(device_type=device_type):
                 predictions = self.model(x_dict, edge_index_dict)
         else:
             predictions = self.model(x_dict, edge_index_dict)
@@ -415,7 +417,9 @@ class SupervisedTrustTrainer:
 
         # Forward pass - PyG handles the batching automatically
         if self.use_amp:
-            with torch.autocast(device_type=self.device.type):
+            # Use proper device type for autocast
+            device_type = 'cuda' if 'cuda' in str(self.device) else str(self.device.type)
+            with torch.autocast(device_type=device_type):
                 predictions = self.model(hetero_batch.x_dict, hetero_batch.edge_index_dict)
         else:
             predictions = self.model(hetero_batch.x_dict, hetero_batch.edge_index_dict)
