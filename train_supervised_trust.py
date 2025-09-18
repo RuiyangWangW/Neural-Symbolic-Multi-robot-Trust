@@ -119,7 +119,7 @@ class SupervisedTrustTrainer:
                  device: str = 'cpu',
                  learning_rate: float = 1e-3,
                  weight_decay: float = 1e-4,
-                 use_amp: bool = False):
+                ):
         """
         Initialize trainer
 
@@ -128,32 +128,18 @@ class SupervisedTrustTrainer:
             device: Device to train on
             learning_rate: Learning rate for optimizer
             weight_decay: Weight decay for regularization
-            use_amp: Whether to use Automatic Mixed Precision (recommended for MPS/CUDA)
         """
         self.model = model
         self.device = torch.device(device)
         self.model.to(self.device)
-        self.use_amp = use_amp and ('cuda' in device)  # Enable AMP for CUDA only (MPS AMP is unstable)
-
         # Optimizer and loss function
         self.optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.7, patience=10
         )
 
-        # Mixed precision scaler (for CUDA/MPS acceleration)
-        if self.use_amp:
-            if 'cuda' in device:
-                self.scaler = torch.amp.GradScaler('cuda')
-            elif device == 'mps':
-                self.scaler = torch.amp.GradScaler('cpu')  # MPS uses CPU scaler
-            else:
-                self.scaler = None
-        else:
-            self.scaler = None
-
-        # Binary cross-entropy loss for classification
-        self.criterion = nn.BCELoss()
+        # Binary cross-entropy loss for classification with sum reduction
+        self.criterion = nn.BCELoss(reduction='sum')
 
         # Training history
         self.train_losses = []
@@ -241,7 +227,7 @@ class SupervisedTrustTrainer:
             loss_components += 1
 
         if loss_components > 0:
-            return loss / loss_components
+            return loss  # Remove averaging to maintain proper loss magnitude
 
         return None
 
@@ -379,13 +365,7 @@ class SupervisedTrustTrainer:
             return 0.0, {}
 
         # Forward pass
-        if self.use_amp:
-            # Use proper device type for autocast
-            device_type = 'cuda' if 'cuda' in str(self.device) else str(self.device.type)
-            with torch.autocast(device_type=device_type):
-                predictions = self.model(x_dict, edge_index_dict)
-        else:
-            predictions = self.model(x_dict, edge_index_dict)
+        predictions = self.model(x_dict, edge_index_dict)
 
         # Compute loss
         loss = self._compute_loss(predictions, agent_labels, track_labels)
@@ -416,13 +396,7 @@ class SupervisedTrustTrainer:
         track_labels = batch_data['track_labels'].to(self.device)
 
         # Forward pass - PyG handles the batching automatically
-        if self.use_amp:
-            # Use proper device type for autocast
-            device_type = 'cuda' if 'cuda' in str(self.device) else str(self.device.type)
-            with torch.autocast(device_type=device_type):
-                predictions = self.model(hetero_batch.x_dict, hetero_batch.edge_index_dict)
-        else:
-            predictions = self.model(hetero_batch.x_dict, hetero_batch.edge_index_dict)
+        predictions = self.model(hetero_batch.x_dict, hetero_batch.edge_index_dict)
 
         # Compute loss - PyG concatenated everything, so labels should align
         loss = self._compute_loss(predictions, agent_labels, track_labels)
@@ -462,16 +436,9 @@ class SupervisedTrustTrainer:
 
                     if loss > 0:
                         # Backward pass
-                        if self.use_amp:
-                            self.scaler.scale(loss).backward()
-                            self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                        else:
-                            loss.backward()
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                            self.optimizer.step()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        self.optimizer.step()
 
                         total_loss += loss.item()
                         num_samples += current_batch_size
@@ -490,16 +457,9 @@ class SupervisedTrustTrainer:
 
                             if loss > 0:
                                 # Backward pass
-                                if self.use_amp:
-                                    self.scaler.scale(loss).backward()
-                                    self.scaler.unscale_(self.optimizer)
-                                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                                    self.scaler.step(self.optimizer)
-                                    self.scaler.update()
-                                else:
-                                    loss.backward()
-                                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                                    self.optimizer.step()
+                                loss.backward()
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                                self.optimizer.step()
 
                                 total_loss += loss.item()
                                 num_samples += 1
@@ -810,8 +770,6 @@ def main():
                        help='Learning rate')
     parser.add_argument('--device', type=str, default='auto',
                        help='Device to use (cpu/cuda/mps/auto)')
-    parser.add_argument('--use-amp', action='store_true',
-                       help='Use Automatic Mixed Precision (recommended for MPS/CUDA)')
     parser.add_argument('--num-workers', type=int, default=0,
                        help='Number of DataLoader workers (default: 0, use 2-4 for MPS/CUDA)')
     parser.add_argument('--force-cpu', action='store_true',
@@ -836,10 +794,6 @@ def main():
             print(f"🚀 Apple Silicon MPS detected")
             print(f"💡 If you encounter MPS issues, use --force-cpu")
 
-            # Auto-enable MPS performance optimizations
-            if not args.use_amp:
-                print("💡 Auto-enabling AMP for MPS performance boost")
-                args.use_amp = True
 
             # Increase batch size for better MPS utilization
             if args.batch_size <= 128:
@@ -897,13 +851,11 @@ def main():
     )
 
     print(f"🧠 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"⚡ Mixed precision: {'Enabled' if args.use_amp else 'Disabled'}")
     print(f"👷 DataLoader workers: {num_workers}")
     print(f"📌 Pin memory: {pin_memory}")
 
     # Create trainer
-    trainer = SupervisedTrustTrainer(model, device=device, learning_rate=args.lr,
-                                   use_amp=args.use_amp)
+    trainer = SupervisedTrustTrainer(model, device=device, learning_rate=args.lr)
 
     # Train model
     history = trainer.train(train_loader, val_loader, epochs=args.epochs, save_path=args.output, patience=args.patience)

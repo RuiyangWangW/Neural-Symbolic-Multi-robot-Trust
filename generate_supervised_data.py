@@ -319,7 +319,9 @@ class SupervisedDataGenerator:
                         ego_robot_id=ego_robot.id
                     )
 
-                    episode_data.append(sample)
+                    # Only save samples that have tracks (skip empty track graphs)
+                    if 'track' in sample.x_dict and sample.x_dict['track'].shape[0] > 0:
+                        episode_data.append(sample)
 
                 except Exception as e:
                     print(f"Warning: Error generating ego graph for robot {ego_robot.id} at step {step}: {e}")
