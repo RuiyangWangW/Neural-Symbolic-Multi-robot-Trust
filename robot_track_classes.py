@@ -63,25 +63,9 @@ class Track:
     
     def update_trust(self, delta_alpha: float, delta_beta: float):
         """Update trust distribution parameters."""
-        scale = self.normalize_trust_parameters()
-        self.trust_alpha += delta_alpha * scale
-        self.trust_beta += delta_beta * scale
+        self.trust_alpha += delta_alpha 
+        self.trust_beta += delta_beta
         # Increment observation count since this represents another observation/update
-        self.observation_count += 1
-    
-    def normalize_trust_parameters(self, max_sum: float = 5.0):
-        current_sum = self.trust_alpha + self.trust_beta
-        scale = 1.0  # Initialize scale to 1.0 (no scaling by default)
-        
-        if current_sum > max_sum:
-            scale = max_sum / max(current_sum, 1e-6)
-            self.trust_alpha *= scale
-            self.trust_beta *= scale
-
-        # Ensure minimum values to prevent degenerate distributions
-        self.trust_alpha = max(self.trust_alpha, 0.1)
-        self.trust_beta = max(self.trust_beta, 0.1)
-        return scale
 
     def update_state(self, position: np.ndarray, velocity: np.ndarray, timestamp: float):
         """Update track state estimates."""
@@ -178,25 +162,8 @@ class Robot:
     
     def update_trust(self, delta_alpha: float, delta_beta: float):
         """Update robot trust distribution parameters."""
-        scale = self.normalize_trust_parameters()
-        self.trust_alpha += delta_alpha * scale
-        self.trust_beta += delta_beta * scale
-
-    def normalize_trust_parameters(self, max_sum: float = 5.0):
-        """Normalize alpha and beta parameters to prevent unbounded growth."""
-        current_sum = self.trust_alpha + self.trust_beta
-        scale = 1.0  # Initialize scale to 1.0 (no scaling by default)
-        
-        if current_sum > max_sum:
-            scale = max_sum / max(current_sum, 1e-6)
-            self.trust_alpha *= scale
-            self.trust_beta *= scale
-
-        # Ensure minimum values to prevent degenerate distributions
-        self.trust_alpha = max(self.trust_alpha, 0.1)
-        self.trust_beta = max(self.trust_beta, 0.1)
-
-        return scale
+        self.trust_alpha += delta_alpha 
+        self.trust_beta += delta_beta 
 
     def update_state(self, position: np.ndarray, velocity: np.ndarray = None):
         """Update robot position, velocity, and orientation."""
@@ -271,6 +238,7 @@ class Robot:
             self.local_tracks[object_id].update_state(position, velocity, current_time)
             # Mark track as updated in current timestep
             self.current_timestep_tracks[object_id] = self.local_tracks[object_id]
+            self.local_tracks[object_id].observation_count += 1
         else:
             self.create_track_for_object(object_id, position, velocity, current_time)
     

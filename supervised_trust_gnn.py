@@ -390,7 +390,7 @@ class SupervisedTrustPredictor:
 
             # Create model with correct architecture
             self.model = SupervisedTrustGNN(
-                agent_features=5,  # 4 neural-symbolic predicates + trust_value
+                agent_features=4,  # 4 neural-symbolic predicates
                 track_features=5,  # 5 neural-symbolic predicates
                 hidden_dim=64
             )
@@ -427,9 +427,14 @@ class SupervisedTrustPredictor:
         # Create ego graph using proper build_ego_graph method with fusion map
         graph_data = self.ego_graph_builder.build_ego_graph(ego_robot, robots)
 
-
         # Make predictions
-        return self.predict(graph_data.x_dict, graph_data.edge_index_dict, threshold)
+        predictions = self.predict(graph_data.x_dict, graph_data.edge_index_dict, threshold)
+
+        # Return both predictions and graph data for proper node mapping
+        return {
+            'predictions': predictions,
+            'graph_data': graph_data
+        }
 
     def predict(self, x_dict, edge_index_dict, threshold: float = 0.5):
         """
