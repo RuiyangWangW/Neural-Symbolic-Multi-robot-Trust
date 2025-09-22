@@ -538,10 +538,10 @@ def main():
     parser = argparse.ArgumentParser(description='Generate supervised trust learning dataset with diverse parameters')
     parser.add_argument('--episodes', type=int, default=10,
                        help='Number of episodes to generate (default: 10)')
-    parser.add_argument('--robots', type=str, default='3,8',
-                       help='Number of robots: single value or range "min,max" (default: 3,8)')
-    parser.add_argument('--targets', type=str, default='10,25',
-                       help='Number of targets: single value or range "min,max" (default: 10,25)')
+    parser.add_argument('--robots', type=str, default='3,10',
+                       help='Number of robots: single value or range "min,max" (default: 3,10)')
+    parser.add_argument('--targets', type=str, default='10,30',
+                       help='Number of targets: single value or range "min,max" (default: 10,30)')
     parser.add_argument('--adversarial-ratio', type=str, default='0.2,0.8',
                        help='Adversarial robot ratio: single value or range "min,max" (default: 0.2,0.8)')
     parser.add_argument('--false-positive-rate', type=str, default='0.1,0.7',

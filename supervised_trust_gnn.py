@@ -369,18 +369,19 @@ class SupervisedTrustPredictor:
     Wrapper class for supervised trust prediction
     """
 
-    def __init__(self, model_path: str, device: str = 'cpu'):
+    def __init__(self, model_path: str, device: str = 'cpu', proximal_range: float = 50.0):
         """
         Initialize predictor with trained model
 
         Args:
             model_path: Path to trained model checkpoint
             device: Device to run inference on
+            proximal_range: Proximal range for ego graph building (must match training data)
         """
         self.device = torch.device(device)
         self.model = None
         self.feature_calculator = TrustFeatureCalculator()
-        self.ego_graph_builder = EgoGraphBuilder()
+        self.ego_graph_builder = EgoGraphBuilder(proximal_range=proximal_range)
         self._load_model(model_path)
 
     def _load_model(self, model_path: str):
@@ -510,7 +511,7 @@ class EgoGraphBuilder:
     Builds ego graphs for individual robots containing only local observations within comm range
     """
 
-    def __init__(self, proximal_range: float = 100.0):
+    def __init__(self, proximal_range: float = 50.0):
         self.proximal_range = proximal_range
         self.feature_calculator = TrustFeatureCalculator()
 

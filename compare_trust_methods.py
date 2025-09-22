@@ -28,7 +28,10 @@ class TrustMethodComparison:
                  num_robots: int = 5,
                  num_targets: int = 10,
                  num_timesteps: int = 500,
-                 random_seed: int = 42):
+                 random_seed: int = 42,
+                 world_size: float = 60.0,
+                 fov_range: float = 50.0,
+                 fov_angle: float = np.pi/3):
         """
         Initialize comparison with both trust methods
 
@@ -38,28 +41,40 @@ class TrustMethodComparison:
             num_targets: Number of ground truth targets
             num_timesteps: Number of simulation steps
             random_seed: Random seed for reproducibility
+            world_size: Size of the simulation world
+            fov_range: Field of view range for robots
+            fov_angle: Field of view angle for robots
         """
         self.model_path = model_path
         self.num_robots = num_robots
         self.num_targets = num_targets
         self.num_timesteps = num_timesteps
         self.random_seed = random_seed
+        self.world_size = world_size
+        self.fov_range = fov_range
+        self.fov_angle = fov_angle
 
         # Initialize trust methods
         self.paper_algorithm = PaperTrustAlgorithm()
         self.supervised_predictor = None
 
-        # Try to load supervised model
+        # Results storage
+        self.paper_results = []
+        self.supervised_results = []
+
+        # Simulation parameters (can be overridden)
+        self.adversarial_ratio = 0.3
+        self.false_positive_rate = 0.5
+        self.false_negative_rate = 0.0
+        self.proximal_range = 50.0
+
+        # Try to load supervised model after proximal_range is set
         try:
-            self.supervised_predictor = SupervisedTrustPredictor(model_path)
+            self.supervised_predictor = SupervisedTrustPredictor(model_path, proximal_range=self.proximal_range)
             print(f"✅ Loaded supervised trust model from {model_path}")
         except Exception as e:
             print(f"⚠️ Failed to load supervised model: {e}")
             print("Will only run paper algorithm comparison")
-
-        # Results storage
-        self.paper_results = []
-        self.supervised_results = []
 
     def create_identical_environments(self) -> Tuple[SimulationEnvironment, SimulationEnvironment]:
         """Create two identical simulation environments for fair comparison"""
@@ -73,13 +88,13 @@ class TrustMethodComparison:
         env1 = SimulationEnvironment(
             num_robots=self.num_robots,
             num_targets=self.num_targets,
-            world_size=(60.0, 60.0),
-            adversarial_ratio=0.3,
-            proximal_range=100.0,
-            fov_range=50.0,
-            fov_angle=np.pi/3,
-            false_positive_rate=0.5,
-            false_negative_rate=0.0
+            world_size=(self.world_size, self.world_size),
+            adversarial_ratio=self.adversarial_ratio,
+            proximal_range=self.proximal_range,
+            fov_range=self.fov_range,
+            fov_angle=self.fov_angle,
+            false_positive_rate=self.false_positive_rate,
+            false_negative_rate=self.false_negative_rate
         )
 
         # Store initial state for reproduction
@@ -122,13 +137,13 @@ class TrustMethodComparison:
         env2 = SimulationEnvironment(
             num_robots=self.num_robots,
             num_targets=self.num_targets,
-            world_size=(60.0, 60.0),
-            adversarial_ratio=0.3,
-            proximal_range=100.0,
-            fov_range=50.0,
-            fov_angle=np.pi/3,
-            false_positive_rate=0.5,
-            false_negative_rate=0.0
+            world_size=(self.world_size, self.world_size),
+            adversarial_ratio=self.adversarial_ratio,
+            proximal_range=self.proximal_range,
+            fov_range=self.fov_range,
+            fov_angle=self.fov_angle,
+            false_positive_rate=self.false_positive_rate,
+            false_negative_rate=self.false_negative_rate
         )
 
         return env1, env2
@@ -635,42 +650,209 @@ class TrustMethodComparison:
 
 
 def main():
-    """Main function to run the comparison"""
-    print("🚀 Starting Trust Method Comparison")
+    """Main function to run three specific scenarios"""
+    print("🚀 Starting Trust Method Comparison - Three Scenarios")
 
-    # Run with single seed first for testing
-    seed = 42
+    # =============================================================================
+    # GLOBAL PARAMETERS - All configuration in one place
+    # =============================================================================
 
-    print(f"\n{'='*50}")
-    print(f"Running comparison with seed {seed}")
-    print('='*50)
+    # Simulation Parameters
+    NUM_ROBOTS = 5
+    NUM_TARGETS = 10
+    NUM_TIMESTEPS = 150
+    RANDOM_SEED = 42
 
-    # Create comparison instance
-    comparison = TrustMethodComparison(
-        model_path="supervised_trust_model.pth",
-        num_robots=5,
-        num_targets=10,
-        num_timesteps=100,  # Reduced for faster testing
-        random_seed=seed
-    )
+    # Environment Parameters
+    WORLD_SIZE = 100.0
+    ADVERSARIAL_RATIO = 0.2
+    PROXIMAL_RANGE = 50.0
+    FOV_RANGE = 50.0
+    FOV_ANGLE = np.pi/3
 
-    # Run comparison
-    results = comparison.run_comparison()
+    # Model Parameters
+    MODEL_PATH = "supervised_trust_model.pth"
 
-    # Save results
-    results_file = f"trust_comparison_seed_{seed}.json"
-    comparison.save_results(results_file)
+    # Scenario-specific parameters (only FP/FN rates vary)
+    scenarios = [
+        {
+            "name": "Scenario_1_Low_FP_Low_FN",
+            "false_positive_rate": 0.3,
+            "false_negative_rate": 0.1
+        },
+        {
+            "name": "Scenario_2_High_FP_Low_FN",
+            "false_positive_rate": 0.8,
+            "false_negative_rate": 0.1
+        },
+        {
+            "name": "Scenario_3_Low_FP_High_FN",
+            "false_positive_rate": 0.3,
+            "false_negative_rate": 0.5
+        }
+    ]
 
-    # Create visualization
-    viz_file = f"trust_comparison_seed_{seed}.png"
-    comparison.visualize_comparison(viz_file)
+    # =============================================================================
+    # SCENARIO EXECUTION
+    # =============================================================================
 
-    # Print summary
-    comparison.print_summary()
+    all_results = {}
+    summary_stats = []
 
-    print("✅ Comparison completed successfully!")
-    print(f"📁 Results saved to {results_file}")
-    print(f"📊 Visualization saved to {viz_file}")
+    for i, scenario in enumerate(scenarios):
+        print(f"\n{'='*60}")
+        print(f"Running {scenario['name']} ({i+1}/3)")
+        print('='*60)
+        print(f"Configuration:")
+        print(f"  - Robots: {NUM_ROBOTS}")
+        print(f"  - Targets: {NUM_TARGETS}")
+        print(f"  - Timesteps: {NUM_TIMESTEPS}")
+        print(f"  - Random seed: {RANDOM_SEED}")
+        print(f"  - Adversarial ratio: {ADVERSARIAL_RATIO}")
+        print(f"  - World size: {WORLD_SIZE}x{WORLD_SIZE}")
+        print(f"  - Proximal range: {PROXIMAL_RANGE}")
+        print(f"  - FOV range: {FOV_RANGE}")
+        print(f"  - FOV angle: π/3")
+        print(f"  - False positive rate: {scenario['false_positive_rate']}")
+        print(f"  - False negative rate: {scenario['false_negative_rate']}")
+
+        # Create comparison instance with centralized parameters
+        comparison = TrustMethodComparison(
+            model_path=MODEL_PATH,
+            num_robots=NUM_ROBOTS,
+            num_targets=NUM_TARGETS,
+            num_timesteps=NUM_TIMESTEPS,
+            random_seed=RANDOM_SEED,
+            world_size=WORLD_SIZE,
+            fov_range=FOV_RANGE,
+            fov_angle=FOV_ANGLE
+        )
+
+        # Set global and scenario-specific parameters
+        comparison.adversarial_ratio = ADVERSARIAL_RATIO
+        comparison.false_positive_rate = scenario['false_positive_rate']
+        comparison.false_negative_rate = scenario['false_negative_rate']
+        comparison.proximal_range = PROXIMAL_RANGE
+
+        try:
+            # Run comparison
+            results = comparison.run_comparison()
+
+            # Store results
+            all_results[scenario['name']] = results
+
+            # Save individual results
+            results_file = f"trust_comparison_{scenario['name']}.json"
+            comparison.save_results(results_file)
+
+            # Create visualization
+            viz_file = f"trust_comparison_{scenario['name']}.png"
+            comparison.visualize_comparison(viz_file)
+
+            # Extract summary statistics
+            metrics = results['comparison_metrics']
+            if 'final_trust_values' in metrics:
+                scenario_summary = {
+                    'scenario': scenario['name'],
+                    'false_positive_rate': scenario['false_positive_rate'],
+                    'false_negative_rate': scenario['false_negative_rate'],
+                    'legitimate_paper': metrics['final_trust_values'].get('legitimate', {}).get('paper_mean', 0),
+                    'legitimate_supervised': metrics['final_trust_values'].get('legitimate', {}).get('supervised_mean', 0),
+                    'adversarial_paper': metrics['final_trust_values'].get('adversarial', {}).get('paper_mean', 0),
+                    'adversarial_supervised': metrics['final_trust_values'].get('adversarial', {}).get('supervised_mean', 0),
+                    'legitimate_improvement': metrics['final_trust_values'].get('legitimate', {}).get('difference', 0),
+                    'adversarial_improvement': metrics['final_trust_values'].get('adversarial', {}).get('difference', 0)
+                }
+                summary_stats.append(scenario_summary)
+
+            # Print summary
+            comparison.print_summary()
+
+            print(f"✅ {scenario['name']} completed successfully!")
+            print(f"📁 Results saved to {results_file}")
+            print(f"📊 Visualization saved to {viz_file}")
+
+        except Exception as e:
+            print(f"❌ Error in {scenario['name']}: {e}")
+            continue
+
+    # Print overall comparison
+    print(f"\n{'='*70}")
+    print("🎯 THREE SCENARIO COMPARISON SUMMARY")
+    print('='*70)
+
+    if summary_stats:
+        print("\n📊 Performance Summary:")
+        print("Scenario Name               | FP Rate | FN Rate | Leg (P→S)    | Adv (P→S)    | Leg Δ   | Adv Δ")
+        print("-" * 85)
+
+        for stat in summary_stats:
+            print(f"{stat['scenario']:<26} | "
+                  f"{stat['false_positive_rate']:<7} | "
+                  f"{stat['false_negative_rate']:<7} | "
+                  f"{stat['legitimate_paper']:.3f}→{stat['legitimate_supervised']:.3f} | "
+                  f"{stat['adversarial_paper']:.3f}→{stat['adversarial_supervised']:.3f} | "
+                  f"{stat['legitimate_improvement']:+.3f} | {stat['adversarial_improvement']:+.3f}")
+
+        # Calculate overall averages
+        avg_leg_improvement = np.mean([s['legitimate_improvement'] for s in summary_stats])
+        avg_adv_improvement = np.mean([s['adversarial_improvement'] for s in summary_stats])
+
+        print("-" * 85)
+        print(f"{'AVERAGE':<26} | {'':>7} | {'':>7} | {'':>12} | {'':>12} | {avg_leg_improvement:+.3f} | {avg_adv_improvement:+.3f}")
+
+        print(f"\n🔍 Key Findings:")
+        print(f"   • Average legitimate robot trust improvement: {avg_leg_improvement:+.3f}")
+        print(f"   • Average adversarial robot trust change: {avg_adv_improvement:+.3f}")
+
+        # Analysis by scenario type
+        print(f"\n📈 Scenario Analysis:")
+        for stat in summary_stats:
+            print(f"   • {stat['scenario']}:")
+            print(f"     - FP/FN rates: {stat['false_positive_rate']:.1f}/{stat['false_negative_rate']:.1f}")
+            print(f"     - Legitimate trust: {stat['legitimate_improvement']:+.3f}")
+            print(f"     - Adversarial detection: {stat['adversarial_improvement']:+.3f}")
+
+    # Save comprehensive results using centralized parameters
+    comprehensive_results = {
+        'scenarios': all_results,
+        'summary_statistics': summary_stats,
+        'configuration': {
+            'num_robots': NUM_ROBOTS,
+            'num_targets': NUM_TARGETS,
+            'adversarial_ratio': ADVERSARIAL_RATIO,
+            'world_size': WORLD_SIZE,
+            'proximal_range': PROXIMAL_RANGE,
+            'fov_range': FOV_RANGE,
+            'fov_angle': 'π/3',
+            'num_timesteps': NUM_TIMESTEPS,
+            'random_seed': RANDOM_SEED,
+            'model_path': MODEL_PATH
+        }
+    }
+
+    # Convert numpy types to Python native types for JSON serialization
+    def convert_numpy_types(obj):
+        if isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {key: convert_numpy_types(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_numpy_types(item) for item in obj]
+        else:
+            return obj
+
+    comprehensive_results = convert_numpy_types(comprehensive_results)
+
+    with open("three_scenario_comparison.json", 'w') as f:
+        json.dump(comprehensive_results, f, indent=2)
+
+    print(f"\n✅ Three scenario comparison completed successfully!")
+    print(f"📁 Comprehensive results saved to three_scenario_comparison.json")
 
 
 if __name__ == "__main__":
