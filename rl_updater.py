@@ -13,7 +13,6 @@ import torch.nn as nn
 import numpy as np
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
-
 from robot_track_classes import Robot, Track
 
 
@@ -84,6 +83,13 @@ class UpdaterPolicy(nn.Module):
             nn.Sigmoid()  # Output [0,1]
         )
 
+        # Value head for PPO
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),  # Takes summary encoding
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, 1)  # State value estimation
+        )
+
     def forward(self,
                 summary: torch.Tensor,           # [1, 10] ego graph summary
                 robot_features: torch.Tensor,   # [num_robots, 3]
@@ -99,7 +105,8 @@ class UpdaterPolicy(nn.Module):
                 summary_encoded.expand(robot_features.size(0), -1),
                 robot_features
             ], dim=1)
-            robot_steps = self.robot_head(robot_input).squeeze(-1)  # [num_robots]
+            robot_output = self.robot_head(robot_input)
+            robot_steps = robot_output.view(-1) if robot_output.size(-1) == 1 else robot_output  # [num_robots]
         else:
             robot_steps = torch.zeros(0, device=summary.device)
 
@@ -109,11 +116,81 @@ class UpdaterPolicy(nn.Module):
                 summary_encoded.expand(track_features.size(0), -1),
                 track_features
             ], dim=1)
-            track_steps = self.track_head(track_input).squeeze(-1)  # [num_tracks]
+            track_output = self.track_head(track_input)
+            track_steps = track_output.view(-1) if track_output.size(-1) == 1 else track_output  # [num_tracks]
         else:
             track_steps = torch.zeros(0, device=summary.device)
 
         return robot_steps, track_steps
+
+    def get_value(self, summary: torch.Tensor) -> torch.Tensor:
+        """Get state value estimate for PPO"""
+        summary_encoded = self.summary_encoder(summary)
+        value = self.value_head(summary_encoded)
+        return value.squeeze(-1)  # Remove last dimension
+
+    def sample_actions(self,
+                      summary: torch.Tensor,
+                      robot_features: torch.Tensor,
+                      track_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample actions and return log probabilities for PPO"""
+        robot_steps, track_steps = self.forward(summary, robot_features, track_features)
+
+        # Add noise for exploration (since we're using continuous actions)
+        noise_std = 0.1  # Exploration noise
+
+        robot_noise = torch.randn_like(robot_steps) * noise_std
+        track_noise = torch.randn_like(track_steps) * noise_std
+
+        # Clamp to [0,1] range after adding noise
+        robot_actions = torch.clamp(robot_steps + robot_noise, 0.0, 1.0)
+        track_actions = torch.clamp(track_steps + track_noise, 0.0, 1.0)
+
+        # Compute log probabilities (assuming Gaussian with fixed std)
+        robot_log_probs = -0.5 * ((robot_actions - robot_steps) / noise_std) ** 2
+        track_log_probs = -0.5 * ((track_actions - track_steps) / noise_std) ** 2
+
+        return robot_actions, track_actions, robot_log_probs, track_log_probs
+
+    def evaluate_actions(self,
+                        summary: torch.Tensor,
+                        robot_features: torch.Tensor,
+                        track_features: torch.Tensor,
+                        robot_actions: torch.Tensor,
+                        track_actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate specific actions for PPO update"""
+
+        # Forward pass to get current action distributions
+        robot_means, track_means = self.forward(summary, robot_features, track_features)
+
+        # Compute log probabilities for the given actions (assuming Gaussian policy)
+        noise_std = 0.1  # Same as in sample_actions
+
+        robot_log_probs = -0.5 * ((robot_actions - robot_means) / noise_std) ** 2
+        track_log_probs = -0.5 * ((track_actions - track_means) / noise_std) ** 2 if len(track_actions) > 0 else torch.zeros(0)
+
+        # Sum log probabilities
+        total_log_prob = robot_log_probs.sum() + track_log_probs.sum()
+
+        # Get value estimate
+        value = self.get_value(summary)
+
+        # Compute entropy (for Gaussian policy)
+        if len(robot_actions) > 0:
+            device = robot_actions.device
+        elif len(track_actions) > 0:
+            device = track_actions.device
+        else:
+            device = summary.device  # Fallback to summary device
+
+        noise_std_tensor = torch.tensor(noise_std, device=device)
+        entropy_constant = torch.log(2 * torch.pi * torch.e * noise_std_tensor**2)
+
+        robot_entropy = len(robot_actions) * 0.5 * entropy_constant if len(robot_actions) > 0 else torch.tensor(0.0, device=device)
+        track_entropy = len(track_actions) * 0.5 * entropy_constant if len(track_actions) > 0 else torch.tensor(0.0, device=device)
+        total_entropy = robot_entropy + track_entropy
+
+        return total_log_prob, value, total_entropy, robot_log_probs, track_log_probs
 
 
 class LearnableUpdater:

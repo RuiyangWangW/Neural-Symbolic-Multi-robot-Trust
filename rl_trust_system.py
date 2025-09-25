@@ -126,9 +126,13 @@ class RLTrustSystem:
 
         return rho_robot, rho_track
 
-    def ego_sweep_step(self, all_robots: List[Robot]) -> TrustDeltas:
+    def ego_sweep_step(self, all_robots: List[Robot], precomputed_decisions: Dict = None) -> TrustDeltas:
         """
         Perform one ego-sweep step following the exact procedure
+
+        Args:
+            all_robots: List of all robots in the simulation
+            precomputed_decisions: Optional dict of {ego_robot_id: UpdateDecision} to use instead of sampling
         """
         # Initialize accumulators
         robot_deltas = defaultdict(lambda: [0.0, 0.0])
@@ -166,11 +170,14 @@ class RLTrustSystem:
             if not participating_robots and not participating_tracks:
                 continue  # No participating nodes in this ego graph
 
-            # Get step scales from updater
-            step_decision = self.updater.get_step_scales(
-                ego_robots, ego_tracks, participating_robots, participating_tracks,
-                scores.agent_scores, scores.track_scores
-            )
+            # Get step scales from updater (use precomputed if available)
+            if precomputed_decisions and ego_robot.id in precomputed_decisions:
+                step_decision = precomputed_decisions[ego_robot.id]
+            else:
+                step_decision = self.updater.get_step_scales(
+                    ego_robots, ego_tracks, participating_robots, participating_tracks,
+                    scores.agent_scores, scores.track_scores
+                )
 
             # Accumulate robot deltas
             for robot in participating_robots:
@@ -258,12 +265,16 @@ class RLTrustSystem:
                     track.trust_alpha *= scale
                     track.trust_beta *= scale
 
-    def update_trust(self, all_robots: List[Robot]):
+    def update_trust(self, all_robots: List[Robot], precomputed_decisions: Dict = None):
         """
         Main entry point: perform one complete trust update step
+
+        Args:
+            all_robots: List of all robots in the simulation
+            precomputed_decisions: Optional dict of {ego_robot_id: UpdateDecision} to use instead of sampling
         """
         # Ego-sweep to accumulate deltas
-        deltas = self.ego_sweep_step(all_robots)
+        deltas = self.ego_sweep_step(all_robots, precomputed_decisions)
 
         # Apply globally
         self.apply_deltas_globally(deltas, all_robots)
