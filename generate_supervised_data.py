@@ -542,8 +542,8 @@ def main():
                        help='Number of robots: single value or range "min,max" (default: 3,10)')
     parser.add_argument('--targets', type=str, default='10,30',
                        help='Number of targets: single value or range "min,max" (default: 10,30)')
-    parser.add_argument('--adversarial-ratio', type=str, default='0.2,0.8',
-                       help='Adversarial robot ratio: single value or range "min,max" (default: 0.2,0.8)')
+    parser.add_argument('--adversarial-ratio', type=str, default='0.2,0.5',
+                       help='Adversarial robot ratio: single value or range "min,max" (default: 0.2,0.5)')
     parser.add_argument('--false-positive-rate', type=str, default='0.1,0.7',
                        help='False positive rate: single value or range "min,max" (default: 0.1,0.7)')
     parser.add_argument('--false-negative-rate', type=str, default='0.0,0.3',

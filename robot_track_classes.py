@@ -4,6 +4,11 @@ Clean robot and track class definitions for multi-robot trust system.
 
 This module provides organized data structures to replace the confusing
 multiple track types (local tracks, fused tracks, current updated tracks).
+
+New in this version:
+- Integrated RL dual-horizon trust buffers (fast/slow) directly in Robot and Track classes
+- RL trust methods (rl_trust_value, update_rl_trust, etc.) for seamless integration
+- Maintains backward compatibility with original trust_alpha/trust_beta parameters
 """
 
 import numpy as np
@@ -50,6 +55,13 @@ class Track:
         # Trust distribution parameters (Beta distribution)
         self.trust_alpha = trust_alpha
         self.trust_beta = trust_beta
+
+        # RL dual-horizon trust buffers (for RL trust system)
+        self.rl_fast_alpha = trust_alpha
+        self.rl_fast_beta = trust_beta
+        self.rl_slow_alpha = trust_alpha
+        self.rl_slow_beta = trust_beta
+        self.rl_lambda_mix = 0.7  # Mixing parameter (70% fast, 30% slow)
         
         # Metadata
         self.timestamp = timestamp or time.time()
@@ -63,9 +75,67 @@ class Track:
     
     def update_trust(self, delta_alpha: float, delta_beta: float):
         """Update trust distribution parameters."""
-        self.trust_alpha += delta_alpha 
+        self.trust_alpha += delta_alpha
         self.trust_beta += delta_beta
-        # Increment observation count since this represents another observation/update
+
+    # RL dual-horizon trust methods
+    @property
+    def rl_effective_alpha(self) -> float:
+        """Compute effective alpha from dual-horizon buffers."""
+        return self.rl_lambda_mix * self.rl_fast_alpha + (1 - self.rl_lambda_mix) * self.rl_slow_alpha
+
+    @property
+    def rl_effective_beta(self) -> float:
+        """Compute effective beta from dual-horizon buffers."""
+        return self.rl_lambda_mix * self.rl_fast_beta + (1 - self.rl_lambda_mix) * self.rl_slow_beta
+
+    @property
+    def rl_trust_value(self) -> float:
+        """Compute RL trust value from effective dual-horizon parameters."""
+        effective_alpha = self.rl_effective_alpha
+        effective_beta = self.rl_effective_beta
+        return effective_alpha / (effective_alpha + effective_beta)
+
+    @property
+    def rl_confidence(self) -> float:
+        """Compute RL trust confidence (strength of belief)."""
+        return self.rl_effective_alpha + self.rl_effective_beta
+
+    def update_rl_trust(self, delta_alpha: float, delta_beta: float, fast_ratio: float = 0.8):
+        """Update RL dual-horizon trust buffers."""
+        # Update fast buffer with higher proportion
+        self.rl_fast_alpha += delta_alpha * fast_ratio
+        self.rl_fast_beta += delta_beta * fast_ratio
+
+        # Update slow buffer with remaining proportion
+        self.rl_slow_alpha += delta_alpha * (1 - fast_ratio)
+        self.rl_slow_beta += delta_beta * (1 - fast_ratio)
+
+    def apply_rl_forgetting(self, gamma_forget: float = 0.01):
+        """Apply forgetting toward (1,1) for RL trust buffers."""
+        # Fast buffer forgetting
+        self.rl_fast_alpha = (1 - gamma_forget) * self.rl_fast_alpha + gamma_forget * 1.0
+        self.rl_fast_beta = (1 - gamma_forget) * self.rl_fast_beta + gamma_forget * 1.0
+
+        # Slow buffer forgetting
+        self.rl_slow_alpha = (1 - gamma_forget) * self.rl_slow_alpha + gamma_forget * 1.0
+        self.rl_slow_beta = (1 - gamma_forget) * self.rl_slow_beta + gamma_forget * 1.0
+
+    def apply_rl_strength_cap(self, strength_max: float = 50.0):
+        """Apply strength caps to prevent over-confidence in RL buffers."""
+        # Cap fast buffer
+        fast_strength = self.rl_fast_alpha + self.rl_fast_beta
+        if fast_strength > strength_max:
+            scale = strength_max / fast_strength
+            self.rl_fast_alpha *= scale
+            self.rl_fast_beta *= scale
+
+        # Cap slow buffer
+        slow_strength = self.rl_slow_alpha + self.rl_slow_beta
+        if slow_strength > strength_max:
+            scale = strength_max / slow_strength
+            self.rl_slow_alpha *= scale
+            self.rl_slow_beta *= scale
 
     def update_state(self, position: np.ndarray, velocity: np.ndarray, timestamp: float):
         """Update track state estimates."""
@@ -138,6 +208,13 @@ class Robot:
         # Robot trust distribution parameters
         self.trust_alpha = trust_alpha
         self.trust_beta = trust_beta
+
+        # RL dual-horizon trust buffers (for RL trust system)
+        self.rl_fast_alpha = trust_alpha
+        self.rl_fast_beta = trust_beta
+        self.rl_slow_alpha = trust_alpha
+        self.rl_slow_beta = trust_beta
+        self.rl_lambda_mix = 0.7  # Mixing parameter (70% fast, 30% slow)
         
         # Field of view parameters
         self.fov_range = fov_range
@@ -162,8 +239,67 @@ class Robot:
     
     def update_trust(self, delta_alpha: float, delta_beta: float):
         """Update robot trust distribution parameters."""
-        self.trust_alpha += delta_alpha 
-        self.trust_beta += delta_beta 
+        self.trust_alpha += delta_alpha
+        self.trust_beta += delta_beta
+
+    # RL dual-horizon trust methods
+    @property
+    def rl_effective_alpha(self) -> float:
+        """Compute effective alpha from dual-horizon buffers."""
+        return self.rl_lambda_mix * self.rl_fast_alpha + (1 - self.rl_lambda_mix) * self.rl_slow_alpha
+
+    @property
+    def rl_effective_beta(self) -> float:
+        """Compute effective beta from dual-horizon buffers."""
+        return self.rl_lambda_mix * self.rl_fast_beta + (1 - self.rl_lambda_mix) * self.rl_slow_beta
+
+    @property
+    def rl_trust_value(self) -> float:
+        """Compute RL trust value from effective dual-horizon parameters."""
+        effective_alpha = self.rl_effective_alpha
+        effective_beta = self.rl_effective_beta
+        return effective_alpha / (effective_alpha + effective_beta)
+
+    @property
+    def rl_confidence(self) -> float:
+        """Compute RL trust confidence (strength of belief)."""
+        return self.rl_effective_alpha + self.rl_effective_beta
+
+    def update_rl_trust(self, delta_alpha: float, delta_beta: float, fast_ratio: float = 0.8):
+        """Update RL dual-horizon trust buffers."""
+        # Update fast buffer with higher proportion
+        self.rl_fast_alpha += delta_alpha * fast_ratio
+        self.rl_fast_beta += delta_beta * fast_ratio
+
+        # Update slow buffer with remaining proportion
+        self.rl_slow_alpha += delta_alpha * (1 - fast_ratio)
+        self.rl_slow_beta += delta_beta * (1 - fast_ratio)
+
+    def apply_rl_forgetting(self, gamma_forget: float = 0.01):
+        """Apply forgetting toward (1,1) for RL trust buffers."""
+        # Fast buffer forgetting
+        self.rl_fast_alpha = (1 - gamma_forget) * self.rl_fast_alpha + gamma_forget * 1.0
+        self.rl_fast_beta = (1 - gamma_forget) * self.rl_fast_beta + gamma_forget * 1.0
+
+        # Slow buffer forgetting
+        self.rl_slow_alpha = (1 - gamma_forget) * self.rl_slow_alpha + gamma_forget * 1.0
+        self.rl_slow_beta = (1 - gamma_forget) * self.rl_slow_beta + gamma_forget * 1.0
+
+    def apply_rl_strength_cap(self, strength_max: float = 50.0):
+        """Apply strength caps to prevent over-confidence in RL buffers."""
+        # Cap fast buffer
+        fast_strength = self.rl_fast_alpha + self.rl_fast_beta
+        if fast_strength > strength_max:
+            scale = strength_max / fast_strength
+            self.rl_fast_alpha *= scale
+            self.rl_fast_beta *= scale
+
+        # Cap slow buffer
+        slow_strength = self.rl_slow_alpha + self.rl_slow_beta
+        if slow_strength > strength_max:
+            scale = strength_max / slow_strength
+            self.rl_slow_alpha *= scale
+            self.rl_slow_beta *= scale 
 
     def update_state(self, position: np.ndarray, velocity: np.ndarray = None):
         """Update robot position, velocity, and orientation."""
