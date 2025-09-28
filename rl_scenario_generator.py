@@ -73,10 +73,10 @@ class RLScenarioGenerator:
         self.episode_length = episode_length
         self.curriculum_learning = curriculum_learning
 
-        # Curriculum learning state - START WITH HIGH COMPLEXITY
-        self.current_complexity = 1.0005  # Start with lots of robots/targets (complex)
-        self.complexity_decrement = 0.0005  # Gradual decrease to simpler scenarios (very slow for long training)
-        self.min_complexity = 0.0  # End with fewer robots/targets (simple)
+        # Curriculum learning state - START WITH LOW COMPLEXITY (traditional curriculum)
+        self.current_complexity = 0.0  # Start with fewer robots/targets (simple)
+        self.complexity_increment = 0.0005  # Gradual increase to more complex scenarios
+        self.max_complexity = 1.0  # End with lots of robots/targets (complex)
 
         # Scenario templates for variety
         self.scenario_templates = [
@@ -100,11 +100,11 @@ class RLScenarioGenerator:
         Returns:
             ScenarioParameters for the episode
         """
-        # Update complexity for curriculum learning (start high, gradually decrease)
+        # Update complexity for curriculum learning (start low, gradually increase)
         if self.curriculum_learning:
-            self.current_complexity = max(
-                self.min_complexity,
-                self.current_complexity - self.complexity_decrement
+            self.current_complexity = min(
+                self.max_complexity,
+                self.current_complexity + self.complexity_increment
             )
         else:
             self.current_complexity = random.uniform(0.0, 1.0)
@@ -130,7 +130,7 @@ class RLScenarioGenerator:
             world_size=params['world_size'],
             proximal_range=self.proximal_range,
             episode_length=params['episode_length'],
-            difficulty_level=1.0 - self.current_complexity  # High complexity = low difficulty score
+            difficulty_level=self.current_complexity  # Low complexity = low difficulty, high complexity = high difficulty
         )
 
     def _sample_base_parameters(self) -> Dict:
@@ -245,18 +245,18 @@ class RLScenarioGenerator:
         Apply curriculum learning scaling to parameters
 
         Args:
-            complexity: Current complexity level (1.0 = start with lots of robots/targets, 0.0 = end with fewer)
+            complexity: Current complexity level (0.0 = start with fewer robots/targets, 1.0 = end with lots)
         """
 
         if not self.curriculum_learning:
             return params
 
-        # Start with MAX robots/targets and gradually reduce to smaller scenarios
+        # Start with MIN robots/targets and gradually increase to larger scenarios
         robot_range_size = self.num_robots_range[1] - self.num_robots_range[0]
         target_range_size = self.num_targets_range[1] - self.num_targets_range[0]
 
-        # complexity = 1.0: use max values (lots of robots/targets)
         # complexity = 0.0: use min values (fewer robots/targets)
+        # complexity = 1.0: use max values (lots of robots/targets)
         curriculum_robots = int(self.num_robots_range[0] + complexity * robot_range_size)
         curriculum_targets = int(self.num_targets_range[0] + complexity * target_range_size)
 
@@ -264,30 +264,8 @@ class RLScenarioGenerator:
         params['num_robots'] = curriculum_robots
         params['num_targets'] = curriculum_targets
 
-        # Scale adversarial parameters - start with moderate challenge, gradually increase
-        base_adv = params['adversarial_ratio']
-        base_fp = params['false_positive_rate']
-        base_fn = params['false_negative_rate']
-
-        # As scenarios get simpler (fewer robots), make individual challenges harder
-        challenge_factor = 1.0 - complexity  # 0.0 at start -> 1.0 at end
-
-        adv_range_size = self.adversarial_ratio_range[1] - self.adversarial_ratio_range[0]
-        fp_range_size = self.false_positive_rate_range[1] - self.false_positive_rate_range[0]
-        fn_range_size = self.false_negative_rate_range[1] - self.false_negative_rate_range[0]
-
-        params['adversarial_ratio'] = min(
-            self.adversarial_ratio_range[1],
-            base_adv + challenge_factor * adv_range_size * 0.3
-        )
-        params['false_positive_rate'] = min(
-            self.false_positive_rate_range[1],
-            base_fp + challenge_factor * fp_range_size * 0.4
-        )
-        params['false_negative_rate'] = min(
-            self.false_negative_rate_range[1],
-            base_fn + challenge_factor * fn_range_size * 0.2
-        )
+        # Keep adversarial parameters as randomly sampled (no curriculum scaling)
+        # Only num_robots and num_targets follow curriculum progression
 
         # Use fixed episode length (no curriculum scaling for episode length)
         params['episode_length'] = self.episode_length
@@ -356,8 +334,8 @@ class RLScenarioGenerator:
         """Get current curriculum learning statistics"""
         return {
             'current_complexity': self.current_complexity,
-            'min_complexity': self.min_complexity,
-            'curriculum_progress': (1.0 - self.current_complexity),  # 0.0 at start -> 1.0 at end
+            'max_complexity': self.max_complexity,
+            'curriculum_progress': self.current_complexity,  # 0.0 at start -> 1.0 at end
             'curriculum_enabled': self.curriculum_learning,
             'robots_range': f"{int(self.num_robots_range[0] + self.current_complexity * (self.num_robots_range[1] - self.num_robots_range[0]))}",
             'targets_range': f"{int(self.num_targets_range[0] + self.current_complexity * (self.num_targets_range[1] - self.num_targets_range[0]))}"

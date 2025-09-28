@@ -63,12 +63,6 @@ class TrainingConfig:
     clip_rewards: bool = True  # Clip rewards for stability
     reward_clip_range: float = 10.0  # Reward clipping range
 
-    # KL divergence control (improved for stable training)
-    target_kl: float = 0.02  # Target KL for adaptive early stopping
-    kl_tolerance: float = 2.0  # Allow KL up to tolerance * target_kl before stopping
-    adaptive_kl: bool = True  # Use adaptive KL threshold based on training progress
-    kl_penalty_coef: float = 0.0  # KL penalty coefficient (disabled for now)
-
     # Advantage processing (blueprint options)
     divide_advantage_by_ego_count: bool = True  # Divide by ego count for balanced gradient mass
     standardize_advantages: bool = True  # Advantage standardization over ego samples
@@ -125,10 +119,8 @@ class PPOTrainer:
         self.value_losses = []
         self.policy_losses = []
         self.entropy_values = []
-        self.kl_divergences = []
         self.total_updates = 0
         self.trajectory_counts = []
-        self.early_stops = 0
 
         # Episode state tracking (reset at episode start to prevent leakage)
         self.prev_robot_trusts = {}   # Dict[int, float] - previous step robot trust values
@@ -751,8 +743,8 @@ class PPOTrainer:
                         maturity = min(1.0, track.observation_count / 10.0)
                         track_score = scores.track_scores.get(track.track_id, 0.5)
                         score_conf = 2 * abs(track_score - 0.5)  # Confidence as distance from 0.5
-                        # Degree (number of robots that detected this track)
-                        degree = sum(1 for r in robots if any(t.track_id == track.track_id for t in r.get_current_timestep_tracks()))
+                        # Degree (number of participating robots that detected this track)
+                        degree = sum(1 for r in participating_robots_sorted if any(t.track_id == track.track_id for t in r.get_current_timestep_tracks()))
                         track_features.append([trust_mean, strength, delta_trust, maturity, track_score, score_conf, degree])
 
                     robot_features_tensor = torch.tensor(robot_features, dtype=torch.float32, device=self.device) if robot_features else torch.zeros(0, 6, device=self.device)
@@ -777,7 +769,7 @@ class PPOTrainer:
                     robot_mask = torch.ones(robot_features_tensor.shape[0], device=self.device) if robot_features_tensor.shape[0] > 0 else None
                     track_mask = torch.ones(track_features_tensor.shape[0], device=self.device) if track_features_tensor.shape[0] > 0 else None
 
-                    robot_actions, track_actions, robot_log_probs, track_log_probs, entropy, robot_alpha_beta, track_alpha_beta = self.updater.policy.sample_actions(
+                    robot_actions, track_actions, robot_log_probs, track_log_probs, entropy, _, _ = self.updater.policy.sample_actions(
                         ego_summary_tensor.unsqueeze(0), robot_features_tensor.unsqueeze(0), track_features_tensor.unsqueeze(0),
                         robot_mask.unsqueeze(0) if robot_mask is not None else None,
                         track_mask.unsqueeze(0) if track_mask is not None else None
@@ -974,7 +966,6 @@ class PPOTrainer:
                 total_policy_loss = 0.0
                 total_value_loss = 0.0
                 total_entropy = 0.0
-                total_kl_div = 0.0
                 batch_count = 0
 
                 # RAGGED SAMPLES APPROACH: Process each sample individually
@@ -1027,11 +1018,6 @@ class PPOTrainer:
                         surr2 = torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon) * advantage
                         policy_loss = -torch.min(surr1, surr2)
 
-                        # Proper KL divergence approximation for PPO monitoring
-                        # KL(old||new) ≈ (log_new - log_old)^2 / 2 for small differences
-                        # Or use the more robust: KL ≈ max(0, log_ratio - (ratio - 1))
-                        kl_div = torch.clamp(total_log_ratio - (ratio - 1), min=0.0)  # More accurate KL approximation
-
                         # Use centralized critic for value loss
                         if step_idx >= 0 and step_idx < len(self.step_S):
                             global_state = self.step_S[step_idx]
@@ -1055,7 +1041,6 @@ class PPOTrainer:
                         total_policy_loss += policy_loss
                         total_value_loss += value_loss
                         total_entropy += entropy
-                        total_kl_div += kl_div
                         batch_count += 1
 
                     except Exception as e:
@@ -1067,32 +1052,9 @@ class PPOTrainer:
                     avg_policy_loss = total_policy_loss / batch_count
                     avg_value_loss = total_value_loss / batch_count
                     avg_entropy = total_entropy / batch_count
-                    avg_kl_div = total_kl_div / batch_count
 
-                    # Improved KL divergence control
-                    approx_kl = abs(avg_kl_div.item())  # Use absolute value
-
-                    # Store KL divergence BEFORE early stopping check (for proper monitoring)
-                    self.kl_divergences.append(approx_kl)
-
-                    # Adaptive KL threshold based on training progress
-                    if self.config.adaptive_kl:
-                        # Allow higher KL in early training, lower in later training
-                        progress = min(1.0, self.total_updates / 1000.0)  # Normalize by 1000 updates
-                        adaptive_threshold = self.config.target_kl * (2.0 - progress)  # Start at 2x, reduce to 1x
-                        kl_threshold = adaptive_threshold * self.config.kl_tolerance
-                    else:
-                        kl_threshold = self.config.target_kl * self.config.kl_tolerance
-
-                    if approx_kl > kl_threshold:
-                        print(f"Early stopping epoch {epoch} due to high KL divergence: {approx_kl:.4f} > {kl_threshold:.4f}")
-                        self.early_stops += 1
-                        break  # Break from current epoch, but continue with remaining epochs
-
-                    # Total loss with optional KL penalty
+                    # Total loss 
                     loss = avg_policy_loss + self.config.value_loss_coef * avg_value_loss - self.config.entropy_coef * avg_entropy
-                    if self.config.kl_penalty_coef > 0:
-                        loss += self.config.kl_penalty_coef * avg_kl_div
 
                     # Store losses for monitoring
                     self.ppo_losses.append(loss.item())
@@ -1111,8 +1073,7 @@ class PPOTrainer:
                     self.optimizer.step()
 
         self.total_updates += 1
-        recent_kl = np.mean(self.kl_divergences[-10:]) if self.kl_divergences else 0
-        print(f"PPO update completed. Total loss: {np.mean(self.ppo_losses[-10:]):.4f}, KL: {recent_kl:.4f}, Early stops: {self.early_stops}")
+        print(f"PPO update completed. Total loss: {np.mean(self.ppo_losses[-10:]):.4f}")
 
     def compute_step_level_advantages(self):
         """
@@ -1273,11 +1234,10 @@ class PPOTrainer:
             if True:
                 avg_reward = np.mean(self.episode_rewards[-10:]) if self.episode_rewards else 0
                 recent_loss = np.mean(self.ppo_losses[-10:]) if self.ppo_losses else 0
-                recent_kl = np.mean(self.kl_divergences[-10:]) if self.kl_divergences else 0
                 current_lr = self.optimizer.param_groups[0]['lr']
                 traj_count = self.trajectory_counts[-1] if self.trajectory_counts else 0
-                print(f"Episode {episode}: Reward = {episode_reward:.4f}, Avg = {avg_reward:.4f}, Loss = {recent_loss:.4f}, KL = {recent_kl:.4f}")
-                print(f"           Updates = {self.total_updates}, LR = {current_lr:.6f}, Trajectories = {traj_count}, Early stops = {self.early_stops}, Time = {episode_time:.2f}s")
+                print(f"Episode {episode}: Reward = {episode_reward:.4f}, Avg = {avg_reward:.4f}, Loss = {recent_loss:.4f}")
+                print(f"           Updates = {self.total_updates}, LR = {current_lr:.6f}, Trajectories = {traj_count}, Time = {episode_time:.2f}s")
 
             # Save best model
             if episode_reward > self.best_reward:
@@ -1294,9 +1254,7 @@ class PPOTrainer:
         print(f"Training completed. Best reward: {self.best_reward:.4f}")
         print(f"Final learning rate: {self.optimizer.param_groups[0]['lr']:.6f}")
         print(f"Total PPO updates: {self.total_updates}")
-        print(f"Early stops due to high KL: {self.early_stops}")
         print(f"Average trajectory count: {np.mean(self.trajectory_counts) if self.trajectory_counts else 0:.1f}")
-        print(f"Average KL divergence: {np.mean(self.kl_divergences) if self.kl_divergences else 0:.4f}")
 
     def plot_training_rewards(self):
         """Plot training rewards over episodes"""
