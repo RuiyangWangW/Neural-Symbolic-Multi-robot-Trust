@@ -34,7 +34,7 @@ class RLScenarioGenerator:
     """
 
     def __init__(self,
-                 num_robots_range: Tuple[int, int] = (3, 8),
+                 num_robots_range: Tuple[int, int] = (3, 10),
                  num_targets_range: Tuple[int, int] = (10, 30),
                  adversarial_ratio_range: Tuple[float, float] = (0.2, 0.5),
                  false_positive_rate_range: Tuple[float, float] = (0.1, 0.7),
@@ -74,7 +74,7 @@ class RLScenarioGenerator:
         self.curriculum_learning = curriculum_learning
 
         # Curriculum learning state - START WITH HIGH COMPLEXITY
-        self.current_complexity = 1.0  # Start with lots of robots/targets (complex)
+        self.current_complexity = 1.0005  # Start with lots of robots/targets (complex)
         self.complexity_decrement = 0.0005  # Gradual decrease to simpler scenarios (very slow for long training)
         self.min_complexity = 0.0  # End with fewer robots/targets (simple)
 
