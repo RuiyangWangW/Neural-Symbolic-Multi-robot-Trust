@@ -92,10 +92,10 @@ class TrustMethodComparison:
             print(f"⚠️ Failed to load RL model: {e}")
 
     def _initialize_rl_system(self):
-        """Initialize the RL trust update system"""
+        """Initialize the RL trust update system with ego-centric architecture"""
         device = 'cpu'  # Use CPU for comparison consistency
 
-        # Initialize RLTrustSystem
+        # Initialize RLTrustSystem with updated ego-centric parameters
         self.rl_trust_system = RLTrustSystem(
             evidence_model_path=self.supervised_model_path,
             updater_model_path=self.rl_model_path,
@@ -695,8 +695,8 @@ def main():
     # =============================================================================
 
     # Simulation Parameters
-    NUM_ROBOTS = 15
-    NUM_TARGETS = 30
+    NUM_ROBOTS = 10
+    NUM_TARGETS = 20
     NUM_TIMESTEPS = 100
     RANDOM_SEED = 8
 

@@ -43,7 +43,7 @@ class RLScenarioGenerator:
                  proximal_range: float = 50.0,
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
-                 episode_length_range: Tuple[int, int] = (50, 200),
+                 episode_length: int = 100,  # Fixed episode length (matches steps_per_episode in train_rl_trust.py)
                  curriculum_learning: bool = True):
         """
         Initialize RL scenario generator
@@ -58,7 +58,7 @@ class RLScenarioGenerator:
             proximal_range: Communication/sensing range
             fov_range: Field of view range
             fov_angle: Field of view angle
-            episode_length_range: Range of episode lengths (min, max)
+            episode_length: Fixed episode length (should match steps_per_episode in train_rl_trust.py)
             curriculum_learning: Whether to use curriculum learning
         """
         self.num_robots_range = num_robots_range
@@ -70,13 +70,13 @@ class RLScenarioGenerator:
         self.proximal_range = proximal_range
         self.fov_range = fov_range
         self.fov_angle = fov_angle
-        self.episode_length_range = episode_length_range
+        self.episode_length = episode_length
         self.curriculum_learning = curriculum_learning
 
-        # Curriculum learning state
-        self.current_difficulty = 0.0  # Start easy
-        self.difficulty_increment = 0.001  # Gradual increase
-        self.max_difficulty = 1.0
+        # Curriculum learning state - START WITH HIGH COMPLEXITY
+        self.current_complexity = 1.0  # Start with lots of robots/targets (complex)
+        self.complexity_decrement = 0.0005  # Gradual decrease to simpler scenarios (very slow for long training)
+        self.min_complexity = 0.0  # End with fewer robots/targets (simple)
 
         # Scenario templates for variety
         self.scenario_templates = [
@@ -100,14 +100,14 @@ class RLScenarioGenerator:
         Returns:
             ScenarioParameters for the episode
         """
-        # Update difficulty for curriculum learning
+        # Update complexity for curriculum learning (start high, gradually decrease)
         if self.curriculum_learning:
-            self.current_difficulty = min(
-                self.max_difficulty,
-                self.current_difficulty + self.difficulty_increment
+            self.current_complexity = max(
+                self.min_complexity,
+                self.current_complexity - self.complexity_decrement
             )
         else:
-            self.current_difficulty = random.uniform(0.0, 1.0)
+            self.current_complexity = random.uniform(0.0, 1.0)
 
         # Sample scenario template
         template = random.choice(self.scenario_templates)
@@ -119,7 +119,7 @@ class RLScenarioGenerator:
         params = self._apply_scenario_template(params, template)
 
         # Apply curriculum scaling
-        params = self._apply_curriculum_scaling(params, self.current_difficulty)
+        params = self._apply_curriculum_scaling(params, self.current_complexity)
 
         return ScenarioParameters(
             num_robots=params['num_robots'],
@@ -130,7 +130,7 @@ class RLScenarioGenerator:
             world_size=params['world_size'],
             proximal_range=self.proximal_range,
             episode_length=params['episode_length'],
-            difficulty_level=self.current_difficulty
+            difficulty_level=1.0 - self.current_complexity  # High complexity = low difficulty score
         )
 
     def _sample_base_parameters(self) -> Dict:
@@ -185,14 +185,8 @@ class RLScenarioGenerator:
         else:
             world_size = min_size
 
-        # Sample episode length with increment of 10
-        min_len, max_len = self.episode_length_range
-        len_steps = (max_len - min_len) // 10
-        if len_steps > 0:
-            len_step = random.randint(0, len_steps)
-            episode_length = min_len + (len_step * 10)
-        else:
-            episode_length = min_len
+        # Use fixed episode length
+        episode_length = self.episode_length
 
         return {
             'num_robots': num_robots,
@@ -246,38 +240,57 @@ class RLScenarioGenerator:
 
         return params
 
-    def _apply_curriculum_scaling(self, params: Dict, difficulty: float) -> Dict:
-        """Apply curriculum learning scaling to parameters"""
+    def _apply_curriculum_scaling(self, params: Dict, complexity: float) -> Dict:
+        """
+        Apply curriculum learning scaling to parameters
+
+        Args:
+            complexity: Current complexity level (1.0 = start with lots of robots/targets, 0.0 = end with fewer)
+        """
 
         if not self.curriculum_learning:
             return params
 
-        # Scale difficulty parameters based on curriculum progress
+        # Start with MAX robots/targets and gradually reduce to smaller scenarios
+        robot_range_size = self.num_robots_range[1] - self.num_robots_range[0]
+        target_range_size = self.num_targets_range[1] - self.num_targets_range[0]
+
+        # complexity = 1.0: use max values (lots of robots/targets)
+        # complexity = 0.0: use min values (fewer robots/targets)
+        curriculum_robots = int(self.num_robots_range[0] + complexity * robot_range_size)
+        curriculum_targets = int(self.num_targets_range[0] + complexity * target_range_size)
+
+        # Override base parameters with curriculum-adjusted values
+        params['num_robots'] = curriculum_robots
+        params['num_targets'] = curriculum_targets
+
+        # Scale adversarial parameters - start with moderate challenge, gradually increase
         base_adv = params['adversarial_ratio']
         base_fp = params['false_positive_rate']
         base_fn = params['false_negative_rate']
 
-        # Gradually increase challenge within the specified ranges
+        # As scenarios get simpler (fewer robots), make individual challenges harder
+        challenge_factor = 1.0 - complexity  # 0.0 at start -> 1.0 at end
+
         adv_range_size = self.adversarial_ratio_range[1] - self.adversarial_ratio_range[0]
         fp_range_size = self.false_positive_rate_range[1] - self.false_positive_rate_range[0]
         fn_range_size = self.false_negative_rate_range[1] - self.false_negative_rate_range[0]
 
         params['adversarial_ratio'] = min(
             self.adversarial_ratio_range[1],
-            base_adv + difficulty * adv_range_size * 0.5
+            base_adv + challenge_factor * adv_range_size * 0.3
         )
         params['false_positive_rate'] = min(
             self.false_positive_rate_range[1],
-            base_fp + difficulty * fp_range_size * 0.6
+            base_fp + challenge_factor * fp_range_size * 0.4
         )
         params['false_negative_rate'] = min(
             self.false_negative_rate_range[1],
-            base_fn + difficulty * fn_range_size * 0.4
+            base_fn + challenge_factor * fn_range_size * 0.2
         )
 
-        # Scale episode length and complexity
-        base_length = params['episode_length']
-        params['episode_length'] = int(base_length + difficulty * 50)
+        # Use fixed episode length (no curriculum scaling for episode length)
+        params['episode_length'] = self.episode_length
 
         return params
 
@@ -342,19 +355,21 @@ class RLScenarioGenerator:
     def get_curriculum_stats(self) -> Dict:
         """Get current curriculum learning statistics"""
         return {
-            'current_difficulty': self.current_difficulty,
-            'max_difficulty': self.max_difficulty,
-            'curriculum_progress': self.current_difficulty / self.max_difficulty,
-            'curriculum_enabled': self.curriculum_learning
+            'current_complexity': self.current_complexity,
+            'min_complexity': self.min_complexity,
+            'curriculum_progress': (1.0 - self.current_complexity),  # 0.0 at start -> 1.0 at end
+            'curriculum_enabled': self.curriculum_learning,
+            'robots_range': f"{int(self.num_robots_range[0] + self.current_complexity * (self.num_robots_range[1] - self.num_robots_range[0]))}",
+            'targets_range': f"{int(self.num_targets_range[0] + self.current_complexity * (self.num_targets_range[1] - self.num_targets_range[0]))}"
         }
 
     def reset_curriculum(self):
-        """Reset curriculum learning to start difficulty"""
-        self.current_difficulty = 0.0
+        """Reset curriculum learning to start complexity (lots of robots/targets)"""
+        self.current_complexity = 1.0
 
-    def set_difficulty(self, difficulty: float):
-        """Manually set difficulty level"""
-        self.current_difficulty = max(0.0, min(1.0, difficulty))
+    def set_complexity(self, complexity: float):
+        """Manually set complexity level (1.0 = lots of robots/targets, 0.0 = fewer)"""
+        self.current_complexity = max(0.0, min(1.0, complexity))
 
 
 # Example usage and testing
@@ -371,14 +386,17 @@ if __name__ == "__main__":
 
     print("\n=== Testing Scenario Generation ===")
 
-    # Generate scenarios for different episodes
-    for episode in [0, 10, 50, 100]:
+    # Generate scenarios for different episodes to show curriculum progression
+    print("Curriculum progression (start with lots of robots/targets, gradually decrease):")
+    for episode in [0, 500, 1000, 2000]:
         params = generator.sample_scenario_parameters(episode)
+        stats = generator.get_curriculum_stats()
 
         print(f"\nEpisode {episode}:")
-        print(f"  Difficulty: {params.difficulty_level:.3f}")
-        print(f"  Robots: {params.num_robots}")
-        print(f"  Targets: {params.num_targets}")
+        print(f"  Complexity: {stats['current_complexity']:.3f}")
+        print(f"  Progress: {stats['curriculum_progress']:.1%}")
+        print(f"  Robots: {params.num_robots} (range: {generator.num_robots_range})")
+        print(f"  Targets: {params.num_targets} (range: {generator.num_targets_range})")
         print(f"  Adversarial ratio: {params.adversarial_ratio:.1f}")
         print(f"  False positive rate: {params.false_positive_rate:.1f}")
         print(f"  Episode length: {params.episode_length}")
@@ -386,9 +404,9 @@ if __name__ == "__main__":
     # Test scenario creation
     print("\n=== Testing Scenario Creation ===")
     params = generator.sample_scenario_parameters(0)
-    robots, ground_truth = generator.create_scenario_environment(params)
+    sim_env, ground_truth = generator.create_scenario_environment(params)
 
-    print(f"Created scenario with {len(robots)} robots")
+    print(f"Created scenario with {len(sim_env.robots)} robots")
     print(f"Adversarial agents: {ground_truth['adversarial_agents']}")
     print(f"False tracks: {len(ground_truth['false_tracks'])}")
 

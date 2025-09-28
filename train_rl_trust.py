@@ -33,8 +33,12 @@ class TrainingConfig:
     entropy_coef: float = 0.005  # Entropy coefficient
     max_grad_norm: float = 0.5  # Gradient clipping (0.5-1.0 range)
 
+    # Fixed padding limits (to prevent tensor size mismatches)
+    max_robots: int = 50  # Maximum number of robots to pad to
+    max_tracks: int = 100  # Maximum number of tracks to pad to
+
     # Training schedule (safe starting point)
-    num_episodes: int = 1000  # Total episodes for training
+    num_episodes: int = 5000  # Total episodes for training
     steps_per_episode: int = 100
     update_every_episodes: int = 10  # How often to run PPO updates
     ppo_epochs: int = 4  # PPO epochs per update
@@ -148,6 +152,8 @@ class PPOTrainer:
         self.ego_logp_T = []       # List[Tensor[N_T]] - Track log probs (old)
         self.ego_entropy = []      # List[float] - Entropy values
         self.ego_step_idx = []     # List[int] - Step indices for broadcasting A_t
+        self.ego_robot_mask = []   # List[Tensor[N_R]] - Robot masks
+        self.ego_track_mask = []   # List[Tensor[N_T]] - Track masks
 
 
     def compute_step_reward(self, all_robots: List[Robot], ground_truth: Dict) -> float:
@@ -573,6 +579,47 @@ class PPOTrainer:
 
         return tier0_summary, tier2_robot_features, tier2_track_features
 
+    def pad_and_mask_tensors(self, robot_features: torch.Tensor, track_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Pad robot and track features to fixed sizes and create masks
+
+        Args:
+            robot_features: [N_R, 6] current robot features
+            track_features: [N_T, 7] current track features
+
+        Returns:
+            Tuple of (padded_robot_features, padded_track_features, robot_mask, track_mask)
+        """
+        device = self.device
+        max_robots = self.config.max_robots
+        max_tracks = self.config.max_tracks
+
+        # Get current sizes
+        n_robots = robot_features.size(0)
+        n_tracks = track_features.size(0)
+
+        # Validate that we don't exceed the fixed limits
+        if n_robots > max_robots:
+            raise ValueError(f"Number of robots ({n_robots}) exceeds maximum limit ({max_robots})")
+        if n_tracks > max_tracks:
+            raise ValueError(f"Number of tracks ({n_tracks}) exceeds maximum limit ({max_tracks})")
+
+        # Create padded robot features
+        padded_robot_features = torch.zeros(max_robots, 6, device=device)
+        robot_mask = torch.zeros(max_robots, device=device)
+        if n_robots > 0:
+            padded_robot_features[:n_robots] = robot_features
+            robot_mask[:n_robots] = 1.0
+
+        # Create padded track features
+        padded_track_features = torch.zeros(max_tracks, 7, device=device)
+        track_mask = torch.zeros(max_tracks, device=device)
+        if n_tracks > 0:
+            padded_track_features[:n_tracks] = track_features
+            track_mask[:n_tracks] = 1.0
+
+        return padded_robot_features, padded_track_features, robot_mask, track_mask
+
     def run_episode(self) -> float:
         """Run one training episode"""
 
@@ -580,6 +627,8 @@ class PPOTrainer:
         self.prev_robot_trusts = {}
         self.prev_track_trusts = {}
         self.prev_step_reward = 0.0
+
+        # Note: Using fixed padding limits from config (no dynamic episode-level padding)
 
         # Generate scenario parameters
         scenario_params = self.scenario_generator.sample_scenario_parameters(self.episode_count)
@@ -620,6 +669,22 @@ class PPOTrainer:
                 precomputed_decisions = {}
                 all_trajectory_data = []  # Will store data for ALL participating egos
 
+                # First pass: collect all GNN scores for global state (detached for critic)
+                for ego_robot in robots:
+                    scores = self.trust_system.evidence_extractor.get_scores(ego_robot, robots)
+                    if scores.agent_scores or scores.track_scores:
+                        # Detach GNN scores to prevent backprop into evidence GNN from RL training
+                        detached_agent_scores = {k: float(v) for k, v in scores.agent_scores.items()}
+                        detached_track_scores = {k: float(v) for k, v in scores.track_scores.items()}
+                        all_gnn_scores['agent_scores'].update(detached_agent_scores)
+                        all_gnn_scores['track_scores'].update(detached_track_scores)
+
+                # Build tier0 features early (needed for SetTransformer)
+                tier0_features = self.build_global_state_tensor(
+                    robots, all_gnn_scores, step, scenario_params.episode_length,
+                    participating_robots=None, participating_tracks=None  # Will be filled per ego
+                )
+
                 # Loop over all robots as ego robots (like in ego_sweep_step)
                 for ego_robot in robots:
                     # Get GNN scores for this ego graph
@@ -628,9 +693,12 @@ class PPOTrainer:
                     if not scores.agent_scores and not scores.track_scores:
                         continue  # No scores from GNN
 
-                    # Accumulate GNN scores for global summary
-                    all_gnn_scores['agent_scores'].update(scores.agent_scores)
-                    all_gnn_scores['track_scores'].update(scores.track_scores)
+                    # Accumulate GNN scores for global summary (detached for critic)
+                    # Detach GNN scores to prevent backprop into evidence GNN from RL training
+                    detached_agent_scores = {k: float(v) for k, v in scores.agent_scores.items()}
+                    detached_track_scores = {k: float(v) for k, v in scores.track_scores.items()}
+                    all_gnn_scores['agent_scores'].update(detached_agent_scores)
+                    all_gnn_scores['track_scores'].update(detached_track_scores)
 
                     # Get ego graph nodes (same logic as in ego_sweep_step)
                     ego_robot_ids = list(scores.agent_scores.keys())
@@ -657,74 +725,128 @@ class PPOTrainer:
                     participating_robots_sorted = [robot_lookup_local[rid] for rid in robot_ids]
                     participating_tracks_sorted = [track_lookup_local[tid] for tid in track_ids]
 
-                    # Encode state for this ego
-                    state = self.encode_state(ego_robots, ego_tracks, scores.agent_scores, scores.track_scores)
+                    # State encoding is no longer needed since we use tier0_features directly
 
-                    # Build features for participating nodes in sorted order
+                    # Build features for participating nodes in sorted order (SetTransformer format)
                     robot_features = []
                     for robot in participating_robots_sorted:
                         trust_mean = robot.trust_value
-                        trust_conf = min(1.0, (robot.trust_alpha + robot.trust_beta) / 20.0)
+                        strength = robot.trust_alpha + robot.trust_beta
+                        # Delta trust: change from previous step
+                        prev_trust = self.prev_robot_trusts.get(robot.id, trust_mean)
+                        delta_trust = abs(trust_mean - prev_trust)
                         robot_score = scores.agent_scores.get(robot.id, 0.5)
-                        robot_features.append([trust_mean, trust_conf, robot_score])
+                        score_conf = 2 * abs(robot_score - 0.5)  # Confidence as distance from 0.5
+                        # Degree (number of tracks this robot has)
+                        degree = len(robot.get_current_timestep_tracks())
+                        robot_features.append([trust_mean, strength, delta_trust, robot_score, score_conf, degree])
 
                     track_features = []
                     for track in participating_tracks_sorted:
                         trust_mean = track.trust_value
-                        trust_conf = min(1.0, (track.trust_alpha + track.trust_beta) / 20.0)
-                        track_score = scores.track_scores.get(track.track_id, 0.5)
+                        strength = track.trust_alpha + track.trust_beta
+                        # Delta trust: change from previous step
+                        prev_trust = self.prev_track_trusts.get(track.track_id, trust_mean)
+                        delta_trust = abs(trust_mean - prev_trust)
                         maturity = min(1.0, track.observation_count / 10.0)
-                        track_features.append([trust_mean, trust_conf, track_score, maturity])
+                        track_score = scores.track_scores.get(track.track_id, 0.5)
+                        score_conf = 2 * abs(track_score - 0.5)  # Confidence as distance from 0.5
+                        # Degree (number of robots that detected this track)
+                        degree = sum(1 for r in robots if any(t.track_id == track.track_id for t in r.get_current_timestep_tracks()))
+                        track_features.append([trust_mean, strength, delta_trust, maturity, track_score, score_conf, degree])
 
-                    robot_features_tensor = torch.tensor(robot_features, dtype=torch.float32, device=self.device) if robot_features else torch.zeros(0, 3, device=self.device)
-                    track_features_tensor = torch.tensor(track_features, dtype=torch.float32, device=self.device) if track_features else torch.zeros(0, 4, device=self.device)
+                    robot_features_tensor = torch.tensor(robot_features, dtype=torch.float32, device=self.device) if robot_features else torch.zeros(0, 6, device=self.device)
+                    track_features_tensor = torch.tensor(track_features, dtype=torch.float32, device=self.device) if track_features else torch.zeros(0, 7, device=self.device)
 
-                    # Sample actions using actor policy (as per blueprint)
-                    summary_tensor = state.unsqueeze(0).to(self.device)
+                    # Create ego graph summary for this ego robot (local stats only)
+                    ego_summary = self.updater.create_ego_graph_summary(
+                        ego_robots, ego_tracks, scores.agent_scores, scores.track_scores
+                    )
+                    ego_summary_tensor = torch.tensor([
+                        ego_summary.robot_trust_mean, ego_summary.robot_trust_std, ego_summary.robot_trust_count,
+                        ego_summary.track_trust_mean, ego_summary.track_trust_std, ego_summary.track_trust_count,
+                        ego_summary.robot_score_mean, ego_summary.robot_score_std,
+                        ego_summary.track_score_mean, ego_summary.track_score_std
+                    ], dtype=torch.float32, device=self.device)
+
+                    # Sample actions using SetTransformer actor policy
                     robot_features_tensor = robot_features_tensor.to(self.device)
                     track_features_tensor = track_features_tensor.to(self.device)
 
-                    robot_actions, track_actions, robot_log_probs, track_log_probs, entropy = self.updater.policy.sample_actions(
-                        summary_tensor, robot_features_tensor, track_features_tensor
+                    # Create masks (no padding needed here since these are actual participating entities)
+                    robot_mask = torch.ones(robot_features_tensor.shape[0], device=self.device) if robot_features_tensor.shape[0] > 0 else None
+                    track_mask = torch.ones(track_features_tensor.shape[0], device=self.device) if track_features_tensor.shape[0] > 0 else None
+
+                    robot_actions, track_actions, robot_log_probs, track_log_probs, entropy, robot_alpha_beta, track_alpha_beta = self.updater.policy.sample_actions(
+                        ego_summary_tensor.unsqueeze(0), robot_features_tensor.unsqueeze(0), track_features_tensor.unsqueeze(0),
+                        robot_mask.unsqueeze(0) if robot_mask is not None else None,
+                        track_mask.unsqueeze(0) if track_mask is not None else None
                     )
+                    # Remove batch dimension from outputs
+                    robot_actions = robot_actions.squeeze(0)
+                    track_actions = track_actions.squeeze(0)
+                    robot_log_probs = robot_log_probs.squeeze(0)
+                    track_log_probs = track_log_probs.squeeze(0)
+                    entropy = entropy.squeeze(0)
 
                     # Convert sampled actions to step decision format for trust updater
                     step_decision = UpdateDecision({}, {})
                     for i, robot_id in enumerate(robot_ids):
                         if i < len(robot_actions):
-                            step_decision.robot_steps[robot_id] = float(robot_actions[i])
+                            step_decision.robot_steps[robot_id] = float(robot_actions[i].detach())
                     for i, track_id in enumerate(track_ids):
                         if i < len(track_actions):
-                            step_decision.track_steps[track_id] = float(track_actions[i])
+                            step_decision.track_steps[track_id] = float(track_actions[i].detach())
 
                     precomputed_decisions[ego_robot.id] = step_decision
 
                     # Store trajectory data for this ego (detached to avoid gradient conflicts)
-                    # Include IDs to maintain exact ordering consistency
-                    ego_trajectory_data = [state.detach(), robot_features_tensor.detach(), track_features_tensor.detach(),
+                    # Include IDs to maintain exact ordering consistency and ego summary for SetTransformer
+                    ego_trajectory_data = [ego_summary_tensor.detach(), robot_features_tensor.detach(), track_features_tensor.detach(),
                                          robot_actions.detach(), track_actions.detach(), robot_log_probs.detach(), track_log_probs.detach(),
-                                         robot_ids.copy(), track_ids.copy()]  # Store IDs for ordering verification
+                                         robot_ids.copy(), track_ids.copy(), robot_mask, track_mask]  # Store everything needed for SetTransformer
                     all_trajectory_data.append(ego_trajectory_data)
 
-                # Build complete global state (combines Tier 0 + Tier 2)
+                # Fix scope bug: compute environment-level participating entities from detection maps
+                env_participating_robot_ids = set(robot_detections.keys())
+                env_participating_track_ids = set(track_detectors.keys())
+
+                env_participating_robots = [r for r in robots if r.id in env_participating_robot_ids]
+                env_participating_tracks = [track_lookup[tid] for tid in env_participating_track_ids if tid in track_lookup]
+
+                # Build complete global state (combines Tier 0 + Tier 2) with detached GNN evidence
                 tier0_summary, tier2_robot_features, tier2_track_features = self.build_complete_global_state(
                     robots, all_gnn_scores, step, scenario_params.episode_length,
-                    participating_robots, participating_tracks
+                    participating_robots=env_participating_robots,
+                    participating_tracks=env_participating_tracks
                 )
 
-                # Create global state tensor for storage (combines all components)
+                # Apply fixed padding and masking for consistent tensor sizes
+                padded_robot_features, padded_track_features, robot_mask, track_mask = self.pad_and_mask_tensors(
+                    tier2_robot_features, tier2_track_features
+                )
+
+                # Create global state tensor for storage (combines all components with fixed padding)
                 global_state_tensor = {
                     'tier0': tier0_summary,
-                    'tier2_robots': tier2_robot_features,
-                    'tier2_tracks': tier2_track_features
+                    'tier2_robots': padded_robot_features,
+                    'tier2_tracks': padded_track_features,
+                    'robot_mask': robot_mask,
+                    'track_mask': track_mask,
+                    'max_robots': self.config.max_robots,
+                    'max_tracks': self.config.max_tracks,
+                    'actual_robots': tier2_robot_features.size(0),
+                    'actual_tracks': tier2_track_features.size(0)
                 }
 
-                # Get centralized critic value estimate for this step
+                # Get centralized critic value estimate for this step with proper masking
                 with torch.no_grad():
                     step_value = self.critic(
                         tier0_summary.unsqueeze(0),  # [1, 34]
-                        tier2_robot_features.unsqueeze(0),  # [1, N_R, 6]
-                        tier2_track_features.unsqueeze(0)   # [1, N_T, 7]
+                        padded_robot_features.unsqueeze(0),  # [1, max_robots, 6]
+                        padded_track_features.unsqueeze(0),  # [1, max_tracks, 7]
+                        robot_mask.unsqueeze(0),  # [1, max_robots]
+                        track_mask.unsqueeze(0)   # [1, max_tracks]
                     ).item()
 
                 # Apply trust updates using precomputed decisions
@@ -755,14 +877,10 @@ class PPOTrainer:
                 # Update previous step reward for next step's feature computation
                 self.prev_step_reward = step_reward
 
-                # Store step-level data using new buffer format with padding info
+                # Store step-level data using new buffer format with proper padding
                 current_step_idx = len(self.step_R)
 
-                # Add padding info to global state for efficient batching later
-                global_state_tensor['max_robots'] = tier2_robot_features.size(0)
-                global_state_tensor['max_tracks'] = tier2_track_features.size(0)
-
-                self.step_S.append(global_state_tensor)  # Store complete global state
+                self.step_S.append(global_state_tensor)  # Store complete global state with padding
                 self.step_V.append(torch.tensor([step_value], device=self.device))  # Tensor[1]
                 self.step_R.append(step_reward)  # float
                 self.step_done.append(step == scenario_params.episode_length - 1)  # bool
@@ -773,12 +891,12 @@ class PPOTrainer:
 
                 # Collect ego-level data for ALL participating egos using new buffer format
                 for ego_trajectory_data in all_trajectory_data:
-                    state, robot_features_tensor, track_features_tensor, robot_actions, track_actions, robot_log_probs, track_log_probs, robot_ids, track_ids = ego_trajectory_data
+                    ego_summary_ego, robot_features_tensor, track_features_tensor, robot_actions, track_actions, robot_log_probs, track_log_probs, robot_ids, track_ids, robot_mask, track_mask = ego_trajectory_data
 
                     # Store ego-level data using new buffer format
                     ego_item_idx = len(self.ego_summary)
 
-                    self.ego_summary.append(state.detach())  # Tensor[D_local] - ego graph summary
+                    self.ego_summary.append(ego_summary_ego.detach())  # Tensor[ego_summary_dim] - ego graph summary
                     self.ego_R_feats.append(robot_features_tensor.detach())  # Tensor[N_R, F_R] - robot features
                     self.ego_T_feats.append(track_features_tensor.detach())  # Tensor[N_T, F_T] - track features
                     self.ego_a_R.append(robot_actions.detach())  # Tensor[N_R] - robot actions
@@ -787,6 +905,8 @@ class PPOTrainer:
                     self.ego_logp_T.append(track_log_probs.detach())  # Tensor[N_T] - track log probs (old)
                     self.ego_entropy.append(float(entropy.item() if hasattr(entropy, 'item') else entropy))  # float - entropy
                     self.ego_step_idx.append(current_step_idx)  # int - step index for broadcasting A_t
+                    self.ego_robot_mask.append(robot_mask.detach() if robot_mask is not None else torch.empty(0, device=self.device))
+                    self.ego_track_mask.append(track_mask.detach() if track_mask is not None else torch.empty(0, device=self.device))
 
                     # Map step to ego item index
                     self.step_to_item_indices[current_step_idx].append(ego_item_idx)
@@ -797,8 +917,9 @@ class PPOTrainer:
 
         # Episode-end reward is now included in the final step above
 
-
-        return episode_reward
+        # Normalize episode reward by episode length for fair comparison across different scenario sizes
+        normalized_episode_reward = episode_reward / max(scenario_params.episode_length, 1)
+        return normalized_episode_reward
 
     def clear_trajectories(self):
         """Clear trajectory storage after PPO update"""
@@ -819,6 +940,8 @@ class PPOTrainer:
         self.ego_logp_T.clear()
         self.ego_entropy.clear()
         self.ego_step_idx.clear()
+        self.ego_robot_mask.clear()
+        self.ego_track_mask.clear()
 
     def ppo_update(self):
         """Perform PPO policy update using collected trajectories"""
@@ -858,9 +981,11 @@ class PPOTrainer:
                 for idx, i in enumerate(batch_indices):
                     try:
                         # Move sample's tensors to device (ragged - no padding needed)
-                        summary = self.ego_summary[i].unsqueeze(0).to(self.device)  # [1, D_local]
+                        ego_summary = self.ego_summary[i].to(self.device)  # [ego_summary_dim] - ego graph summary
                         robot_features = self.ego_R_feats[i].to(self.device)  # [N_R, F_R] - variable N_R
                         track_features = self.ego_T_feats[i].to(self.device)  # [N_T, F_T] - variable N_T
+                        robot_mask = self.ego_robot_mask[i].to(self.device) if self.ego_robot_mask[i].numel() > 0 else None
+                        track_mask = self.ego_track_mask[i].to(self.device) if self.ego_track_mask[i].numel() > 0 else None
 
                         robot_actions = self.ego_a_R[i].to(self.device)  # [N_R] - taken robot actions
                         track_actions = self.ego_a_T[i].to(self.device)  # [N_T] - taken track actions
@@ -868,17 +993,32 @@ class PPOTrainer:
                         logp_R_old = self.ego_logp_R[i].to(self.device)  # [N_R] - old log-probs
                         logp_T_old = self.ego_logp_T[i].to(self.device)  # [N_T] - old log-probs
 
-                        # Get new log-probs from current policy (handles zero-length sides)
-                        logp_R_new, logp_T_new, entropy, _, _ = self.updater.policy.evaluate_actions(
-                            summary, robot_features, track_features, robot_actions, track_actions
+                        # Get new log-probs from current policy using SetTransformer interface
+                        logp_R_new, logp_T_new, entropy = self.updater.policy.evaluate_actions(
+                            ego_summary.unsqueeze(0), robot_features.unsqueeze(0), track_features.unsqueeze(0),
+                            robot_actions.unsqueeze(0), track_actions.unsqueeze(0),
+                            robot_mask.unsqueeze(0) if robot_mask is not None else None,
+                            track_mask.unsqueeze(0) if track_mask is not None else None
                         )
+                        # Remove batch dimension from outputs
+                        logp_R_new = logp_R_new.squeeze(0)
+                        logp_T_new = logp_T_new.squeeze(0)
+                        entropy = entropy.squeeze(0)
 
-                        # Compute totals (cleanly handles empty tensors)
-                        logp_old_total = logp_R_old.sum() + logp_T_old.sum()
-                        logp_new_total = logp_R_new.sum() + logp_T_new.sum()
+                        # Compute element-wise log probability ratios (much more stable)
+                        robot_log_ratios = logp_R_new - logp_R_old  # [N_R]
+                        track_log_ratios = logp_T_new - logp_T_old  # [N_T]
 
-                        # Compute ratio and clipped surrogate with broadcast advantage
-                        ratio = torch.exp(logp_new_total - logp_old_total)
+                        # Combine ratios (weighted by mask if available)
+                        if robot_mask is not None and robot_mask.numel() > 0:
+                            robot_log_ratios = robot_log_ratios * robot_mask.float()
+                        if track_mask is not None and track_mask.numel() > 0:
+                            track_log_ratios = track_log_ratios * track_mask.float()
+
+                        # Sum log ratios for total policy ratio (more numerically stable than summing log probs)
+                        total_log_ratio = robot_log_ratios.sum() + track_log_ratios.sum()
+                        ratio = torch.exp(torch.clamp(total_log_ratio, -10, 10))  # Clamp for numerical stability
+
                         step_idx = self.ego_step_idx[i]  # Get step index for broadcasting advantage
                         advantage = batch_advantages[idx]  # Broadcast advantage for this step
 
@@ -887,8 +1027,10 @@ class PPOTrainer:
                         surr2 = torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon) * advantage
                         policy_loss = -torch.min(surr1, surr2)
 
-                        # Simple, stable KL divergence proxy for PPO monitoring
-                        kl_div = (logp_old_total - logp_new_total).abs()  # Stable proxy: |old - new|
+                        # Proper KL divergence approximation for PPO monitoring
+                        # KL(old||new) ≈ (log_new - log_old)^2 / 2 for small differences
+                        # Or use the more robust: KL ≈ max(0, log_ratio - (ratio - 1))
+                        kl_div = torch.clamp(total_log_ratio - (ratio - 1), min=0.0)  # More accurate KL approximation
 
                         # Use centralized critic for value loss
                         if step_idx >= 0 and step_idx < len(self.step_S):
@@ -896,7 +1038,9 @@ class PPOTrainer:
                             tier0_summary = global_state['tier0'].unsqueeze(0).to(self.device)
                             tier2_robot_features = global_state['tier2_robots'].unsqueeze(0).to(self.device)
                             tier2_track_features = global_state['tier2_tracks'].unsqueeze(0).to(self.device)
-                            centralized_value = self.critic(tier0_summary, tier2_robot_features, tier2_track_features)
+                            robot_mask = global_state['robot_mask'].unsqueeze(0).to(self.device)
+                            track_mask = global_state['track_mask'].unsqueeze(0).to(self.device)
+                            centralized_value = self.critic(tier0_summary, tier2_robot_features, tier2_track_features, robot_mask, track_mask)
 
                             # Target comes from step-level returns (already computed)
                             step_target = batch_returns[idx]  # Use position in batch
@@ -928,6 +1072,9 @@ class PPOTrainer:
                     # Improved KL divergence control
                     approx_kl = abs(avg_kl_div.item())  # Use absolute value
 
+                    # Store KL divergence BEFORE early stopping check (for proper monitoring)
+                    self.kl_divergences.append(approx_kl)
+
                     # Adaptive KL threshold based on training progress
                     if self.config.adaptive_kl:
                         # Allow higher KL in early training, lower in later training
@@ -952,12 +1099,15 @@ class PPOTrainer:
                     self.policy_losses.append(avg_policy_loss.item())
                     self.value_losses.append(avg_value_loss.item())
                     self.entropy_values.append(avg_entropy.item())
-                    self.kl_divergences.append(approx_kl)
 
                     # Update policy
                     self.optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.updater.policy.parameters(), self.config.max_grad_norm)
+                    # Clip gradients for both actor and critic (since they're optimized together)
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.updater.policy.parameters()) + list(self.critic.parameters()),
+                        self.config.max_grad_norm
+                    )
                     self.optimizer.step()
 
         self.total_updates += 1
@@ -982,10 +1132,12 @@ class PPOTrainer:
         with torch.no_grad():
             for global_state in self.step_S:
                 tier0_summary = global_state['tier0'].unsqueeze(0).to(self.device)  # [1, 34]
-                tier2_robot_features = global_state['tier2_robots'].unsqueeze(0).to(self.device)  # [1, N_R, 6]
-                tier2_track_features = global_state['tier2_tracks'].unsqueeze(0).to(self.device)  # [1, N_T, 7]
+                tier2_robot_features = global_state['tier2_robots'].unsqueeze(0).to(self.device)  # [1, max_robots, 6]
+                tier2_track_features = global_state['tier2_tracks'].unsqueeze(0).to(self.device)  # [1, max_tracks, 7]
+                robot_mask = global_state['robot_mask'].unsqueeze(0).to(self.device)  # [1, max_robots]
+                track_mask = global_state['track_mask'].unsqueeze(0).to(self.device)  # [1, max_tracks]
 
-                step_value = self.critic(tier0_summary, tier2_robot_features, tier2_track_features)
+                step_value = self.critic(tier0_summary, tier2_robot_features, tier2_track_features, robot_mask, track_mask)
                 fresh_step_values.append(step_value.squeeze())
 
         fresh_step_values = torch.stack(fresh_step_values).to(self.device)  # [T]
@@ -1210,8 +1362,19 @@ class PPOTrainer:
 
 def main():
     """Main training function"""
+    import argparse
+    parser = argparse.ArgumentParser(description='Train RL Trust System')
+    parser.add_argument('--device', type=str, default='auto',
+                       help='Device to use: auto, cpu, cuda, cuda:0, cuda:1, etc.')
+    args = parser.parse_args()
+
     config = TrainingConfig()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # Device selection logic
+    if args.device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    else:
+        device = args.device
 
     print(f"🖥️  Using device: {device}")
 
