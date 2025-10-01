@@ -35,7 +35,7 @@ class TrainingConfig:
 
     # Fixed padding limits (to prevent tensor size mismatches)
     max_robots: int = 50  # Maximum number of robots to pad to
-    max_tracks: int = 100  # Maximum number of tracks to pad to
+    max_tracks: int = 200  # Maximum number of tracks to pad to
 
     # Training schedule (safe starting point)
     num_episodes: int = 5000  # Total episodes for training
@@ -135,7 +135,6 @@ class PPOTrainer:
         self.step_to_item_indices = {}  # Dict[int, List[int]] - map step t -> ego item indices
 
         # Ego-level storage (for actors)
-        self.ego_summary = []      # List[Tensor[D_local]] - Ego graph summaries
         self.ego_R_feats = []      # List[Tensor[N_R, F_R]] - Robot features
         self.ego_T_feats = []      # List[Tensor[N_T, F_T]] - Track features
         self.ego_a_R = []          # List[Tensor[N_R]] - Robot actions
@@ -276,335 +275,122 @@ class PPOTrainer:
 
         return max(0.0, classification_reward)  # Ensure non-negative reward
 
-    def build_global_state_tensor(self, robots: List[Robot], gnn_scores_all: Dict,
-                                 step_idx: int, total_steps: int,
-                                 participating_robots: List[Robot] = None,
-                                 participating_tracks: List = None) -> torch.Tensor:
-        """
-        Build Tier 0 global summary with fixed-length vector
-
-        Args:
-            robots: All robots in the environment
-            gnn_scores_all: Dictionary of all GNN scores from this step
-            step_idx: Current step index
-            total_steps: Total steps in episode
-            participating_robots: Robots participating in this step
-            participating_tracks: Tracks participating in this step
-
-        Returns:
-            Tier 0 global state summary tensor [34 dims]
-        """
+    def build_global_state_tensor(self, robots: List[Robot], ground_truth: Dict,
+                                 step_idx: int, total_steps: int) -> torch.Tensor:
+        """Build compact Tier-0 summary driven by ground-truth alignment"""
         if not robots:
-            # Return default features if no robots
-            return torch.zeros(34, device=self.device)
+            return torch.zeros(8, device=self.device)
 
-        # Get all tracks (avoid duplicates)
-        all_tracks = []
+        true_adversarial = set(ground_truth.get('adversarial_agents', []))
+        false_tracks = set(ground_truth.get('false_tracks', []))
+
         track_lookup = {}
         for robot in robots:
             for track in robot.get_current_timestep_tracks():
-                if track.track_id not in track_lookup:
-                    all_tracks.append(track)
-                    track_lookup[track.track_id] = track
+                track_lookup[track.track_id] = track
 
-        # Participating counts
-        n_participating_robots = len(participating_robots) if participating_robots else 0
-        n_participating_tracks = len(participating_tracks) if participating_tracks else 0
+        adv_trusts = [robot.trust_value for robot in robots if robot.id in true_adversarial]
+        legit_trusts = [robot.trust_value for robot in robots if robot.id not in true_adversarial]
 
-        # Robot and track data
-        robot_trusts = [robot.trust_value for robot in robots]
-        robot_strengths = [robot.trust_alpha + robot.trust_beta for robot in robots]
-        track_trusts = [track.trust_value for track in all_tracks]
-        track_strengths = [track.trust_alpha + track.trust_beta for track in all_tracks]
-        track_maturities = [min(1.0, track.observation_count / 10.0) for track in all_tracks]
+        false_trusts = [track_lookup[tid].trust_value for tid in track_lookup if tid in false_tracks]
+        true_trusts = [track_lookup[tid].trust_value for tid in track_lookup if tid not in false_tracks]
 
-        # GNN scores - ALIGNED by ID to prevent mismatched pairing
-        rid2score = gnn_scores_all.get('agent_scores', {})
-        robot_scores = [rid2score.get(robot.id, 0.5) for robot in robots]
+        def mean_with_default(values: List[float], default: float = 0.5) -> float:
+            return float(np.mean(values)) if values else default
 
-        tid2score = gnn_scores_all.get('track_scores', {})
-        track_scores = [tid2score.get(track.track_id, 0.5) for track in all_tracks]
+        total_robots = len(robots)
+        total_tracks = len(track_lookup)
+        adv_present = len(adv_trusts)
+        false_present = len(false_trusts)
 
-        features = []
+        step_progress = step_idx / max(total_steps, 1)
+        prev_reward = self.prev_step_reward
+        frac_adversarial = adv_present / max(total_robots, 1)
+        frac_false_tracks = false_present / max(total_tracks, 1) if total_tracks > 0 else 0.0
 
-        # === Counts / Context (6) ===
-        features.append(np.log1p(len(robots)))  # log1p(n_robots)
-        features.append(np.log1p(len(all_tracks)))  # log1p(n_tracks)
-        features.append(np.log1p(n_participating_robots))  # log1p(n_participating_robots)
-        features.append(np.log1p(n_participating_tracks))  # log1p(n_participating_tracks)
-        features.append(step_idx / max(total_steps, 1))  # t_over_T
-        # Previous step reward (using explicit member to avoid episode leakage)
-        features.append(self.prev_step_reward)  # mean_prev_step_reward
+        features = [
+            step_progress,
+            prev_reward,
+            frac_adversarial,
+            frac_false_tracks,
+            mean_with_default(adv_trusts, 0.5),
+            mean_with_default(legit_trusts, 0.5),
+            mean_with_default(false_trusts, 0.5),
+            mean_with_default(true_trusts, 0.5),
+        ]
 
-        # === Robots - Trust & Strength (8) ===
-        features.append(np.mean(robot_trusts) if robot_trusts else 0.5)  # robot_trust_mean
-        features.append(np.std(robot_trusts) if len(robot_trusts) > 1 else 0.0)  # robot_trust_std
-        features.append(np.mean(robot_strengths) if robot_strengths else 2.0)  # robot_strength_mean
-        features.append(np.std(robot_strengths) if len(robot_strengths) > 1 else 0.0)  # robot_strength_std
-
-        # Dual threshold fractions for robots
-        neg_thresh = self.config.robot_negative_threshold  # 0.30
-        pos_thresh = self.config.robot_positive_threshold  # 0.70
-        if robot_trusts:
-            frac_robot_low = sum(1 for t in robot_trusts if t <= neg_thresh) / len(robot_trusts)
-            frac_robot_high = sum(1 for t in robot_trusts if t >= pos_thresh) / len(robot_trusts)
-            frac_robot_gray = 1.0 - frac_robot_low - frac_robot_high
-        else:
-            frac_robot_low = frac_robot_high = frac_robot_gray = 0.0
-
-        features.append(frac_robot_low)
-        features.append(frac_robot_high)
-        features.append(frac_robot_gray)
-
-        # Mean absolute delta robot trust - track trust changes from previous step
-        mean_abs_delta_robot_trust = 0.0
-        if hasattr(self, 'prev_robot_trusts') and self.prev_robot_trusts and robot_trusts:
-            # Calculate absolute trust changes for robots that exist in both steps
-            trust_deltas = []
-            robot_id_to_trust = {robot.id: robot.trust_value for robot in robots}
-            for robot_id, prev_trust in self.prev_robot_trusts.items():
-                if robot_id in robot_id_to_trust:
-                    current_trust = robot_id_to_trust[robot_id]
-                    trust_deltas.append(abs(current_trust - prev_trust))
-            mean_abs_delta_robot_trust = np.mean(trust_deltas) if trust_deltas else 0.0
-
-        # Store current robot trusts for next step
         self.prev_robot_trusts = {robot.id: robot.trust_value for robot in robots}
-        features.append(mean_abs_delta_robot_trust)  # mean_abs_delta_robot_trust
-
-        # === Tracks - Trust, Strength, Maturity (10) ===
-        features.append(np.mean(track_trusts) if track_trusts else 0.5)  # track_trust_mean
-        features.append(np.std(track_trusts) if len(track_trusts) > 1 else 0.0)  # track_trust_std
-        features.append(np.mean(track_strengths) if track_strengths else 2.0)  # track_strength_mean
-        features.append(np.std(track_strengths) if len(track_strengths) > 1 else 0.0)  # track_strength_std
-        features.append(np.mean(track_maturities) if track_maturities else 0.0)  # track_maturity_mean
-        features.append(np.std(track_maturities) if len(track_maturities) > 1 else 0.0)  # track_maturity_std
-
-        # Dual threshold fractions for tracks
-        neg_thresh_t = self.config.track_negative_threshold  # 0.30
-        pos_thresh_t = self.config.track_positive_threshold  # 0.70
-        if track_trusts:
-            frac_track_low = sum(1 for t in track_trusts if t <= neg_thresh_t) / len(track_trusts)
-            frac_track_high = sum(1 for t in track_trusts if t >= pos_thresh_t) / len(track_trusts)
-            frac_track_gray = 1.0 - frac_track_low - frac_track_high
-        else:
-            frac_track_low = frac_track_high = frac_track_gray = 0.0
-
-        features.append(frac_track_low)
-        features.append(frac_track_high)
-        features.append(frac_track_gray)
-
-        # Mean absolute delta track trust - track trust changes from previous step
-        mean_abs_delta_track_trust = 0.0
-        if hasattr(self, 'prev_track_trusts') and self.prev_track_trusts and track_trusts:
-            # Calculate absolute trust changes for tracks that exist in both steps
-            trust_deltas = []
-            track_id_to_trust = {track.track_id: track.trust_value for track in all_tracks}
-            for track_id, prev_trust in self.prev_track_trusts.items():
-                if track_id in track_id_to_trust:
-                    current_trust = track_id_to_trust[track_id]
-                    trust_deltas.append(abs(current_trust - prev_trust))
-            mean_abs_delta_track_trust = np.mean(trust_deltas) if trust_deltas else 0.0
-
-        # Store current track trusts for next step
-        self.prev_track_trusts = {track.track_id: track.trust_value for track in all_tracks}
-        features.append(mean_abs_delta_track_trust)  # mean_abs_delta_track_trust
-
-        # === Current GNN Evidence (6) ===
-        features.append(np.mean(robot_scores) if robot_scores else 0.5)  # robot_score_mean
-        features.append(np.std(robot_scores) if len(robot_scores) > 1 else 0.0)  # robot_score_std
-        features.append(np.mean(track_scores) if track_scores else 0.5)  # track_score_mean
-        features.append(np.std(track_scores) if len(track_scores) > 1 else 0.0)  # track_score_std
-
-        # Score confidence (distance from 0.5)
-        robot_score_conf = np.mean([2 * abs(score - 0.5) for score in robot_scores]) if robot_scores else 0.0
-        track_score_conf = np.mean([2 * abs(score - 0.5) for score in track_scores]) if track_scores else 0.0
-        features.append(robot_score_conf)  # robot_score_conf_mean
-        features.append(track_score_conf)  # track_score_conf_mean
-
-        # === Trust-Evidence Alignment (4) ===
-        # Compute correlations between trust and GNN scores
-        robot_trust_score_corr = 0.0
-        track_trust_score_corr = 0.0
-
-        # Safe correlation computation with variance checks
-        if (len(robot_trusts) > 1 and len(robot_scores) > 1 and
-            len(robot_trusts) == len(robot_scores)):
-            # Check if both arrays have variance (avoid division by zero)
-            if np.std(robot_trusts) > 1e-8 and np.std(robot_scores) > 1e-8:
-                robot_trust_score_corr = np.corrcoef(robot_trusts, robot_scores)[0, 1]
-                if np.isnan(robot_trust_score_corr):
-                    robot_trust_score_corr = 0.0
-            # If no variance, correlation is undefined (set to 0)
-
-        if (len(track_trusts) > 1 and len(track_scores) > 1 and
-            len(track_trusts) == len(track_scores)):
-            # Check if both arrays have variance (avoid division by zero)
-            if np.std(track_trusts) > 1e-8 and np.std(track_scores) > 1e-8:
-                track_trust_score_corr = np.corrcoef(track_trusts, track_scores)[0, 1]
-                if np.isnan(track_trust_score_corr):
-                    track_trust_score_corr = 0.0
-            # If no variance, correlation is undefined (set to 0)
-
-        features.append(robot_trust_score_corr)  # cov(robot_trust, robot_score)
-        features.append(track_trust_score_corr)  # cov(track_trust, track_score)
-
-        # Disagreement rates - measure trust vs GNN score disagreement
-        robot_disagreement_rate = 0.0
-        track_disagreement_rate = 0.0
-
-        # Robot disagreement: trust says adversarial but GNN says legitimate (or vice versa)
-        if robot_trusts and robot_scores and len(robot_trusts) == len(robot_scores):
-            disagreements = 0
-            for trust, score in zip(robot_trusts, robot_scores):
-                trust_says_bad = trust < 0.5  # Low trust = adversarial
-                gnn_says_bad = score < 0.5    # Low score = adversarial
-                if trust_says_bad != gnn_says_bad:  # Disagreement
-                    disagreements += 1
-            robot_disagreement_rate = disagreements / len(robot_trusts)
-
-        # Track disagreement: trust says false but GNN says legitimate (or vice versa)
-        if track_trusts and track_scores and len(track_trusts) == len(track_scores):
-            disagreements = 0
-            for trust, score in zip(track_trusts, track_scores):
-                trust_says_bad = trust < 0.5  # Low trust = false track
-                gnn_says_bad = score < 0.5    # Low score = false track
-                if trust_says_bad != gnn_says_bad:  # Disagreement
-                    disagreements += 1
-            track_disagreement_rate = disagreements / len(track_trusts)
-
-        features.append(track_disagreement_rate)  # disagreement_rate_tracks
-        features.append(robot_disagreement_rate)  # disagreement_rate_robots
+        self.prev_track_trusts = {track_id: track.trust_value for track_id, track in track_lookup.items()}
 
         return torch.tensor(features, dtype=torch.float32, device=self.device)
 
-    def build_tier2_robot_features(self, robots: List[Robot], gnn_scores_all: Dict) -> torch.Tensor:
-        """
-        Build per-robot features for Tier 2 set encoder
-
-        Returns:
-            [N_R, 6] tensor with features: [trust_mean, strength, Δtrust, agent_score, score_conf, degree]
-        """
+    def build_tier2_robot_features(self, robots: List[Robot], ground_truth: Dict) -> torch.Tensor:
+        """Per-robot critic features using ground-truth labels"""
         if not robots:
-            return torch.zeros(0, 6, device=self.device)
+            return torch.zeros(0, 3, device=self.device)
 
-        robot_features = []
+        true_adversarial = set(ground_truth.get('adversarial_agents', []))
+
+        features = []
         for robot in robots:
-            # Basic features
-            trust_mean = robot.trust_value
-            strength = robot.trust_alpha + robot.trust_beta
-            # Delta trust: change from previous step
-            prev_trust = self.prev_robot_trusts.get(robot.id, trust_mean)
-            delta_trust = abs(trust_mean - prev_trust)
+            trust = robot.trust_value
+            label = 0.0 if robot.id in true_adversarial else 1.0
+            error = abs(trust - label)
+            features.append([trust, label, error])
 
-            # GNN score
-            agent_score = gnn_scores_all.get('agent_scores', {}).get(robot.id, 0.5)
-            score_conf = 2 * abs(agent_score - 0.5)  # Confidence as distance from 0.5
+        return torch.tensor(features, dtype=torch.float32, device=self.device)
 
-            # Degree (number of tracks this robot has)
-            degree = len(robot.get_current_timestep_tracks())
-
-            robot_features.append([trust_mean, strength, delta_trust, agent_score, score_conf, degree])
-
-        return torch.tensor(robot_features, dtype=torch.float32, device=self.device)
-
-    def build_tier2_track_features(self, robots: List[Robot], gnn_scores_all: Dict) -> torch.Tensor:
-        """
-        Build per-track features for Tier 2 set encoder
-
-        Returns:
-            [N_T, 7] tensor with features: [trust_mean, strength, Δtrust, maturity, track_score, score_conf, degree]
-        """
-        # Get all unique tracks
-        all_tracks = []
+    def build_tier2_track_features(self, robots: List[Robot], ground_truth: Dict) -> torch.Tensor:
+        """Per-track critic features using ground-truth labels"""
         track_lookup = {}
-        track_detectors = {}  # track_id -> list of robot_ids that detected it
-
         for robot in robots:
             for track in robot.get_current_timestep_tracks():
-                if track.track_id not in track_lookup:
-                    all_tracks.append(track)
-                    track_lookup[track.track_id] = track
-                    track_detectors[track.track_id] = []
-                track_detectors[track.track_id].append(robot.id)
+                track_lookup[track.track_id] = track
 
-        if not all_tracks:
-            return torch.zeros(0, 7, device=self.device)
+        if not track_lookup:
+            return torch.zeros(0, 3, device=self.device)
 
-        track_features = []
-        for track in all_tracks:
-            # Basic features
-            trust_mean = track.trust_value
-            strength = track.trust_alpha + track.trust_beta
-            # Delta trust: change from previous step
-            prev_trust = self.prev_track_trusts.get(track.track_id, trust_mean)
-            delta_trust = abs(trust_mean - prev_trust)
-            maturity = min(1.0, track.observation_count / 10.0)
+        false_tracks = set(ground_truth.get('false_tracks', []))
 
-            # GNN score
-            track_score = gnn_scores_all.get('track_scores', {}).get(track.track_id, 0.5)
-            score_conf = 2 * abs(track_score - 0.5)  # Confidence as distance from 0.5
+        features = []
+        for track_id, track in track_lookup.items():
+            trust = track.trust_value
+            label = 0.0 if track_id in false_tracks else 1.0
+            error = abs(trust - label)
+            features.append([trust, label, error])
 
-            # Degree (number of robots that detected this track)
-            degree = len(track_detectors.get(track.track_id, []))
+        return torch.tensor(features, dtype=torch.float32, device=self.device)
 
-            track_features.append([trust_mean, strength, delta_trust, maturity, track_score, score_conf, degree])
-
-        return torch.tensor(track_features, dtype=torch.float32, device=self.device)
-
-    def build_complete_global_state(self, robots: List[Robot], gnn_scores_all: Dict,
-                                   step_idx: int, total_steps: int,
-                                   participating_robots: List[Robot] = None,
-                                   participating_tracks: List = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Build complete global state representation for the critic
-
-        Returns:
-            Tuple of (tier0_summary, tier2_robot_features, tier2_track_features)
-        """
-        tier0_summary = self.build_global_state_tensor(
-            robots, gnn_scores_all, step_idx, total_steps,
-            participating_robots, participating_tracks
-        )
-        tier2_robot_features = self.build_tier2_robot_features(robots, gnn_scores_all)
-        tier2_track_features = self.build_tier2_track_features(robots, gnn_scores_all)
+    def build_complete_global_state(self, robots: List[Robot], ground_truth: Dict,
+                                   step_idx: int, total_steps: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build global critic inputs from simplified ground-truth-driven features"""
+        tier0_summary = self.build_global_state_tensor(robots, ground_truth, step_idx, total_steps)
+        tier2_robot_features = self.build_tier2_robot_features(robots, ground_truth)
+        tier2_track_features = self.build_tier2_track_features(robots, ground_truth)
 
         return tier0_summary, tier2_robot_features, tier2_track_features
 
     def pad_and_mask_tensors(self, robot_features: torch.Tensor, track_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Pad robot and track features to fixed sizes and create masks
-
-        Args:
-            robot_features: [N_R, 6] current robot features
-            track_features: [N_T, 7] current track features
-
-        Returns:
-            Tuple of (padded_robot_features, padded_track_features, robot_mask, track_mask)
-        """
+        """Pad simplified robot/track features to the configured max counts"""
         device = self.device
         max_robots = self.config.max_robots
         max_tracks = self.config.max_tracks
 
-        # Get current sizes
         n_robots = robot_features.size(0)
         n_tracks = track_features.size(0)
 
-        # Validate that we don't exceed the fixed limits
         if n_robots > max_robots:
             raise ValueError(f"Number of robots ({n_robots}) exceeds maximum limit ({max_robots})")
         if n_tracks > max_tracks:
             raise ValueError(f"Number of tracks ({n_tracks}) exceeds maximum limit ({max_tracks})")
 
-        # Create padded robot features
-        padded_robot_features = torch.zeros(max_robots, 6, device=device)
+        padded_robot_features = torch.zeros(max_robots, 3, device=device)
         robot_mask = torch.zeros(max_robots, device=device)
         if n_robots > 0:
             padded_robot_features[:n_robots] = robot_features
             robot_mask[:n_robots] = 1.0
 
-        # Create padded track features
-        padded_track_features = torch.zeros(max_tracks, 7, device=device)
+        padded_track_features = torch.zeros(max_tracks, 3, device=device)
         track_mask = torch.zeros(max_tracks, device=device)
         if n_tracks > 0:
             padded_track_features[:n_tracks] = track_features
@@ -654,28 +440,12 @@ class PPOTrainer:
                     for track in robot.get_current_timestep_tracks():
                         track_lookup[track.track_id] = track
 
-                # Collect all GNN scores for global summary
-                all_gnn_scores = {'agent_scores': {}, 'track_scores': {}}
-
                 # Pre-compute step decisions for ALL ego robots to maintain on-policy behavior
                 precomputed_decisions = {}
                 all_trajectory_data = []  # Will store data for ALL participating egos
 
-                # First pass: collect all GNN scores for global state (detached for critic)
-                for ego_robot in robots:
-                    scores = self.trust_system.evidence_extractor.get_scores(ego_robot, robots)
-                    if scores.agent_scores or scores.track_scores:
-                        # Detach GNN scores to prevent backprop into evidence GNN from RL training
-                        detached_agent_scores = {k: float(v) for k, v in scores.agent_scores.items()}
-                        detached_track_scores = {k: float(v) for k, v in scores.track_scores.items()}
-                        all_gnn_scores['agent_scores'].update(detached_agent_scores)
-                        all_gnn_scores['track_scores'].update(detached_track_scores)
-
-                # Build tier0 features early (needed for SetTransformer)
-                tier0_features = self.build_global_state_tensor(
-                    robots, all_gnn_scores, step, scenario_params.episode_length,
-                    participating_robots=None, participating_tracks=None  # Will be filled per ego
-                )
+                # Pull ground truth before applying updates for critic features
+                ground_truth_pre_update = self.scenario_generator._extract_ground_truth(sim_env)
 
                 # Loop over all robots as ego robots (like in ego_sweep_step)
                 for ego_robot in robots:
@@ -685,12 +455,6 @@ class PPOTrainer:
                     if not scores.agent_scores and not scores.track_scores:
                         continue  # No scores from GNN
 
-                    # Accumulate GNN scores for global summary (detached for critic)
-                    # Detach GNN scores to prevent backprop into evidence GNN from RL training
-                    detached_agent_scores = {k: float(v) for k, v in scores.agent_scores.items()}
-                    detached_track_scores = {k: float(v) for k, v in scores.track_scores.items()}
-                    all_gnn_scores['agent_scores'].update(detached_agent_scores)
-                    all_gnn_scores['track_scores'].update(detached_track_scores)
 
                     # Get ego graph nodes (same logic as in ego_sweep_step)
                     ego_robot_ids = list(scores.agent_scores.keys())
@@ -707,38 +471,42 @@ class PPOTrainer:
                         continue  # No participating nodes in this ego graph
 
                     # STABLE ORDERING: Sort IDs for consistent ordering across calls
-                    robot_ids = sorted([r.id for r in participating_robots])
+                    robot_ids = sorted([r.id for r in ego_robots])
                     track_ids = sorted([t.track_id for t in participating_tracks])
 
                     # Build participating entities in sorted order
-                    robot_lookup_local = {r.id: r for r in participating_robots}
+                    robot_lookup_local = {r.id: r for r in ego_robots}
                     track_lookup_local = {t.track_id: t for t in participating_tracks}
+                    participating_robot_ids = set(robot_detections.keys())
+                    participating_track_ids = set(track_detectors.keys())
 
                     participating_robots_sorted = [robot_lookup_local[rid] for rid in robot_ids]
                     participating_tracks_sorted = [track_lookup_local[tid] for tid in track_ids]
 
                     # State encoding is no longer needed since we use tier0_features directly
 
-                    # Build features for participating nodes in sorted order (SetTransformer format)
+                    # Build features for ego robots (mask marks participation)
                     robot_features = []
+                    robot_mask_values = []
                     for robot in participating_robots_sorted:
                         trust_mean = robot.trust_value
                         strength = robot.trust_alpha + robot.trust_beta
                         # Delta trust: change from previous step
-                        prev_trust = self.prev_robot_trusts.get(robot.id, trust_mean)
+                        prev_trust = self.prev_robot_trusts.get(robot.id, 0.5)
                         delta_trust = abs(trust_mean - prev_trust)
                         robot_score = scores.agent_scores.get(robot.id, 0.5)
                         score_conf = 2 * abs(robot_score - 0.5)  # Confidence as distance from 0.5
                         # Degree (number of tracks this robot has)
                         degree = len(robot.get_current_timestep_tracks())
                         robot_features.append([trust_mean, strength, delta_trust, robot_score, score_conf, degree])
+                        robot_mask_values.append(1.0 if robot.id in participating_robot_ids else 0.0)
 
                     track_features = []
                     for track in participating_tracks_sorted:
                         trust_mean = track.trust_value
                         strength = track.trust_alpha + track.trust_beta
                         # Delta trust: change from previous step
-                        prev_trust = self.prev_track_trusts.get(track.track_id, trust_mean)
+                        prev_trust = self.prev_track_trusts.get(track.track_id, 0.5)
                         delta_trust = abs(trust_mean - prev_trust)
                         maturity = min(1.0, track.observation_count / 10.0)
                         track_score = scores.track_scores.get(track.track_id, 0.5)
@@ -750,30 +518,29 @@ class PPOTrainer:
                     robot_features_tensor = torch.tensor(robot_features, dtype=torch.float32, device=self.device) if robot_features else torch.zeros(0, 6, device=self.device)
                     track_features_tensor = torch.tensor(track_features, dtype=torch.float32, device=self.device) if track_features else torch.zeros(0, 7, device=self.device)
 
-                    # Create ego graph summary for this ego robot (local stats only)
-                    ego_summary = self.updater.create_ego_graph_summary(
-                        ego_robots, ego_tracks, scores.agent_scores, scores.track_scores
-                    )
-                    ego_summary_tensor = torch.tensor([
-                        ego_summary.robot_trust_mean, ego_summary.robot_trust_std, ego_summary.robot_trust_count,
-                        ego_summary.track_trust_mean, ego_summary.track_trust_std, ego_summary.track_trust_count,
-                        ego_summary.robot_score_mean, ego_summary.robot_score_std,
-                        ego_summary.track_score_mean, ego_summary.track_score_std
-                    ], dtype=torch.float32, device=self.device)
-
-                    # Sample actions using SetTransformer actor policy
+                    # Sample actions using the simplified actor policy
                     robot_features_tensor = robot_features_tensor.to(self.device)
                     track_features_tensor = track_features_tensor.to(self.device)
 
-                    # Create masks (no padding needed here since these are actual participating entities)
-                    robot_mask = torch.ones(robot_features_tensor.shape[0], device=self.device) if robot_features_tensor.shape[0] > 0 else None
+                    # Create masks (flag participating robots/tracks)
+                    robot_mask = torch.tensor(robot_mask_values, dtype=torch.float32, device=self.device) if robot_features_tensor.shape[0] > 0 else None
                     track_mask = torch.ones(track_features_tensor.shape[0], device=self.device) if track_features_tensor.shape[0] > 0 else None
 
-                    robot_actions, track_actions, robot_log_probs, track_log_probs, entropy, _, _ = self.updater.policy.sample_actions(
-                        ego_summary_tensor.unsqueeze(0), robot_features_tensor.unsqueeze(0), track_features_tensor.unsqueeze(0),
-                        robot_mask.unsqueeze(0) if robot_mask is not None else None,
-                        track_mask.unsqueeze(0) if track_mask is not None else None
-                    )
+                    try:
+                        robot_actions, track_actions, robot_log_probs, track_log_probs, entropy, _, _ = self.updater.policy.sample_actions(
+                            robot_features_tensor.unsqueeze(0), track_features_tensor.unsqueeze(0),
+                            robot_mask.unsqueeze(0) if robot_mask is not None else None,
+                            track_mask.unsqueeze(0) if track_mask is not None else None
+                        )
+                    except Exception as exc:
+                        print("Actor sample failure:")
+                        print("  robot_features shape:", robot_features_tensor.unsqueeze(0).shape)
+                        print("  track_features shape:", track_features_tensor.unsqueeze(0).shape)
+                        if robot_mask is not None:
+                            print("  robot_mask shape:", robot_mask.unsqueeze(0).shape)
+                        if track_mask is not None:
+                            print("  track_mask shape:", track_mask.unsqueeze(0).shape)
+                        raise
                     # Remove batch dimension from outputs
                     robot_actions = robot_actions.squeeze(0)
                     track_actions = track_actions.squeeze(0)
@@ -793,24 +560,15 @@ class PPOTrainer:
                     precomputed_decisions[ego_robot.id] = step_decision
 
                     # Store trajectory data for this ego (detached to avoid gradient conflicts)
-                    # Include IDs to maintain exact ordering consistency and ego summary for SetTransformer
-                    ego_trajectory_data = [ego_summary_tensor.detach(), robot_features_tensor.detach(), track_features_tensor.detach(),
+                    # Include IDs to maintain exact ordering consistency for the actor
+                    ego_trajectory_data = [robot_features_tensor.detach(), track_features_tensor.detach(),
                                          robot_actions.detach(), track_actions.detach(), robot_log_probs.detach(), track_log_probs.detach(),
-                                         robot_ids.copy(), track_ids.copy(), robot_mask, track_mask]  # Store everything needed for SetTransformer
+                                         robot_ids.copy(), track_ids.copy(), robot_mask, track_mask]  # Store everything needed for the actor
                     all_trajectory_data.append(ego_trajectory_data)
 
-                # Fix scope bug: compute environment-level participating entities from detection maps
-                env_participating_robot_ids = set(robot_detections.keys())
-                env_participating_track_ids = set(track_detectors.keys())
-
-                env_participating_robots = [r for r in robots if r.id in env_participating_robot_ids]
-                env_participating_tracks = [track_lookup[tid] for tid in env_participating_track_ids if tid in track_lookup]
-
-                # Build complete global state (combines Tier 0 + Tier 2) with detached GNN evidence
+                # Build complete global state for the critic using simplified features
                 tier0_summary, tier2_robot_features, tier2_track_features = self.build_complete_global_state(
-                    robots, all_gnn_scores, step, scenario_params.episode_length,
-                    participating_robots=env_participating_robots,
-                    participating_tracks=env_participating_tracks
+                    robots, ground_truth_pre_update, step, scenario_params.episode_length
                 )
 
                 # Apply fixed padding and masking for consistent tensor sizes
@@ -834,11 +592,11 @@ class PPOTrainer:
                 # Get centralized critic value estimate for this step with proper masking
                 with torch.no_grad():
                     step_value = self.critic(
-                        tier0_summary.unsqueeze(0),  # [1, 34]
-                        padded_robot_features.unsqueeze(0),  # [1, max_robots, 6]
-                        padded_track_features.unsqueeze(0),  # [1, max_tracks, 7]
-                        robot_mask.unsqueeze(0),  # [1, max_robots]
-                        track_mask.unsqueeze(0)   # [1, max_tracks]
+                        tier0_summary.unsqueeze(0),  # [1, 8]
+                        padded_robot_features.unsqueeze(0),  # [1, max_robots, 3]
+                        padded_track_features.unsqueeze(0),  # [1, max_tracks, 3]
+                        robot_mask.unsqueeze(0),
+                        track_mask.unsqueeze(0)
                     ).item()
 
                 # Apply trust updates using precomputed decisions
@@ -883,12 +641,10 @@ class PPOTrainer:
 
                 # Collect ego-level data for ALL participating egos using new buffer format
                 for ego_trajectory_data in all_trajectory_data:
-                    ego_summary_ego, robot_features_tensor, track_features_tensor, robot_actions, track_actions, robot_log_probs, track_log_probs, robot_ids, track_ids, robot_mask, track_mask = ego_trajectory_data
+                    robot_features_tensor, track_features_tensor, robot_actions, track_actions, robot_log_probs, track_log_probs, robot_ids, track_ids, robot_mask, track_mask = ego_trajectory_data
 
                     # Store ego-level data using new buffer format
-                    ego_item_idx = len(self.ego_summary)
-
-                    self.ego_summary.append(ego_summary_ego.detach())  # Tensor[ego_summary_dim] - ego graph summary
+                    ego_item_idx = len(self.ego_R_feats)
                     self.ego_R_feats.append(robot_features_tensor.detach())  # Tensor[N_R, F_R] - robot features
                     self.ego_T_feats.append(track_features_tensor.detach())  # Tensor[N_T, F_T] - track features
                     self.ego_a_R.append(robot_actions.detach())  # Tensor[N_R] - robot actions
@@ -923,7 +679,6 @@ class PPOTrainer:
         self.step_to_item_indices.clear()
 
         # Clear ego-level storage
-        self.ego_summary.clear()
         self.ego_R_feats.clear()
         self.ego_T_feats.clear()
         self.ego_a_R.clear()
@@ -951,7 +706,7 @@ class PPOTrainer:
         # PPO update loop with KL watchdog
         for epoch in range(self.config.ppo_epochs):
             # Create random mini-batches over ego items
-            num_ego_items = len(self.ego_summary)
+            num_ego_items = len(self.ego_R_feats)
             batch_size = min(self.config.batch_size, num_ego_items)
             indices = torch.randperm(num_ego_items)
 
@@ -972,7 +727,6 @@ class PPOTrainer:
                 for idx, i in enumerate(batch_indices):
                     try:
                         # Move sample's tensors to device (ragged - no padding needed)
-                        ego_summary = self.ego_summary[i].to(self.device)  # [ego_summary_dim] - ego graph summary
                         robot_features = self.ego_R_feats[i].to(self.device)  # [N_R, F_R] - variable N_R
                         track_features = self.ego_T_feats[i].to(self.device)  # [N_T, F_T] - variable N_T
                         robot_mask = self.ego_robot_mask[i].to(self.device) if self.ego_robot_mask[i].numel() > 0 else None
@@ -984,9 +738,9 @@ class PPOTrainer:
                         logp_R_old = self.ego_logp_R[i].to(self.device)  # [N_R] - old log-probs
                         logp_T_old = self.ego_logp_T[i].to(self.device)  # [N_T] - old log-probs
 
-                        # Get new log-probs from current policy using SetTransformer interface
+                        # Get new log-probs from current policy using the simplified actor interface
                         logp_R_new, logp_T_new, entropy = self.updater.policy.evaluate_actions(
-                            ego_summary.unsqueeze(0), robot_features.unsqueeze(0), track_features.unsqueeze(0),
+                            robot_features.unsqueeze(0), track_features.unsqueeze(0),
                             robot_actions.unsqueeze(0), track_actions.unsqueeze(0),
                             robot_mask.unsqueeze(0) if robot_mask is not None else None,
                             track_mask.unsqueeze(0) if track_mask is not None else None
@@ -1092,9 +846,9 @@ class PPOTrainer:
 
         with torch.no_grad():
             for global_state in self.step_S:
-                tier0_summary = global_state['tier0'].unsqueeze(0).to(self.device)  # [1, 34]
-                tier2_robot_features = global_state['tier2_robots'].unsqueeze(0).to(self.device)  # [1, max_robots, 6]
-                tier2_track_features = global_state['tier2_tracks'].unsqueeze(0).to(self.device)  # [1, max_tracks, 7]
+                tier0_summary = global_state['tier0'].unsqueeze(0).to(self.device)  # [1, 8]
+                tier2_robot_features = global_state['tier2_robots'].unsqueeze(0).to(self.device)  # [1, max_robots, 3]
+                tier2_track_features = global_state['tier2_tracks'].unsqueeze(0).to(self.device)  # [1, max_tracks, 3]
                 robot_mask = global_state['robot_mask'].unsqueeze(0).to(self.device)  # [1, max_robots]
                 track_mask = global_state['track_mask'].unsqueeze(0).to(self.device)  # [1, max_tracks]
 
@@ -1151,57 +905,6 @@ class PPOTrainer:
 
         return torch.stack(ego_advantages), torch.stack(ego_returns)
 
-    def encode_state(self, ego_robots, ego_tracks, robot_scores, track_scores) -> torch.Tensor:
-        """Encode ego graph state for PPO"""
-        # Create ego graph summary (same as in rl_updater.py)
-        summary = self.trust_system.updater.create_ego_graph_summary(
-            ego_robots, ego_tracks, robot_scores, track_scores
-        )
-
-        # Convert to tensor
-        summary_tensor = torch.tensor([
-            summary.robot_trust_mean, summary.robot_trust_std, summary.robot_trust_count,
-            summary.track_trust_mean, summary.track_trust_std, summary.track_trust_count,
-            summary.robot_score_mean, summary.robot_score_std,
-            summary.track_score_mean, summary.track_score_std
-        ], dtype=torch.float32)
-
-        return summary_tensor
-
-    def collect_trajectory_step(self, summary, robot_features, track_features,
-                               robot_actions, track_actions, robot_log_probs, track_log_probs,
-                               reward, value, done, robot_ids=None, track_ids=None, step_idx=None):
-        """Collect one step of trajectory for PPO with complete state information"""
-
-        # Store complete state information
-        full_state = {
-            'summary': summary,
-            'robot_features': robot_features,
-            'track_features': track_features,
-            'robot_ids': robot_ids if robot_ids is not None else [],
-            'track_ids': track_ids if track_ids is not None else []
-        }
-
-        # Store complete action information
-        full_actions = {
-            'robot_actions': robot_actions,
-            'track_actions': track_actions
-        }
-
-        # Store complete log probabilities
-        full_log_probs = {
-            'robot_log_probs': robot_log_probs,
-            'track_log_probs': track_log_probs
-        }
-
-        self.trajectories['states'].append(full_state)
-        self.trajectories['actions'].append(full_actions)
-        self.trajectories['log_probs'].append(full_log_probs)
-        self.trajectories['rewards'].append(reward)
-        self.trajectories['values'].append(value)
-        self.trajectories['dones'].append(done)
-        self.trajectories['step_indices'].append(step_idx if step_idx is not None else -1)
-
     def train(self):
         """Main training loop"""
         print(f"Starting PPO training for RL Trust System")
@@ -1219,8 +922,8 @@ class PPOTrainer:
             self.episode_rewards.append(episode_reward)
 
             # Perform PPO update every few episodes (separate from ppo_epochs)
-            if episode > 0 and episode % self.config.update_every_episodes == 0 and len(self.ego_summary) > 0:
-                traj_count = len(self.ego_summary)
+            if episode > 0 and episode % self.config.update_every_episodes == 0 and len(self.ego_R_feats) > 0:
+                traj_count = len(self.ego_R_feats)
                 self.trajectory_counts.append(traj_count)
                 print(f"Running PPO update at episode {episode} with {traj_count} ego samples")
                 self.ppo_update()
