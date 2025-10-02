@@ -11,6 +11,7 @@ import random
 import torch
 import matplotlib.pyplot as plt
 import json
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 # Import required modules
@@ -29,7 +30,7 @@ class TrustMethodComparison:
 
     def __init__(self,
                  supervised_model_path: str = "supervised_trust_model.pth",
-                 rl_model_path: str = "rl_trust_model.pth",
+                 rl_model_path: str = "rl_trust_model_final.pth",
                  num_robots: int = 5,
                  num_targets: int = 10,
                  num_timesteps: int = 500,
@@ -87,13 +88,27 @@ class TrustMethodComparison:
         # Try to load RL model
         try:
             self._initialize_rl_system()
-            print(f"✅ Loaded RL trust model from {rl_model_path}")
+            model_label = self.rl_model_path if self.rl_model_path else "fresh initialization"
+            print(f"✅ Loaded RL trust model from {model_label}")
         except Exception as e:
             print(f"⚠️ Failed to load RL model: {e}")
 
     def _initialize_rl_system(self):
         """Initialize the RL trust update system with ego-centric architecture"""
         device = 'cpu'  # Use CPU for comparison consistency
+
+        if self.rl_model_path:
+            model_path = Path(self.rl_model_path)
+            if not model_path.exists():
+                legacy_path = Path('rl_trust_model.pth')
+                if legacy_path.exists():
+                    print(f"ℹ️ RL model '{model_path}' not found. Falling back to '{legacy_path}'.")
+                    self.rl_model_path = str(legacy_path)
+                else:
+                    print(f"⚠️ RL model '{model_path}' not found and no legacy model available. Using fresh weights.")
+                    self.rl_model_path = None
+        else:
+            self.rl_model_path = None
 
         # Initialize RLTrustSystem with updated ego-centric parameters
         self.rl_trust_system = RLTrustSystem(

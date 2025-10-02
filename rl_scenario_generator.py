@@ -86,8 +86,6 @@ class RLScenarioGenerator:
             "high_false_pos",     # High false positive rate
             "mixed_challenge",    # Balanced difficulty
             "dynamic_world",      # Changing world size
-            "long_episode",       # Extended episodes
-            "short_episode"       # Quick episodes
         ]
 
     def sample_scenario_parameters(self, episode_num: int) -> ScenarioParameters:
@@ -217,7 +215,7 @@ class RLScenarioGenerator:
 
         elif template == "high_false_pos":
             # Focus on false positive track detection
-            params['false_positive_rate'] = min(0.8, params['false_positive_rate'] + 0.3)
+            params['false_positive_rate'] = min(0.5, params['false_positive_rate'] + 0.3)
 
         elif template == "mixed_challenge":
             # Balanced but challenging
@@ -229,14 +227,6 @@ class RLScenarioGenerator:
             current_size = params['world_size'][0]
             new_size = min(100, current_size + 20)
             params['world_size'] = (new_size, new_size)
-
-        elif template == "long_episode":
-            # Extended episodes for long-term trust learning
-            params['episode_length'] = min(200, params['episode_length'] + 50)
-
-        elif template == "short_episode":
-            # Quick episodes for reactive learning
-            params['episode_length'] = max(50, params['episode_length'] - 30)
 
         return params
 

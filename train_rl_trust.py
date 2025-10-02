@@ -13,12 +13,14 @@ import time
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
+from typing import Optional
 
 from robot_track_classes import Robot
 from rl_trust_system import RLTrustSystem
 # rl_updater imports are accessed through RLTrustSystem
 from rl_scenario_generator import RLScenarioGenerator
 from rl_updater import UpdateDecision
+from robot_track_classes import Track
 
 
 @dataclass
@@ -101,11 +103,10 @@ class PPOTrainer:
         # Optimizer for both actor and critic
         actor_params = list(self.updater.policy.parameters())
         critic_params = list(self.critic.parameters())
-        self.optimizer = optim.Adam(actor_params + critic_params, lr=config.lr)
-
-        # Add learning rate scheduler for better convergence
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', factor=0.8, patience=50
+        self.actor_optimizer = optim.Adam(actor_params, lr=config.lr)
+        self.critic_optimizer = optim.Adam(critic_params, lr=config.lr)
+        self.critic_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.critic_optimizer, mode='min', factor=0.8, patience=10
         )
 
         # Training state
@@ -145,6 +146,66 @@ class PPOTrainer:
         self.ego_step_idx = []     # List[int] - Step indices for broadcasting A_t
         self.ego_robot_mask = []   # List[Tensor[N_R]] - Robot masks
         self.ego_track_mask = []   # List[Tensor[N_T]] - Track masks
+
+    def _build_actor_robot_inputs(self,
+                                  ego_robots: List[Robot],
+                                  agent_scores: Dict[int, float],
+                                  robot_detections: Dict[int, List[str]]) -> Tuple[List[int], torch.Tensor, Optional[torch.Tensor]]:
+        """Create actor feature tensor and mask for ego robots"""
+        if not ego_robots:
+            empty = torch.zeros(0, 6, device=self.device)
+            return [], empty, None
+
+        robot_lookup = {robot.id: robot for robot in ego_robots}
+        robot_ids = sorted(robot_lookup)
+        participating_ids = set(robot_detections.keys())
+
+        rows = []
+        mask_vals = []
+        for robot_id in robot_ids:
+            robot = robot_lookup[robot_id]
+            trust_mean = robot.trust_value
+            strength = robot.trust_alpha + robot.trust_beta
+            prev_trust = self.prev_robot_trusts.get(robot_id, 0.5)
+            delta_trust = abs(trust_mean - prev_trust)
+            agent_score = agent_scores.get(robot_id, 0.5)
+            score_conf = 2 * abs(agent_score - 0.5)
+            degree = len(robot.get_current_timestep_tracks())
+            rows.append([trust_mean, strength, delta_trust, agent_score, score_conf, degree])
+            mask_vals.append(1.0 if robot_id in participating_ids else 0.0)
+
+        features = torch.tensor(rows, dtype=torch.float32, device=self.device)
+        mask_tensor = torch.tensor(mask_vals, dtype=torch.float32, device=self.device)
+        return robot_ids, features, mask_tensor
+
+    def _build_actor_track_inputs(self,
+                                  participating_tracks: List[Track],
+                                  track_scores: Dict[str, float],
+                                  track_detectors: Dict[str, List[int]]) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
+        """Create actor feature tensor for detected tracks"""
+        if not participating_tracks:
+            empty = torch.zeros(0, 7, device=self.device)
+            return [], empty, None
+
+        track_lookup = {track.track_id: track for track in participating_tracks}
+        track_ids = sorted(track_lookup)
+
+        rows = []
+        for track_id in track_ids:
+            track = track_lookup[track_id]
+            trust_mean = track.trust_value
+            strength = track.trust_alpha + track.trust_beta
+            prev_trust = self.prev_track_trusts.get(track_id, 0.5)
+            delta_trust = abs(trust_mean - prev_trust)
+            maturity = min(1.0, track.observation_count / 10.0)
+            track_score = track_scores.get(track_id, 0.5)
+            score_conf = 2 * abs(track_score - 0.5)
+            degree = len(track_detectors.get(track_id, []))
+            rows.append([trust_mean, strength, delta_trust, maturity, track_score, score_conf, degree])
+
+        features = torch.tensor(rows, dtype=torch.float32, device=self.device)
+        mask_tensor = torch.ones(features.shape[0], dtype=torch.float32, device=self.device)
+        return track_ids, features, mask_tensor
 
 
     def compute_step_reward(self, all_robots: List[Robot], ground_truth: Dict) -> float:
@@ -455,7 +516,6 @@ class PPOTrainer:
                     if not scores.agent_scores and not scores.track_scores:
                         continue  # No scores from GNN
 
-
                     # Get ego graph nodes (same logic as in ego_sweep_step)
                     ego_robot_ids = list(scores.agent_scores.keys())
                     ego_track_ids = list(scores.track_scores.keys())
@@ -470,61 +530,11 @@ class PPOTrainer:
                     if not participating_robots and not participating_tracks:
                         continue  # No participating nodes in this ego graph
 
-                    # STABLE ORDERING: Sort IDs for consistent ordering across calls
-                    robot_ids = sorted([r.id for r in ego_robots])
-                    track_ids = sorted([t.track_id for t in participating_tracks])
-
-                    # Build participating entities in sorted order
-                    robot_lookup_local = {r.id: r for r in ego_robots}
-                    track_lookup_local = {t.track_id: t for t in participating_tracks}
-                    participating_robot_ids = set(robot_detections.keys())
-                    participating_track_ids = set(track_detectors.keys())
-
-                    participating_robots_sorted = [robot_lookup_local[rid] for rid in robot_ids]
-                    participating_tracks_sorted = [track_lookup_local[tid] for tid in track_ids]
-
-                    # State encoding is no longer needed since we use tier0_features directly
-
-                    # Build features for ego robots (mask marks participation)
-                    robot_features = []
-                    robot_mask_values = []
-                    for robot in participating_robots_sorted:
-                        trust_mean = robot.trust_value
-                        strength = robot.trust_alpha + robot.trust_beta
-                        # Delta trust: change from previous step
-                        prev_trust = self.prev_robot_trusts.get(robot.id, 0.5)
-                        delta_trust = abs(trust_mean - prev_trust)
-                        robot_score = scores.agent_scores.get(robot.id, 0.5)
-                        score_conf = 2 * abs(robot_score - 0.5)  # Confidence as distance from 0.5
-                        # Degree (number of tracks this robot has)
-                        degree = len(robot.get_current_timestep_tracks())
-                        robot_features.append([trust_mean, strength, delta_trust, robot_score, score_conf, degree])
-                        robot_mask_values.append(1.0 if robot.id in participating_robot_ids else 0.0)
-
-                    track_features = []
-                    for track in participating_tracks_sorted:
-                        trust_mean = track.trust_value
-                        strength = track.trust_alpha + track.trust_beta
-                        # Delta trust: change from previous step
-                        prev_trust = self.prev_track_trusts.get(track.track_id, 0.5)
-                        delta_trust = abs(trust_mean - prev_trust)
-                        maturity = min(1.0, track.observation_count / 10.0)
-                        track_score = scores.track_scores.get(track.track_id, 0.5)
-                        score_conf = 2 * abs(track_score - 0.5)  # Confidence as distance from 0.5
-                        # Degree (number of participating robots that detected this track)
-                        degree = sum(1 for r in participating_robots_sorted if any(t.track_id == track.track_id for t in r.get_current_timestep_tracks()))
-                        track_features.append([trust_mean, strength, delta_trust, maturity, track_score, score_conf, degree])
-
-                    robot_features_tensor = torch.tensor(robot_features, dtype=torch.float32, device=self.device) if robot_features else torch.zeros(0, 6, device=self.device)
-                    track_features_tensor = torch.tensor(track_features, dtype=torch.float32, device=self.device) if track_features else torch.zeros(0, 7, device=self.device)
-
-                    # Sample actions using the simplified actor policy
-                    robot_features_tensor = robot_features_tensor.to(self.device)
-                    track_features_tensor = track_features_tensor.to(self.device)
-
-                    # Create masks (flag participating robots/tracks)
-                    robot_mask = torch.tensor(robot_mask_values, dtype=torch.float32, device=self.device) if robot_features_tensor.shape[0] > 0 else None
-                    track_mask = torch.ones(track_features_tensor.shape[0], device=self.device) if track_features_tensor.shape[0] > 0 else None
+                    # Build actor inputs (robots include ego + proximal, tracks only detections)
+                    robot_ids, robot_features_tensor, robot_mask = self._build_actor_robot_inputs(
+                        ego_robots, scores.agent_scores, robot_detections)
+                    track_ids, track_features_tensor, track_mask = self._build_actor_track_inputs(
+                        participating_tracks, scores.track_scores, track_detectors)
 
                     try:
                         robot_actions, track_actions, robot_log_probs, track_log_probs, entropy, _, _ = self.updater.policy.sample_actions(
@@ -665,9 +675,7 @@ class PPOTrainer:
 
         # Episode-end reward is now included in the final step above
 
-        # Normalize episode reward by episode length for fair comparison across different scenario sizes
-        normalized_episode_reward = episode_reward / max(scenario_params.episode_length, 1)
-        return normalized_episode_reward
+        return episode_reward
 
     def clear_trajectories(self):
         """Clear trajectory storage after PPO update"""
@@ -807,27 +815,43 @@ class PPOTrainer:
                     avg_value_loss = total_value_loss / batch_count
                     avg_entropy = total_entropy / batch_count
 
-                    # Total loss 
-                    loss = avg_policy_loss + self.config.value_loss_coef * avg_value_loss - self.config.entropy_coef * avg_entropy
+                    actor_loss = avg_policy_loss - self.config.entropy_coef * avg_entropy
+                    critic_loss = self.config.value_loss_coef * avg_value_loss
 
-                    # Store losses for monitoring
-                    self.ppo_losses.append(loss.item())
-                    self.policy_losses.append(avg_policy_loss.item())
-                    self.value_losses.append(avg_value_loss.item())
-                    self.entropy_values.append(avg_entropy.item())
-
-                    # Update policy
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    # Clip gradients for both actor and critic (since they're optimized together)
+                    # Actor update
+                    self.actor_optimizer.zero_grad()
+                    actor_loss.backward()
                     torch.nn.utils.clip_grad_norm_(
-                        list(self.updater.policy.parameters()) + list(self.critic.parameters()),
+                        self.updater.policy.parameters(),
                         self.config.max_grad_norm
                     )
-                    self.optimizer.step()
+                    self.actor_optimizer.step()
+
+                    # Critic update
+                    self.critic_optimizer.zero_grad()
+                    critic_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.critic.parameters(),
+                        self.config.max_grad_norm
+                    )
+                    self.critic_optimizer.step()
+
+                    actor_loss_val = actor_loss.item()
+                    critic_loss_val = critic_loss.item()
+                    combined_loss = actor_loss_val + critic_loss_val
+
+                    # Store losses for monitoring
+                    self.ppo_losses.append(combined_loss)
+                    self.policy_losses.append(actor_loss_val)
+                    self.value_losses.append(critic_loss_val)
+                    self.entropy_values.append(avg_entropy.item())
 
         self.total_updates += 1
-        print(f"PPO update completed. Total loss: {np.mean(self.ppo_losses[-10:]):.4f}")
+        recent_actor = np.mean(self.policy_losses[-10:]) if self.policy_losses else 0.0
+        recent_critic = np.mean(self.value_losses[-10:]) if self.value_losses else 0.0
+        recent_total = np.mean(self.ppo_losses[-10:]) if self.ppo_losses else 0.0
+        print(f"PPO update completed. Loss(actor/critic/total): {recent_actor:.4f} / {recent_critic:.4f} / {recent_total:.4f}")
+        self.critic_scheduler.step(recent_critic)
 
     def compute_step_level_advantages(self):
         """
@@ -929,18 +953,17 @@ class PPOTrainer:
                 self.ppo_update()
                 self.clear_trajectories()
 
-                # Update learning rate based on recent performance
-                recent_avg = np.mean(self.episode_rewards[-10:]) if len(self.episode_rewards) >= 10 else episode_reward
-                self.scheduler.step(recent_avg)
-
             # More frequent logging for monitoring
             if True:
                 avg_reward = np.mean(self.episode_rewards[-10:]) if self.episode_rewards else 0
-                recent_loss = np.mean(self.ppo_losses[-10:]) if self.ppo_losses else 0
-                current_lr = self.optimizer.param_groups[0]['lr']
+                recent_actor_loss = np.mean(self.policy_losses[-10:]) if self.policy_losses else 0
+                recent_critic_loss = np.mean(self.value_losses[-10:]) if self.value_losses else 0
+                recent_total_loss = np.mean(self.ppo_losses[-10:]) if self.ppo_losses else 0
+                actor_lr = self.actor_optimizer.param_groups[0]['lr']
+                critic_lr = self.critic_optimizer.param_groups[0]['lr']
                 traj_count = self.trajectory_counts[-1] if self.trajectory_counts else 0
-                print(f"Episode {episode}: Reward = {episode_reward:.4f}, Avg = {avg_reward:.4f}, Loss = {recent_loss:.4f}")
-                print(f"           Updates = {self.total_updates}, LR = {current_lr:.6f}, Trajectories = {traj_count}, Time = {episode_time:.2f}s")
+                print(f"Episode {episode}: Reward = {episode_reward:.4f}, Avg = {avg_reward:.4f}, Loss(actor/critic/total) = {recent_actor_loss:.4f}/{recent_critic_loss:.4f}/{recent_total_loss:.4f}")
+                print(f"           Updates = {self.total_updates}, LR(actor/critic) = {actor_lr:.6f}/{critic_lr:.6f}, Trajectories = {traj_count}, Time = {episode_time:.2f}s")
 
             # Save best model
             if episode_reward > self.best_reward:
@@ -955,7 +978,8 @@ class PPOTrainer:
         self.plot_training_rewards()
 
         print(f"Training completed. Best reward: {self.best_reward:.4f}")
-        print(f"Final learning rate: {self.optimizer.param_groups[0]['lr']:.6f}")
+        print(f"Final actor LR: {self.actor_optimizer.param_groups[0]['lr']:.6f}")
+        print(f"Final critic LR: {self.critic_optimizer.param_groups[0]['lr']:.6f}")
         print(f"Total PPO updates: {self.total_updates}")
         print(f"Average trajectory count: {np.mean(self.trajectory_counts) if self.trajectory_counts else 0:.1f}")
 
@@ -1017,7 +1041,8 @@ class PPOTrainer:
         print(f"   • Mean Reward: {mean_reward:.4f} ± {std_reward:.4f}")
         print(f"   • Best Reward: {max(self.episode_rewards):.4f}")
         print(f"   • Worst Reward: {min(self.episode_rewards):.4f}")
-        print(f"   • Final Learning Rate: {self.optimizer.param_groups[0]['lr']:.6f}")
+        print(f"   • Final Actor LR: {self.actor_optimizer.param_groups[0]['lr']:.6f}")
+        print(f"   • Final Critic LR: {self.critic_optimizer.param_groups[0]['lr']:.6f}")
         print(f"   • Total Updates: {self.total_updates}")
 
 

@@ -165,6 +165,40 @@ class SetTransformerActor(nn.Module):
         summed = (embeddings * mask).sum(dim=1)
         return summed / denom
 
+    def _beta_forward(self,
+                      mu: torch.Tensor,
+                      kappa: torch.Tensor,
+                      mask: Optional[torch.Tensor],
+                      actions: Optional[torch.Tensor] = None):
+        """Helper to sample Beta actions or evaluate log-probs with empty-set guards"""
+        if mu.numel() == 0:
+            shape = mu.shape
+            zero = torch.zeros(shape, dtype=mu.dtype, device=mu.device)
+            entropy = torch.zeros(mu.shape[0], dtype=mu.dtype, device=mu.device)
+            if actions is None:
+                return zero, zero.clone(), entropy, zero.clone(), zero.clone()
+            return zero.clone(), entropy
+
+        eps = 1e-4
+        mu = mu.clamp(eps, 1.0 - eps)
+        alpha = mu * kappa
+        beta = (1 - mu) * kappa
+        dist = torch.distributions.Beta(alpha, beta)
+
+        samples = dist.rsample() if actions is None else actions
+        log_prob = dist.log_prob(samples)
+        if mask is not None:
+            log_prob = log_prob * mask.float()
+
+        entropy_matrix = dist.entropy() - torch.log(kappa + 1e-8) * 0.01
+        if mask is not None:
+            entropy_matrix = entropy_matrix * mask.float()
+        entropy = entropy_matrix.sum(dim=1)
+
+        if actions is None:
+            return samples, log_prob, entropy, alpha, beta
+        return log_prob, entropy
+
     def forward(self,
                 robot_features: torch.Tensor,
                 track_features: torch.Tensor,
@@ -262,31 +296,10 @@ class SetTransformerActor(nn.Module):
         (robot_mu, robot_kappa), (track_mu, track_kappa) = self.forward(
             robot_features, track_features, robot_mask, track_mask)
 
-        eps = 1e-4
-
-        def _sample(mu, kappa, mask):
-            if mu.numel() == 0:
-                shape = mu.shape
-                zero = torch.zeros(shape, dtype=mu.dtype, device=mu.device)
-                entropy = torch.zeros(mu.shape[0], dtype=mu.dtype, device=mu.device)
-                return zero, zero.clone(), entropy, zero.clone(), zero.clone()
-
-            mu = mu.clamp(eps, 1.0 - eps)
-            alpha = mu * kappa
-            beta = (1 - mu) * kappa
-            dist = torch.distributions.Beta(alpha, beta)
-            actions = dist.rsample()
-            log_prob = dist.log_prob(actions)
-            if mask is not None:
-                log_prob = log_prob * mask.float()
-            entropy = dist.entropy() - torch.log(kappa + 1e-8) * 0.01
-            if mask is not None:
-                entropy = entropy * mask.float()
-            entropy = entropy.sum(dim=1)
-            return actions, log_prob, entropy, alpha, beta
-
-        robot_actions, robot_log_probs, robot_entropy, robot_alpha, robot_beta = _sample(robot_mu, robot_kappa, robot_mask)
-        track_actions, track_log_probs, track_entropy, track_alpha, track_beta = _sample(track_mu, track_kappa, track_mask)
+        robot_actions, robot_log_probs, robot_entropy, robot_alpha, robot_beta = self._beta_forward(
+            robot_mu, robot_kappa, robot_mask)
+        track_actions, track_log_probs, track_entropy, track_alpha, track_beta = self._beta_forward(
+            track_mu, track_kappa, track_mask)
 
         total_entropy = robot_entropy + track_entropy
 
@@ -305,37 +318,12 @@ class SetTransformerActor(nn.Module):
         (robot_mu, robot_kappa), (track_mu, track_kappa) = self.forward(
             robot_features, track_features, robot_mask, track_mask)
 
-        eps = 1e-4
+        robot_log_probs, robot_entropy = self._beta_forward(
+            robot_mu, robot_kappa, robot_mask, actions=robot_actions)
+        track_log_probs, track_entropy = self._beta_forward(
+            track_mu, track_kappa, track_mask, actions=track_actions)
 
-        robot_log_probs = torch.zeros_like(robot_actions)
-        track_log_probs = torch.zeros_like(track_actions)
-        total_entropy = torch.zeros(robot_actions.shape[0], dtype=robot_actions.dtype, device=robot_actions.device)
-
-        if robot_mu.numel() > 0:
-            robot_mu = robot_mu.clamp(eps, 1.0 - eps)
-            robot_alpha = robot_mu * robot_kappa
-            robot_beta = (1 - robot_mu) * robot_kappa
-            robot_dist = torch.distributions.Beta(robot_alpha, robot_beta)
-            robot_log_probs = robot_dist.log_prob(robot_actions)
-            if robot_mask is not None:
-                robot_log_probs = robot_log_probs * robot_mask.float()
-            robot_entropy = robot_dist.entropy() - torch.log(robot_kappa + 1e-8) * 0.01
-            if robot_mask is not None:
-                robot_entropy = robot_entropy * robot_mask.float()
-            total_entropy += robot_entropy.sum(dim=1)
-
-        if track_mu.numel() > 0:
-            track_mu = track_mu.clamp(eps, 1.0 - eps)
-            track_alpha = track_mu * track_kappa
-            track_beta = (1 - track_mu) * track_kappa
-            track_dist = torch.distributions.Beta(track_alpha, track_beta)
-            track_log_probs = track_dist.log_prob(track_actions)
-            if track_mask is not None:
-                track_log_probs = track_log_probs * track_mask.float()
-            track_entropy = track_dist.entropy() - torch.log(track_kappa + 1e-8) * 0.01
-            if track_mask is not None:
-                track_entropy = track_entropy * track_mask.float()
-            total_entropy += track_entropy.sum(dim=1)
+        total_entropy = robot_entropy + track_entropy
 
         return robot_log_probs, track_log_probs, total_entropy
 
