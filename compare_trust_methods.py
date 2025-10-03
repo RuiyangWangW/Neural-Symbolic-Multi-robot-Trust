@@ -713,7 +713,7 @@ def main():
     NUM_ROBOTS = 10
     NUM_TARGETS = 20
     NUM_TIMESTEPS = 100
-    RANDOM_SEED = 8
+    RANDOM_SEED = 11
 
     # Environment Parameters
     WORLD_SIZE = 100.0

@@ -99,30 +99,45 @@ class RLTrustSystem:
             for track in robot.get_current_timestep_tracks():
                 track_lookup[track.track_id] = track
 
+        # Pre-compute FoV visibility for each robot to extend detections
+        robot_visible_tracks = {}
+        for robot in all_robots:
+            visible = []
+            for track in track_lookup.values():
+                if robot.is_in_fov(track.position):
+                    visible.append(track.track_id)
+            robot_visible_tracks[robot.id] = visible
+
         rho_robot = {}  # ρ_i^fromTracks(t)
         rho_track = {}  # ρ_j^fromAgents(t)
 
-        # Gate robot i by tracks it detected
-        for robot_id, detected_track_ids in robot_detections.items():
-            if detected_track_ids:
+        # Gate robot i by tracks it detected or has in FoV
+        for robot in all_robots:
+            detected_track_ids = set(robot_detections.get(robot.id, []))
+            fov_track_ids = set(robot_visible_tracks.get(robot.id, []))
+            observed_track_ids = detected_track_ids | fov_track_ids
+            if observed_track_ids:
                 track_means = []
-                for track_id in detected_track_ids:
+                for track_id in observed_track_ids:
                     if track_id in track_lookup:
                         t_j = track_lookup[track_id].trust_value
                         track_means.append(max(self.rho_min, np.clip(2 * t_j, 0, 1)))
-                rho_robot[robot_id] = np.mean(track_means)
-            # If no detections, skip (no delta this step)
+                if track_means:
+                    rho_robot[robot.id] = np.mean(track_means)
 
-        # Gate track j by robots that detected it
-        for track_id, detecting_robot_ids in track_detectors.items():
-            if detecting_robot_ids:
+        # Gate track j by robots that detected it or have it in FoV
+        for track_id, track in track_lookup.items():
+            detecting_robot_ids = set(track_detectors.get(track_id, []))
+            fov_robot_ids = {robot.id for robot in all_robots if track_id in robot_visible_tracks.get(robot.id, [])}
+            observer_ids = detecting_robot_ids | fov_robot_ids
+            if observer_ids:
                 robot_means = []
-                for robot_id in detecting_robot_ids:
+                for robot_id in observer_ids:
                     if robot_id in robot_lookup:
                         m_i = robot_lookup[robot_id].trust_value
                         robot_means.append(max(self.rho_min, np.clip(2 * m_i, 0, 1)))
-                rho_track[track_id] = np.mean(robot_means)
-            # If no detectors, skip (no delta this step)
+                if robot_means:
+                    rho_track[track_id] = np.mean(robot_means)
 
         return rho_robot, rho_track
 
@@ -163,9 +178,21 @@ class RLTrustSystem:
             ego_robots = [robot for robot in all_robots if robot.id in ego_robot_ids]
             ego_tracks = [track_lookup[track_id] for track_id in ego_track_ids if track_id in track_lookup]
 
-            # Get participating nodes (those that detected/were detected this step)
-            participating_robots = [robot for robot in ego_robots if robot.id in robot_detections]
-            participating_tracks = [track for track in ego_tracks if track.track_id in track_detectors]
+            # Build observer lists (detections + FoV)
+            track_observers = {}
+            for track in ego_tracks:
+                detectors = set(track_detectors.get(track.track_id, []))
+                fov_watchers = {robot.id for robot in ego_robots if robot.is_in_fov(track.position)}
+                observers = detectors | fov_watchers
+                if observers:
+                    track_observers[track.track_id] = sorted(observers)
+
+            observer_robot_ids = set(robot_detections.keys())
+            for observers in track_observers.values():
+                observer_robot_ids.update(observers)
+
+            participating_robots = [robot for robot in ego_robots if robot.id in observer_robot_ids]
+            participating_tracks = [track for track in ego_tracks if track.track_id in track_observers]
 
             if not participating_robots and not participating_tracks:
                 continue  # No participating nodes in this ego graph
@@ -176,7 +203,7 @@ class RLTrustSystem:
             else:
                 step_decision = self.updater.get_step_scales(
                     ego_robots, ego_tracks, participating_robots, participating_tracks,
-                    scores.agent_scores, scores.track_scores
+                    scores.agent_scores, scores.track_scores, track_observers
                 )
 
             # Accumulate robot deltas
@@ -191,8 +218,8 @@ class RLTrustSystem:
                 cross_weight = rho_robot[robot_id]
 
                 # Scale agent_score by (step_scale × confidence × cross_weight)
-                effective_weight = step_scale * confidence * cross_weight
-
+                #effective_weight = step_scale * confidence * cross_weight
+                effective_weight = step_scale
                 # Accumulate pseudo-counts
                 robot_deltas[robot_id][0] += effective_weight * agent_score
                 robot_deltas[robot_id][1] += effective_weight * (1 - agent_score)
@@ -210,8 +237,8 @@ class RLTrustSystem:
                 cross_weight = rho_track[track_id]
 
                 # Scale track_score by (step_scale × confidence × cross_weight)
-                effective_weight = step_scale * confidence * cross_weight
-
+                #effective_weight = step_scale * confidence * cross_weight
+                effective_weight = step_scale
                 # Accumulate pseudo-counts
                 track_deltas[track_id][0] += effective_weight * track_score
                 track_deltas[track_id][1] += effective_weight * (1 - track_score)

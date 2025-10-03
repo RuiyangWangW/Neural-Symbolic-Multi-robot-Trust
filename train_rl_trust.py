@@ -42,12 +42,12 @@ class TrainingConfig:
     # Training schedule (safe starting point)
     num_episodes: int = 5000  # Total episodes for training
     steps_per_episode: int = 100
-    update_every_episodes: int = 10  # How often to run PPO updates
+    update_every_episodes: int = 5  # How often to run PPO updates
     ppo_epochs: int = 4  # PPO epochs per update
     batch_size: int = 128  # Ego batch size (64-256 range, using middle value)
     
     # Trust system defaults from framework
-    step_size: float = 0.25
+    step_size: float = 1.0
     strength_cap: float = 50.0
 
     # Thresholds for classification
@@ -146,11 +146,13 @@ class PPOTrainer:
         self.ego_step_idx = []     # List[int] - Step indices for broadcasting A_t
         self.ego_robot_mask = []   # List[Tensor[N_R]] - Robot masks
         self.ego_track_mask = []   # List[Tensor[N_T]] - Track masks
+        self.ego_robot_track_mask = []  # List[Tensor[N_R, N_T]] - Robot-to-track adjacency masks
 
     def _build_actor_robot_inputs(self,
                                   ego_robots: List[Robot],
                                   agent_scores: Dict[int, float],
-                                  robot_detections: Dict[int, List[str]]) -> Tuple[List[int], torch.Tensor, Optional[torch.Tensor]]:
+                                  robot_detections: Dict[int, List[str]],
+                                  track_observers: Optional[Dict[str, List[int]]] = None) -> Tuple[List[int], torch.Tensor, Optional[torch.Tensor]]:
         """Create actor feature tensor and mask for ego robots"""
         if not ego_robots:
             empty = torch.zeros(0, 6, device=self.device)
@@ -159,6 +161,9 @@ class PPOTrainer:
         robot_lookup = {robot.id: robot for robot in ego_robots}
         robot_ids = sorted(robot_lookup)
         participating_ids = set(robot_detections.keys())
+        if track_observers:
+            for observers in track_observers.values():
+                participating_ids.update(observers)
 
         rows = []
         mask_vals = []
@@ -170,7 +175,10 @@ class PPOTrainer:
             delta_trust = abs(trust_mean - prev_trust)
             agent_score = agent_scores.get(robot_id, 0.5)
             score_conf = 2 * abs(agent_score - 0.5)
-            degree = len(robot.get_current_timestep_tracks())
+            if track_observers:
+                degree = sum(1 for observers in track_observers.values() if robot_id in observers)
+            else:
+                degree = len(robot.get_current_timestep_tracks())
             rows.append([trust_mean, strength, delta_trust, agent_score, score_conf, degree])
             mask_vals.append(1.0 if robot_id in participating_ids else 0.0)
 
@@ -206,6 +214,30 @@ class PPOTrainer:
         features = torch.tensor(rows, dtype=torch.float32, device=self.device)
         mask_tensor = torch.ones(features.shape[0], dtype=torch.float32, device=self.device)
         return track_ids, features, mask_tensor
+
+    def _build_robot_track_relation_mask(self,
+                                         robot_ids: List[int],
+                                         track_ids: List[str],
+                                         robot_lookup: Dict[int, Robot],
+                                         track_lookup: Dict[str, Track],
+                                         robot_detections: Dict[int, List[str]]) -> torch.Tensor:
+        """Build adjacency mask marking which robots should attend to which tracks"""
+        if not robot_ids or not track_ids:
+            return torch.zeros((len(robot_ids), len(track_ids)), dtype=torch.float32, device=self.device)
+
+        mask = torch.zeros((len(robot_ids), len(track_ids)), dtype=torch.float32, device=self.device)
+
+        for r_idx, robot_id in enumerate(robot_ids):
+            robot = robot_lookup[robot_id]
+            detected_tracks = set(robot_detections.get(robot_id, []))
+            for t_idx, track_id in enumerate(track_ids):
+                track = track_lookup[track_id]
+                in_detection = track_id in detected_tracks
+                in_fov = robot.is_in_fov(track.position)
+                if in_detection or in_fov:
+                    mask[r_idx, t_idx] = 1.0
+
+        return mask
 
 
     def compute_step_reward(self, all_robots: List[Robot], ground_truth: Dict) -> float:
@@ -523,24 +555,43 @@ class PPOTrainer:
                     ego_robots = [robot for robot in robots if robot.id in ego_robot_ids]
                     ego_tracks = [track_lookup[track_id] for track_id in ego_track_ids if track_id in track_lookup]
 
-                    # Get participating nodes (those that detected/were detected this step)
-                    participating_robots = [robot for robot in ego_robots if robot.id in robot_detections]
-                    participating_tracks = [track for track in ego_tracks if track.track_id in track_detectors]
+                    # Identify observers (detections or FoV sightings)
+                    track_observers = {}
+                    for track in ego_tracks:
+                        detectors = set(track_detectors.get(track.track_id, []))
+                        fov_watchers = {robot.id for robot in ego_robots if robot.is_in_fov(track.position)}
+                        observers = detectors | fov_watchers
+                        if observers:
+                            track_observers[track.track_id] = sorted(observers)
+
+                    observer_robot_ids = set(robot_detections.keys())
+                    for observers in track_observers.values():
+                        observer_robot_ids.update(observers)
+
+                    participating_robots = [robot for robot in ego_robots if robot.id in observer_robot_ids]
+                    participating_tracks = [track for track in ego_tracks if track.track_id in track_observers]
 
                     if not participating_robots and not participating_tracks:
                         continue  # No participating nodes in this ego graph
 
                     # Build actor inputs (robots include ego + proximal, tracks only detections)
                     robot_ids, robot_features_tensor, robot_mask = self._build_actor_robot_inputs(
-                        ego_robots, scores.agent_scores, robot_detections)
+                        ego_robots, scores.agent_scores, robot_detections, track_observers)
                     track_ids, track_features_tensor, track_mask = self._build_actor_track_inputs(
-                        participating_tracks, scores.track_scores, track_detectors)
+                        participating_tracks, scores.track_scores, track_observers)
+
+                    robot_lookup_local = {robot.id: robot for robot in ego_robots}
+                    track_lookup_local = {track.track_id: track for track in participating_tracks}
+                    robot_track_mask = self._build_robot_track_relation_mask(
+                        robot_ids, track_ids, robot_lookup_local, track_lookup_local, robot_detections
+                    )
 
                     try:
                         robot_actions, track_actions, robot_log_probs, track_log_probs, entropy, _, _ = self.updater.policy.sample_actions(
                             robot_features_tensor.unsqueeze(0), track_features_tensor.unsqueeze(0),
                             robot_mask.unsqueeze(0) if robot_mask is not None else None,
-                            track_mask.unsqueeze(0) if track_mask is not None else None
+                            track_mask.unsqueeze(0) if track_mask is not None else None,
+                            robot_track_mask.unsqueeze(0) if robot_track_mask.numel() > 0 else None
                         )
                     except Exception as exc:
                         print("Actor sample failure:")
@@ -571,9 +622,20 @@ class PPOTrainer:
 
                     # Store trajectory data for this ego (detached to avoid gradient conflicts)
                     # Include IDs to maintain exact ordering consistency for the actor
-                    ego_trajectory_data = [robot_features_tensor.detach(), track_features_tensor.detach(),
-                                         robot_actions.detach(), track_actions.detach(), robot_log_probs.detach(), track_log_probs.detach(),
-                                         robot_ids.copy(), track_ids.copy(), robot_mask, track_mask]  # Store everything needed for the actor
+                    ego_trajectory_data = [
+                        robot_features_tensor.detach(),
+                        track_features_tensor.detach(),
+                        robot_actions.detach(),
+                        track_actions.detach(),
+                        robot_log_probs.detach(),
+                        track_log_probs.detach(),
+                        robot_ids.copy(),
+                        track_ids.copy(),
+                        robot_mask,
+                        track_mask,
+                        robot_track_mask.detach(),
+                        float(entropy.detach())
+                    ]
                     all_trajectory_data.append(ego_trajectory_data)
 
                 # Build complete global state for the critic using simplified features
@@ -651,7 +713,9 @@ class PPOTrainer:
 
                 # Collect ego-level data for ALL participating egos using new buffer format
                 for ego_trajectory_data in all_trajectory_data:
-                    robot_features_tensor, track_features_tensor, robot_actions, track_actions, robot_log_probs, track_log_probs, robot_ids, track_ids, robot_mask, track_mask = ego_trajectory_data
+                    (robot_features_tensor, track_features_tensor, robot_actions, track_actions,
+                     robot_log_probs, track_log_probs, robot_ids, track_ids, robot_mask,
+                     track_mask, robot_track_mask_tensor, entropy_value) = ego_trajectory_data
 
                     # Store ego-level data using new buffer format
                     ego_item_idx = len(self.ego_R_feats)
@@ -661,10 +725,11 @@ class PPOTrainer:
                     self.ego_a_T.append(track_actions.detach())  # Tensor[N_T] - track actions
                     self.ego_logp_R.append(robot_log_probs.detach())  # Tensor[N_R] - robot log probs (old)
                     self.ego_logp_T.append(track_log_probs.detach())  # Tensor[N_T] - track log probs (old)
-                    self.ego_entropy.append(float(entropy.item() if hasattr(entropy, 'item') else entropy))  # float - entropy
+                    self.ego_entropy.append(float(entropy_value))  # float - entropy
                     self.ego_step_idx.append(current_step_idx)  # int - step index for broadcasting A_t
                     self.ego_robot_mask.append(robot_mask.detach() if robot_mask is not None else torch.empty(0, device=self.device))
                     self.ego_track_mask.append(track_mask.detach() if track_mask is not None else torch.empty(0, device=self.device))
+                    self.ego_robot_track_mask.append(robot_track_mask_tensor.detach() if robot_track_mask_tensor.numel() > 0 else torch.empty(0, 0, device=self.device))
 
                     # Map step to ego item index
                     self.step_to_item_indices[current_step_idx].append(ego_item_idx)
@@ -697,6 +762,7 @@ class PPOTrainer:
         self.ego_step_idx.clear()
         self.ego_robot_mask.clear()
         self.ego_track_mask.clear()
+        self.ego_robot_track_mask.clear()
 
     def ppo_update(self):
         """Perform PPO policy update using collected trajectories"""
@@ -739,6 +805,7 @@ class PPOTrainer:
                         track_features = self.ego_T_feats[i].to(self.device)  # [N_T, F_T] - variable N_T
                         robot_mask = self.ego_robot_mask[i].to(self.device) if self.ego_robot_mask[i].numel() > 0 else None
                         track_mask = self.ego_track_mask[i].to(self.device) if self.ego_track_mask[i].numel() > 0 else None
+                        robot_track_mask = self.ego_robot_track_mask[i].to(self.device) if self.ego_robot_track_mask[i].numel() > 0 else None
 
                         robot_actions = self.ego_a_R[i].to(self.device)  # [N_R] - taken robot actions
                         track_actions = self.ego_a_T[i].to(self.device)  # [N_T] - taken track actions
@@ -751,7 +818,8 @@ class PPOTrainer:
                             robot_features.unsqueeze(0), track_features.unsqueeze(0),
                             robot_actions.unsqueeze(0), track_actions.unsqueeze(0),
                             robot_mask.unsqueeze(0) if robot_mask is not None else None,
-                            track_mask.unsqueeze(0) if track_mask is not None else None
+                            track_mask.unsqueeze(0) if track_mask is not None else None,
+                            robot_track_mask.unsqueeze(0) if robot_track_mask is not None else None
                         )
                         # Remove batch dimension from outputs
                         logp_R_new = logp_R_new.squeeze(0)

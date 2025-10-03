@@ -75,7 +75,7 @@ class RLScenarioGenerator:
 
         # Curriculum learning state - START WITH LOW COMPLEXITY (traditional curriculum)
         self.current_complexity = 0.0  # Start with fewer robots/targets (simple)
-        self.complexity_increment = 0.0005  # Gradual increase to more complex scenarios
+        self.complexity_increment = 0.0002  # Gradual increase to more complex scenarios
         self.max_complexity = 1.0  # End with lots of robots/targets (complex)
 
         # Scenario templates for variety
