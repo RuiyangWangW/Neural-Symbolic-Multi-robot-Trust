@@ -31,7 +31,7 @@ class TrustMethodComparison:
 
     def __init__(self,
                  supervised_model_path: str = "supervised_trust_model.pth",
-                 rl_model_path: str = "rl_trust_model_final.pth",
+                 rl_model_path: str = "rl_trust_model.pth",
                  num_robots: int = 5,
                  num_targets: int = 10,
                  num_timesteps: int = 500,
@@ -751,14 +751,14 @@ def main():
     # =============================================================================
 
     # Simulation Parameters
-    NUM_ROBOTS = 3
-    NUM_TARGETS = 10
+    NUM_ROBOTS = 10
+    NUM_TARGETS = 20
     NUM_TIMESTEPS = 100
     RANDOM_SEED = 11
 
     # Environment Parameters
-    WORLD_SIZE = 100.0
-    ADVERSARIAL_RATIO = 0.5
+    WORLD_SIZE = 120.0
+    ADVERSARIAL_RATIO = 0.3
     PROXIMAL_RANGE = 50.0
     FOV_RANGE = 50.0
     FOV_ANGLE = np.pi/3

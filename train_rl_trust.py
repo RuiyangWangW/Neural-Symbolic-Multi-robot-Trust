@@ -11,6 +11,7 @@ import torch.optim as optim
 import numpy as np
 import time
 import matplotlib.pyplot as plt
+import copy
 from typing import Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass
 
@@ -122,6 +123,8 @@ class PPOTrainer:
         self.trajectory_counts = []
         self.final_classification_scores = []
         self.final_accuracy_stats = []
+        self.best_model_score = float('-inf')
+        self.best_accuracy_stats = None
 
         # Episode state tracking (reset at episode start to prevent leakage)
         self.prev_robot_trusts = {}   # Dict[int, float] - previous step robot trust values
@@ -414,6 +417,12 @@ class PPOTrainer:
                     false_object_ids.add(obj_id)
 
         return object_min_trust, false_object_ids
+
+    def compute_model_selection_score(self, final_classification: float, accuracy_stats: Dict[str, Dict[str, float]]) -> float:
+        """Composite metric for deciding when to save best model."""
+        total_correct = sum(stats['correct'] for stats in accuracy_stats.values())
+        total_entities = sum(stats['total'] for stats in accuracy_stats.values())
+        return final_classification * (1 + total_entities) + total_correct
 
     def build_global_state_tensor(self, robots: List[Robot], ground_truth: Dict,
                                  step_idx: int, total_steps: int) -> torch.Tensor:
@@ -1146,11 +1155,18 @@ class PPOTrainer:
                 print(f"           Loss(actor/critic/total) = {recent_actor_loss:.4f}/{recent_critic_loss:.4f}/{recent_total_loss:.4f}")
                 print(f"           Updates = {self.total_updates}, LR(actor/critic) = {actor_lr:.6f}/{critic_lr:.6f}, Trajectories = {traj_count}, Time = {episode_time:.2f}s")
 
-            # Save best model
-            if episode_reward > self.best_reward:
+            total_correct = sum(stats['correct'] for stats in accuracy_stats.values())
+            total_entities = sum(stats['total'] for stats in accuracy_stats.values())
+            selection_score = self.compute_model_selection_score(final_classification, accuracy_stats)
+
+            # Save best model based on composite selection score
+            if selection_score > self.best_model_score:
+                self.best_model_score = selection_score
                 self.best_reward = episode_reward
+                self.best_accuracy_stats = copy.deepcopy(accuracy_stats)
                 torch.save(self.updater.policy.state_dict(), 'rl_trust_model.pth')
-                print(f"New best model saved: {episode_reward:.3f}")
+                print(f"New best model saved: reward={episode_reward:.3f}, finalCls={final_classification:.3f}, "
+                      f"correct={total_correct}, total={total_entities}, score={selection_score:.2f}")
 
         # Save final model
         torch.save(self.updater.policy.state_dict(), 'rl_trust_model_final.pth')
@@ -1165,6 +1181,12 @@ class PPOTrainer:
         print(f"Average trajectory count: {np.mean(self.trajectory_counts) if self.trajectory_counts else 0:.1f}")
         if self.final_classification_scores:
             print(f"Average final classification score: {np.mean(self.final_classification_scores):.4f}")
+        if self.best_accuracy_stats:
+            print("Best model classification stats:")
+            for key, stats in self.best_accuracy_stats.items():
+                acc = stats['accuracy']
+                acc_str = f"{acc*100:.1f}%" if acc is not None else 'N/A'
+                print(f"  {key}: {stats['correct']}/{stats['total']} ({acc_str})")
         if self.final_accuracy_stats:
             def average_accuracy(key: str) -> float:
                 values = [stats[key]['accuracy'] for stats in self.final_accuracy_stats if stats[key]['accuracy'] is not None]
