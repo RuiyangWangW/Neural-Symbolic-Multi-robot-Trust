@@ -11,9 +11,8 @@ import torch.optim as optim
 import numpy as np
 import time
 import matplotlib.pyplot as plt
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass
-from typing import Optional
 
 from robot_track_classes import Robot
 from rl_trust_system import RLTrustSystem
@@ -63,15 +62,14 @@ class TrainingConfig:
     # Training options
     reward_scale: float = 1.0  # Let advantage normalization handle scaling
     clip_rewards: bool = True  # Clip rewards for stability
-    reward_clip_range: float = 10.0  # Reward clipping range
+    reward_clip_range: float = 200.0  # Reward clipping range
+    baseline_step_scale: float = 0.5  # Reference step scale used for baseline comparison
+    step_reward_scale: float = 1000.0  # Scale factor applied to per-step alignment improvements
+    final_classification_weight: float = 100.0  # Scale factor for final classification bonus
 
     # Advantage processing (blueprint options)
     divide_advantage_by_ego_count: bool = True  # Divide by ego count for balanced gradient mass
     standardize_advantages: bool = True  # Advantage standardization over ego samples
-
-    # Reward wiring (blueprint specification)
-    classification_bonus_multiplier: float = 2.0  # Small multiplier (1-3×) for final step classification bonus
-
 
 class PPOTrainer:
     """PPO trainer for the updater policy"""
@@ -122,6 +120,8 @@ class PPOTrainer:
         self.entropy_values = []
         self.total_updates = 0
         self.trajectory_counts = []
+        self.final_classification_scores = []
+        self.final_accuracy_stats = []
 
         # Episode state tracking (reset at episode start to prevent leakage)
         self.prev_robot_trusts = {}   # Dict[int, float] - previous step robot trust values
@@ -240,70 +240,42 @@ class PPOTrainer:
         return mask
 
 
-    def compute_step_reward(self, all_robots: List[Robot], ground_truth: Dict) -> float:
-        """
-        Compute step reward based on how close trust values are to ground truth targets
-        - Adversarial robots should have trust → 0
-        - Legitimate robots should have trust → 1
-        - False tracks should have trust → 0
-        - True tracks should have trust → 1
-        """
-        total_reward = 0.0
+    def compute_alignment_score(self, all_robots: List[Robot], ground_truth: Dict) -> float:
+        """Average trust alignment with ground truth for robots and tracks."""
+        total_score = 0.0
         entity_count = 0
 
-        # Ground truth
         true_adversarial = set(ground_truth.get('adversarial_agents', []))
         true_false_tracks = set(ground_truth.get('false_tracks', []))
 
-        # Robot trust alignment rewards (simpler reward computation)
         for robot in all_robots:
             entity_count += 1
             if robot.id in true_adversarial:
-                # Adversarial robot: reward for low trust (closer to 0 is better)
-                total_reward += (1.0 - robot.trust_value)  # Max reward 1.0 when trust = 0
+                total_score += (1.0 - robot.trust_value)
             else:
-                # Legitimate robot: reward for high trust (closer to 1 is better)
-                total_reward += robot.trust_value  # Max reward 1.0 when trust = 1
+                total_score += robot.trust_value
 
-        # Track trust alignment rewards
-        all_track_ids = set()
         for robot in all_robots:
             for track in robot.get_current_timestep_tracks():
-                if track.track_id not in all_track_ids:  # Avoid double counting
-                    all_track_ids.add(track.track_id)
-                    entity_count += 1
+                entity_count += 1
 
-                    if track.track_id in true_false_tracks:
-                        # False track: reward for low trust
-                        total_reward += (1.0 - track.trust_value)
-                    else:
-                        # True track: reward for high trust
-                        total_reward += track.trust_value
+                if track.track_id in true_false_tracks:
+                    total_score += (1.0 - track.trust_value)
+                else:
+                    total_score += track.trust_value
 
-        # Normalize by entity count to keep rewards manageable
-        return total_reward / max(entity_count, 1)
+        return total_score / max(entity_count, 1)
 
-    def compute_episode_end_reward(self, all_robots: List[Robot], ground_truth: Dict) -> float:
-        """
-        Compute episode-end classification reward using dual thresholds
-        - trust > positive_threshold = legitimate (positive class)
-        - trust < negative_threshold = adversarial/false (negative class)
-        - negative_threshold <= trust <= positive_threshold = uncertain (penalized)
-        """
-        # Ground truth sets
+    def compute_classification_score(self, all_robots: List[Robot], ground_truth: Dict) -> float:
+        """Signed classification quality (F1 - uncertainty penalty)."""
         true_adversarial = set(ground_truth.get('adversarial_agents', []))
-        true_false_tracks = set(ground_truth.get('false_tracks', []))
-
-        all_robot_ids = set(robot.id for robot in all_robots)
+        all_robot_ids = {robot.id for robot in all_robots}
         true_legitimate = all_robot_ids - true_adversarial
 
-        all_track_ids = set()
-        for robot in all_robots:
-            for track in robot.get_current_timestep_tracks():
-                all_track_ids.add(track.track_id)
-        true_legitimate_tracks = all_track_ids - true_false_tracks
+        object_min_trust, false_object_ids = self._aggregate_track_objects(all_robots, ground_truth)
+        object_ids = set(object_min_trust.keys())
+        true_legitimate_objects = object_ids - false_object_ids
 
-        # Classify robots using dual thresholds
         predicted_legitimate_robots = set()
         predicted_adversarial_robots = set()
         uncertain_robots = set()
@@ -316,57 +288,132 @@ class PPOTrainer:
             else:
                 uncertain_robots.add(robot.id)
 
-        # Classify tracks using dual thresholds
-        predicted_legitimate_tracks = set()
-        predicted_false_tracks = set()
-        uncertain_tracks = set()
+        predicted_legitimate_objects = set()
+        predicted_false_objects = set()
+        uncertain_objects = set()
 
-        for robot in all_robots:
-            for track in robot.get_current_timestep_tracks():
-                if track.trust_value >= self.config.track_positive_threshold:
-                    predicted_legitimate_tracks.add(track.track_id)
-                elif track.trust_value <= self.config.track_negative_threshold:
-                    predicted_false_tracks.add(track.track_id)
-                else:
-                    uncertain_tracks.add(track.track_id)
+        for obj_id, trust in object_min_trust.items():
+            if trust >= self.config.track_positive_threshold:
+                predicted_legitimate_objects.add(obj_id)
+            elif trust <= self.config.track_negative_threshold:
+                predicted_false_objects.add(obj_id)
+            else:
+                uncertain_objects.add(obj_id)
 
-        # Calculate classification metrics for robots
         robot_tp = len(true_legitimate & predicted_legitimate_robots)
-        robot_fp = len(predicted_legitimate_robots & true_adversarial)  # Adversarial predicted as legitimate
-        robot_fn = len(true_legitimate & predicted_adversarial_robots)  # Legitimate predicted as adversarial
+        robot_fp = len(predicted_legitimate_robots & true_adversarial)
+        robot_fn = len(true_legitimate & predicted_adversarial_robots)
 
-        # Calculate classification metrics for tracks
-        track_tp = len(true_legitimate_tracks & predicted_legitimate_tracks)
-        track_fp = len(predicted_legitimate_tracks & true_false_tracks)  # False predicted as legitimate
-        track_fn = len(true_legitimate_tracks & predicted_false_tracks)  # Legitimate predicted as false
+        track_tp = len(true_legitimate_objects & predicted_legitimate_objects)
+        track_fp = len(predicted_legitimate_objects & false_object_ids)
+        track_fn = len(true_legitimate_objects & predicted_false_objects)
 
-        # Penalty for uncertain classifications
-        robot_uncertainty_penalty = len(uncertain_robots) * 0.5  # Each uncertain robot costs 0.5
-        track_uncertainty_penalty = len(uncertain_tracks) * 0.5  # Each uncertain track costs 0.5
+        robot_precision = robot_tp / (robot_tp + robot_fp) if (robot_tp + robot_fp) > 0 else 1.0
+        robot_recall = robot_tp / (robot_tp + robot_fn) if (robot_tp + robot_fn) > 0 else 0.0
+        robot_f1 = (
+            2 * robot_precision * robot_recall / (robot_precision + robot_recall)
+            if (robot_precision + robot_recall) > 0 else 0.0
+        ) if true_legitimate else (1.0 if not predicted_legitimate_robots else 0.0)
 
-        # Calculate F1 scores for legitimate classification
-        if len(true_legitimate) == 0:
-            robot_f1 = 1.0 if len(predicted_legitimate_robots) == 0 else 0.0
-        else:
-            robot_precision = robot_tp / (robot_tp + robot_fp) if (robot_tp + robot_fp) > 0 else 1.0
-            robot_recall = robot_tp / (robot_tp + robot_fn) if (robot_tp + robot_fn) > 0 else 0.0
-            robot_f1 = 2 * robot_precision * robot_recall / (robot_precision + robot_recall) if (robot_precision + robot_recall) > 0 else 0.0
+        track_precision = track_tp / (track_tp + track_fp) if (track_tp + track_fp) > 0 else 1.0
+        track_recall = track_tp / (track_tp + track_fn) if (track_tp + track_fn) > 0 else 0.0
+        track_f1 = (
+            2 * track_precision * track_recall / (track_precision + track_recall)
+            if (track_precision + track_recall) > 0 else 0.0
+        ) if true_legitimate_objects else (1.0 if not predicted_legitimate_objects else 0.0)
 
-        if len(true_legitimate_tracks) == 0:
-            track_f1 = 1.0 if len(predicted_legitimate_tracks) == 0 else 0.0
-        else:
-            track_precision = track_tp / (track_tp + track_fp) if (track_tp + track_fp) > 0 else 1.0
-            track_recall = track_tp / (track_tp + track_fn) if (track_tp + track_fn) > 0 else 0.0
-            track_f1 = 2 * track_precision * track_recall / (track_precision + track_recall) if (track_precision + track_recall) > 0 else 0.0
+        total_entities = len(all_robot_ids) + len(object_ids)
+        uncertainty_penalty = (
+            (len(uncertain_robots) * 0.5 + len(uncertain_objects) * 0.5) / total_entities
+            if total_entities > 0 else 0.0
+        )
 
-        # Combined reward with uncertainty penalty
         base_reward = (robot_f1 + track_f1) / 2.0
-        total_entities = len(all_robot_ids) + len(all_track_ids)
-        uncertainty_penalty = (robot_uncertainty_penalty + track_uncertainty_penalty) / total_entities if total_entities > 0 else 0.0
+        return base_reward - uncertainty_penalty
 
-        classification_reward = base_reward - uncertainty_penalty
+    def compute_episode_end_reward(self, all_robots: List[Robot], ground_truth: Dict) -> float:
+        """
+        Compute episode-end classification reward using dual thresholds
+        - trust > positive_threshold = legitimate (positive class)
+        - trust < negative_threshold = adversarial/false (negative class)
+        - negative_threshold <= trust <= positive_threshold = uncertain (penalized)
+        """
+        classification_reward = self.compute_classification_score(all_robots, ground_truth)
 
         return max(0.0, classification_reward)  # Ensure non-negative reward
+
+    def compute_classification_breakdown(self, all_robots: List[Robot], ground_truth: Dict) -> Dict:
+        """Compute per-category classification accuracy for robots and tracks."""
+        true_adversarial = set(ground_truth.get('adversarial_agents', []))
+        object_min_trust, false_object_ids = self._aggregate_track_objects(all_robots, ground_truth)
+
+        robot_legit_total = 0
+        robot_legit_correct = 0
+        robot_adv_total = 0
+        robot_adv_correct = 0
+
+        track_true_total = 0
+        track_true_correct = 0
+        track_false_total = 0
+        track_false_correct = 0
+
+        for robot in all_robots:
+            trust_val = robot.trust_value
+            if robot.id in true_adversarial:
+                robot_adv_total += 1
+                if trust_val <= self.config.robot_negative_threshold:
+                    robot_adv_correct += 1
+            else:
+                robot_legit_total += 1
+                if trust_val >= self.config.robot_positive_threshold:
+                    robot_legit_correct += 1
+
+        for obj_id, trust in object_min_trust.items():
+            if obj_id in false_object_ids:
+                track_false_total += 1
+                if trust <= self.config.track_negative_threshold:
+                    track_false_correct += 1
+            else:
+                track_true_total += 1
+                if trust >= self.config.track_positive_threshold:
+                    track_true_correct += 1
+
+        def build_stats(correct: int, total: int) -> Dict[str, float]:
+            return {
+                'correct': correct,
+                'total': total,
+                'accuracy': (correct / total) if total > 0 else None
+            }
+
+        return {
+            'robot_legitimate': build_stats(robot_legit_correct, robot_legit_total),
+            'robot_adversarial': build_stats(robot_adv_correct, robot_adv_total),
+            'track_true': build_stats(track_true_correct, track_true_total),
+            'track_false': build_stats(track_false_correct, track_false_total)
+        }
+
+    def _aggregate_track_objects(self, all_robots: List[Robot], ground_truth: Dict) -> Tuple[Dict[str, float], Set[str]]:
+        """Aggregate min trust per underlying object and identify false objects."""
+        object_min_trust: Dict[str, float] = {}
+        for robot in all_robots:
+            for track in robot.get_current_timestep_tracks():
+                obj_id = getattr(track, 'object_id', track.track_id)
+                trust = track.trust_value
+                if obj_id not in object_min_trust or trust < object_min_trust[obj_id]:
+                    object_min_trust[obj_id] = trust
+
+        false_object_ids: Set[str] = set()
+        for track_key in ground_truth.get('false_tracks', []):
+            parts = track_key.split('_', 1)
+            if len(parts) == 2:
+                false_object_ids.add(parts[1])
+
+        if not false_object_ids:
+            for obj_id in object_min_trust:
+                if obj_id.startswith('fp_obj_'):
+                    false_object_ids.add(obj_id)
+
+        return object_min_trust, false_object_ids
 
     def build_global_state_tensor(self, robots: List[Robot], ground_truth: Dict,
                                  step_idx: int, total_steps: int) -> torch.Tensor:
@@ -508,6 +555,13 @@ class PPOTrainer:
         sim_env, _ = self.scenario_generator.create_scenario_environment(scenario_params)
 
         episode_reward = 0.0
+        final_classification_score = 0.0
+        final_accuracy_stats = {
+            'robot_legitimate': {'correct': 0, 'total': 0, 'accuracy': None},
+            'robot_adversarial': {'correct': 0, 'total': 0, 'accuracy': None},
+            'track_true': {'correct': 0, 'total': 0, 'accuracy': None},
+            'track_false': {'correct': 0, 'total': 0, 'accuracy': None}
+        }
 
         # Run episode using proper simulation
         for step in range(scenario_params.episode_length):
@@ -539,6 +593,8 @@ class PPOTrainer:
 
                 # Pull ground truth before applying updates for critic features
                 ground_truth_pre_update = self.scenario_generator._extract_ground_truth(sim_env)
+
+                alignment_before = self.compute_alignment_score(robots, ground_truth_pre_update)
 
                 # Loop over all robots as ego robots (like in ego_sweep_step)
                 for ego_robot in robots:
@@ -671,22 +727,64 @@ class PPOTrainer:
                         track_mask.unsqueeze(0)
                     ).item()
 
-                # Apply trust updates using precomputed decisions
+                # Baseline comparison using fixed step scales
+                baseline_alignment_delta = 0.0
+                baseline_decisions = {}
+                baseline_scale = max(0.0, float(self.config.baseline_step_scale))
+                if baseline_scale > 0 and precomputed_decisions:
+                    for ego_id, decision in precomputed_decisions.items():
+                        baseline_robot_steps = {rid: baseline_scale for rid in decision.robot_steps}
+                        baseline_track_steps = {tid: baseline_scale for tid in decision.track_steps}
+                        if baseline_robot_steps or baseline_track_steps:
+                            baseline_decisions[ego_id] = UpdateDecision(baseline_robot_steps, baseline_track_steps)
+
+                if baseline_decisions:
+                    robot_trust_snapshot = {
+                        robot.id: (robot.trust_alpha, robot.trust_beta)
+                        for robot in robots
+                    }
+                    track_trust_snapshot = {
+                        track_id: (track.trust_alpha, track.trust_beta)
+                        for track_id, track in track_lookup.items()
+                    }
+
+                    self.trust_system.update_trust(robots, baseline_decisions)
+                    baseline_alignment_after = self.compute_alignment_score(robots, ground_truth_pre_update)
+                    baseline_alignment_delta = baseline_alignment_after - alignment_before
+
+                    # Restore original trust state before applying actual policy decisions
+                    for robot in robots:
+                        if robot.id in robot_trust_snapshot:
+                            alpha, beta = robot_trust_snapshot[robot.id]
+                            robot.trust_alpha = alpha
+                            robot.trust_beta = beta
+                    for robot in robots:
+                        for track in robot.get_current_timestep_tracks():
+                            if track.track_id in track_trust_snapshot:
+                                alpha, beta = track_trust_snapshot[track.track_id]
+                                track.trust_alpha = alpha
+                                track.trust_beta = beta
+
+                # Apply trust updates using policy decisions
                 self.trust_system.update_trust(robots, precomputed_decisions)
 
                 # Update ground truth for dynamic false tracks (changes as robots move)
                 current_ground_truth = self.scenario_generator._extract_ground_truth(sim_env)
 
-                # Compute step reward based on trust alignment with current ground truth
-                raw_step_reward = self.compute_step_reward(robots, current_ground_truth)
-                step_reward = raw_step_reward * self.config.reward_scale
+                alignment_after = self.compute_alignment_score(robots, current_ground_truth)
+
+                alignment_delta = alignment_after - alignment_before
+                improvement_alignment = alignment_delta - baseline_alignment_delta
+
+                step_reward = improvement_alignment * self.config.step_reward_scale * self.config.reward_scale
 
                 # REWARD WIRING: Add classification bonus to R_t at the last step (blueprint requirement)
                 if step == scenario_params.episode_length - 1:
                     try:
                         episode_end_reward = self.compute_episode_end_reward(robots, current_ground_truth)
-                        # Small multiplier (1-3×) as specified in blueprint
-                        step_reward += episode_end_reward * self.config.classification_bonus_multiplier * self.config.reward_scale
+                        final_classification_score = episode_end_reward
+                        final_accuracy_stats = self.compute_classification_breakdown(robots, current_ground_truth)
+                        step_reward += episode_end_reward * self.config.final_classification_weight
                     except Exception as e:
                         print(f"Error computing episode-end reward in step: {e}")
 
@@ -740,7 +838,7 @@ class PPOTrainer:
 
         # Episode-end reward is now included in the final step above
 
-        return episode_reward
+        return episode_reward, final_classification_score, final_accuracy_stats
 
     def clear_trajectories(self):
         """Clear trajectory storage after PPO update"""
@@ -1007,11 +1105,16 @@ class PPOTrainer:
 
             # Run episode
             start_time = time.time()
-            episode_reward = self.run_episode()
+            episode_reward, final_classification, accuracy_stats = self.run_episode()
             episode_time = time.time() - start_time
 
             # Collect metrics
             self.episode_rewards.append(episode_reward)
+            self.final_classification_scores.append(final_classification)
+            self.final_accuracy_stats.append(accuracy_stats)
+
+            # Update curriculum progression based on current performance
+            self.scenario_generator.update_curriculum(final_classification)
 
             # Perform PPO update every few episodes (separate from ppo_epochs)
             if episode > 0 and episode % self.config.update_every_episodes == 0 and len(self.ego_R_feats) > 0:
@@ -1024,13 +1127,23 @@ class PPOTrainer:
             # More frequent logging for monitoring
             if True:
                 avg_reward = np.mean(self.episode_rewards[-10:]) if self.episode_rewards else 0
+                avg_final_cls = np.mean(self.final_classification_scores[-10:]) if self.final_classification_scores else 0
                 recent_actor_loss = np.mean(self.policy_losses[-10:]) if self.policy_losses else 0
                 recent_critic_loss = np.mean(self.value_losses[-10:]) if self.value_losses else 0
                 recent_total_loss = np.mean(self.ppo_losses[-10:]) if self.ppo_losses else 0
                 actor_lr = self.actor_optimizer.param_groups[0]['lr']
                 critic_lr = self.critic_optimizer.param_groups[0]['lr']
                 traj_count = self.trajectory_counts[-1] if self.trajectory_counts else 0
-                print(f"Episode {episode}: Reward = {episode_reward:.4f}, Avg = {avg_reward:.4f}, Loss(actor/critic/total) = {recent_actor_loss:.4f}/{recent_critic_loss:.4f}/{recent_total_loss:.4f}")
+                def fmt_acc(stats_key):
+                    stats = accuracy_stats[stats_key]
+                    if stats['total'] == 0 or stats['accuracy'] is None:
+                        return 'N/A'
+                    return f"{stats['accuracy']*100:.1f}%"
+
+                print(f"Episode {episode}: Reward = {episode_reward:.4f}, Avg = {avg_reward:.4f}, FinalCls = {final_classification:.3f}, AvgCls = {avg_final_cls:.3f}")
+                print(f"           Robot Acc (legit/adv) = {fmt_acc('robot_legitimate')}/{fmt_acc('robot_adversarial')} | "
+                      f"Track Acc (true/false) = {fmt_acc('track_true')}/{fmt_acc('track_false')}")
+                print(f"           Loss(actor/critic/total) = {recent_actor_loss:.4f}/{recent_critic_loss:.4f}/{recent_total_loss:.4f}")
                 print(f"           Updates = {self.total_updates}, LR(actor/critic) = {actor_lr:.6f}/{critic_lr:.6f}, Trajectories = {traj_count}, Time = {episode_time:.2f}s")
 
             # Save best model
@@ -1050,6 +1163,26 @@ class PPOTrainer:
         print(f"Final critic LR: {self.critic_optimizer.param_groups[0]['lr']:.6f}")
         print(f"Total PPO updates: {self.total_updates}")
         print(f"Average trajectory count: {np.mean(self.trajectory_counts) if self.trajectory_counts else 0:.1f}")
+        if self.final_classification_scores:
+            print(f"Average final classification score: {np.mean(self.final_classification_scores):.4f}")
+        if self.final_accuracy_stats:
+            def average_accuracy(key: str) -> float:
+                values = [stats[key]['accuracy'] for stats in self.final_accuracy_stats if stats[key]['accuracy'] is not None]
+                return float(np.mean(values)) if values else None
+
+            avg_robot_legit = average_accuracy('robot_legitimate')
+            avg_robot_adv = average_accuracy('robot_adversarial')
+            avg_track_true = average_accuracy('track_true')
+            avg_track_false = average_accuracy('track_false')
+
+            def fmt_avg(value):
+                return f"{value*100:.1f}%" if value is not None else 'N/A'
+
+            print("Average classification accuracy:")
+            print(f"  Robot legitimate: {fmt_avg(avg_robot_legit)}")
+            print(f"  Robot adversarial: {fmt_avg(avg_robot_adv)}")
+            print(f"  Track true: {fmt_avg(avg_track_true)}")
+            print(f"  Track false: {fmt_avg(avg_track_false)}")
 
     def plot_training_rewards(self):
         """Plot training rewards over episodes"""
