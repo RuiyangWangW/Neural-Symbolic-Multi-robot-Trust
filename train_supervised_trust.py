@@ -14,10 +14,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 import os
-from pathlib import Path
 from typing import List, Dict, Tuple
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-from sklearn.model_selection import KFold
 
 from supervised_trust_gnn import SupervisedTrustGNN
 from generate_supervised_data import SupervisedDataSample
@@ -699,163 +697,6 @@ def split_dataset(dataset: List[SupervisedDataSample],
     return train_data, val_data
 
 
-def create_dataloaders(train_samples: List[SupervisedDataSample],
-                       val_samples: List[SupervisedDataSample],
-                       batch_size: int,
-                       num_workers: int,
-                       pin_memory: bool) -> Tuple[DataLoader, DataLoader]:
-    """Create PyTorch DataLoaders with consistent settings"""
-    train_dataset = SupervisedTrustDataset(train_samples)
-    val_dataset = SupervisedTrustDataset(val_samples)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_batch,
-        num_workers=num_workers,
-        pin_memory=pin_memory
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=collate_batch,
-        num_workers=num_workers,
-        pin_memory=pin_memory
-    )
-
-    return train_loader, val_loader
-
-
-def train_on_split(train_samples: List[SupervisedDataSample],
-                   val_samples: List[SupervisedDataSample],
-                   args,
-                   device: str,
-                   num_workers: int,
-                   pin_memory: bool,
-                   fold_label: str = None) -> Tuple[Dict, Path]:
-    """
-    Train the model on a given train/validation split and return training history.
-    """
-    output_path = Path(args.output)
-    if fold_label:
-        output_path = output_path.with_name(f"{output_path.stem}_{fold_label}{output_path.suffix}")
-
-    plot_path = output_path.with_name(f"{output_path.stem}_training.png")
-
-    train_loader, val_loader = create_dataloaders(
-        train_samples, val_samples, args.batch_size, num_workers, pin_memory
-    )
-
-    model = SupervisedTrustGNN(
-        agent_features=4,
-        track_features=5,
-        hidden_dim=64
-    )
-
-    print(f"🧠 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"📦 Samples — train: {len(train_samples)}, val: {len(val_samples)}")
-    print(f"👷 DataLoader workers: {num_workers}")
-    print(f"📌 Pin memory: {pin_memory}")
-
-    trainer = SupervisedTrustTrainer(model, device=device, learning_rate=args.lr)
-    history = trainer.train(
-        train_loader,
-        val_loader,
-        epochs=args.epochs,
-        save_path=str(output_path),
-        patience=args.patience
-    )
-
-    plot_training_results(history, save_path=str(plot_path))
-
-    return history, output_path
-
-
-def extract_best_metrics(history: Dict) -> Tuple[float, Dict]:
-    """Extract best validation loss and corresponding metrics from training history."""
-    if not history['val_losses']:
-        return float('inf'), {}
-
-    best_idx = int(np.argmin(history['val_losses']))
-    best_loss = history['val_losses'][best_idx]
-    best_metrics = history['val_metrics'][best_idx] if history['val_metrics'] else {}
-    return best_loss, best_metrics
-
-
-def run_cross_validation(dataset: List[SupervisedDataSample],
-                         args,
-                         device: str,
-                         num_workers: int,
-                         pin_memory: bool):
-    """Perform K-fold cross validation."""
-    kf = KFold(n_splits=args.folds, shuffle=True, random_state=args.cv_seed)
-    fold_results = []
-
-    print(f"🔁 Starting {args.folds}-fold cross validation...")
-
-    for fold_idx, (train_indices, val_indices) in enumerate(kf.split(range(len(dataset))), start=1):
-        print(f"\n{'='*60}")
-        print(f"🎯 Fold {fold_idx}/{args.folds}")
-        print(f"{'='*60}")
-
-        train_samples = [dataset[i] for i in train_indices]
-        val_samples = [dataset[i] for i in val_indices]
-
-        history, model_path = train_on_split(
-            train_samples,
-            val_samples,
-            args,
-            device,
-            num_workers,
-            pin_memory,
-            fold_label=f"fold{fold_idx}"
-        )
-
-        best_loss, best_metrics = extract_best_metrics(history)
-        fold_results.append({
-            'fold': fold_idx,
-            'loss': best_loss,
-            'metrics': best_metrics,
-            'model_path': str(model_path)
-        })
-
-        print(f"✅ Fold {fold_idx} best val loss: {best_loss:.4f}")
-        for metric_name, value in best_metrics.items():
-            if isinstance(value, (int, float, np.floating)):
-                print(f"   - {metric_name}: {value:.3f}")
-
-    if not fold_results:
-        print("⚠️ No fold results collected.")
-        return
-
-    losses = [result['loss'] for result in fold_results]
-    mean_loss = float(np.mean(losses))
-    std_loss = float(np.std(losses))
-
-    print(f"\n📊 Cross-validation summary ({args.folds} folds)")
-    print(f"   • Val loss: mean={mean_loss:.4f}, std={std_loss:.4f}")
-
-    aggregated_metrics = {}
-    for result in fold_results:
-        for metric_name, value in result['metrics'].items():
-            if isinstance(value, (int, float, np.floating)):
-                aggregated_metrics.setdefault(metric_name, []).append(float(value))
-
-    if aggregated_metrics:
-        print("   • Validation metrics (mean ± std):")
-        for metric_name, values in aggregated_metrics.items():
-            metric_mean = float(np.mean(values))
-            metric_std = float(np.std(values))
-            print(f"     - {metric_name}: {metric_mean:.3f} ± {metric_std:.3f}")
-
-    print("\n📁 Saved fold models:")
-    for result in fold_results:
-        print(f"   Fold {result['fold']}: {result['model_path']}")
-
-
 def plot_training_results(history: Dict, save_path: str = 'supervised_training_results.png'):
     """Plot training results"""
     _, axes = plt.subplots(2, 2, figsize=(15, 10))
@@ -937,10 +778,6 @@ def main():
                        help='Early stopping patience - epochs without improvement (default: 20)')
     parser.add_argument('--output', type=str, default='supervised_trust_model.pth',
                        help='Output model path')
-    parser.add_argument('--folds', type=int, default=10,
-                       help='Number of cross-validation folds (default: 1, i.e., single train/val split)')
-    parser.add_argument('--cv-seed', type=int, default=None,
-                       help='Random seed for CV shuffling (default: None)')
 
     args = parser.parse_args()
 
@@ -988,34 +825,44 @@ def main():
         return
 
     dataset = load_dataset(args.data)
+    train_data, val_data = split_dataset(dataset)
+
+    # Create data loaders with MPS/CUDA optimizations
+    train_dataset = SupervisedTrustDataset(train_data)
+    val_dataset = SupervisedTrustDataset(val_data)
 
     # Optimize DataLoader settings based on device
     pin_memory = 'cuda' in device
     num_workers = args.num_workers if args.num_workers > 0 else (2 if 'cuda' in device else (0 if device == 'mps' else 0))
 
-    if args.folds and args.folds > 1:
-        run_cross_validation(dataset, args, device, num_workers, pin_memory)
-        print("✅ Cross-validation completed successfully!")
-        return
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
+                             shuffle=True, collate_fn=collate_batch,
+                             num_workers=num_workers, pin_memory=pin_memory)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                           shuffle=False, collate_fn=collate_batch,
+                           num_workers=num_workers, pin_memory=pin_memory)
 
-    train_data, val_data = split_dataset(dataset)
-    history, output_path = train_on_split(
-        train_data,
-        val_data,
-        args,
-        device,
-        num_workers,
-        pin_memory
+    # Create model with updated feature dimensions
+    model = SupervisedTrustGNN(
+        agent_features=4,  # 4 neural-symbolic predicates: high_confidence, highly_trusted, high_connectivity, reliable_detector
+        track_features=5,  # 5 neural-symbolic predicates (unchanged)
+        hidden_dim=64
     )
 
-    best_loss, best_metrics = extract_best_metrics(history)
-    print(f"✅ Training completed successfully! Best val loss: {best_loss:.4f}")
-    if best_metrics:
-        print("📈 Best validation metrics:")
-        for metric_name, value in best_metrics.items():
-            if isinstance(value, (int, float, np.floating)):
-                print(f"   - {metric_name}: {value:.3f}")
-    print(f"💾 Model saved to {output_path}")
+    print(f"🧠 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"👷 DataLoader workers: {num_workers}")
+    print(f"📌 Pin memory: {pin_memory}")
+
+    # Create trainer
+    trainer = SupervisedTrustTrainer(model, device=device, learning_rate=args.lr)
+
+    # Train model
+    history = trainer.train(train_loader, val_loader, epochs=args.epochs, save_path=args.output, patience=args.patience)
+
+    # Plot results
+    plot_training_results(history)
+
+    print("✅ Training completed successfully!")
 
 
 if __name__ == "__main__":
