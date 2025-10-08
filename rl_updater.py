@@ -17,8 +17,8 @@ from robot_track_classes import Robot, Track
 @dataclass
 class UpdateDecision:
     """Step scales for participating nodes in this ego graph"""
-    robot_steps: Dict[int, float]   # robot_id -> step_scale [0,1]
-    track_steps: Dict[str, float]   # track_id -> step_scale [0,1]
+    robot_steps: Dict[int, Tuple[float, float]]   # (positive, negative) contributions
+    track_steps: Dict[str, Tuple[float, float]]   # (positive, negative) contributions
 
 
 class SetTransformerCritic(nn.Module):
@@ -106,8 +106,8 @@ class SetTransformerActor(nn.Module):
     """Simplified actor that pools robot/track features and emits Beta parameters"""
 
     def __init__(self,
-                 robot_input_dim: int = 6,
-                 track_input_dim: int = 7,
+                 robot_input_dim: int = 5,
+                 track_input_dim: int = 5,
                  hidden_dim: int = 128,
                  dropout: float = 0.1):
         super().__init__()
@@ -145,13 +145,13 @@ class SetTransformerActor(nn.Module):
         self.robot_action_head = nn.Sequential(
             nn.Linear(3 * hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 2)
+            nn.Linear(hidden_dim, 4)
         )
 
         self.track_action_head = nn.Sequential(
             nn.Linear(3 * hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 2)
+            nn.Linear(hidden_dim, 4)
         )
 
     @staticmethod
@@ -296,7 +296,7 @@ class SetTransformerActor(nn.Module):
                 robot_inputs = torch.cat([robot_embeddings, context_expanded, track_context], dim=-1)
                 robot_params = self.robot_action_head(robot_inputs)
             else:
-                robot_params = torch.zeros(B, 0, 2, dtype=dtype, device=device)
+                robot_params = torch.zeros(B, 0, 4, dtype=dtype, device=device)
 
             if track_embeddings.shape[1] > 0:
                 context_expanded = context_embed.unsqueeze(1).repeat(1, track_embeddings.shape[1], 1)
@@ -317,18 +317,26 @@ class SetTransformerActor(nn.Module):
                 track_inputs = torch.cat([track_embeddings, context_expanded, robot_context], dim=-1)
                 track_params = self.track_action_head(track_inputs)
             else:
-                track_params = torch.zeros(B, 0, 2, dtype=dtype, device=device)
+                track_params = torch.zeros(B, 0, 4, dtype=dtype, device=device)
 
             kappa_min = 1e-3
             kappa_max = 50.0
 
-            robot_mu = torch.sigmoid(robot_params[..., 0])
-            robot_kappa = kappa_max * torch.sigmoid(robot_params[..., 1]) + kappa_min
+            robot_params_pos = robot_params[..., :2]
+            robot_params_neg = robot_params[..., 2:]
+            robot_mu_pos = torch.sigmoid(robot_params_pos[..., 0])
+            robot_kappa_pos = kappa_max * torch.sigmoid(robot_params_pos[..., 1]) + kappa_min
+            robot_mu_neg = torch.sigmoid(robot_params_neg[..., 0])
+            robot_kappa_neg = kappa_max * torch.sigmoid(robot_params_neg[..., 1]) + kappa_min
 
-            track_mu = torch.sigmoid(track_params[..., 0])
-            track_kappa = kappa_max * torch.sigmoid(track_params[..., 1]) + kappa_min
+            track_params_pos = track_params[..., :2]
+            track_params_neg = track_params[..., 2:]
+            track_mu_pos = torch.sigmoid(track_params_pos[..., 0])
+            track_kappa_pos = kappa_max * torch.sigmoid(track_params_pos[..., 1]) + kappa_min
+            track_mu_neg = torch.sigmoid(track_params_neg[..., 0])
+            track_kappa_neg = kappa_max * torch.sigmoid(track_params_neg[..., 1]) + kappa_min
 
-            return (robot_mu, robot_kappa), (track_mu, track_kappa)
+            return (robot_mu_pos, robot_kappa_pos, robot_mu_neg, robot_kappa_neg), (track_mu_pos, track_kappa_pos, track_mu_neg, track_kappa_neg)
 
         except Exception as exc:
             print("Actor forward failure")
@@ -347,15 +355,31 @@ class SetTransformerActor(nn.Module):
                                                                                Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """Sample Beta actions while safely handling empty robot/track sets."""
 
-        (robot_mu, robot_kappa), (track_mu, track_kappa) = self.forward(
+        (robot_mu_pos, robot_kappa_pos, robot_mu_neg, robot_kappa_neg), (track_mu_pos, track_kappa_pos, track_mu_neg, track_kappa_neg) = self.forward(
             robot_features, track_features, robot_mask, track_mask, robot_track_mask)
 
-        robot_actions, robot_log_probs, robot_entropy, robot_alpha, robot_beta = self._beta_forward(
-            robot_mu, robot_kappa, robot_mask)
-        track_actions, track_log_probs, track_entropy, track_alpha, track_beta = self._beta_forward(
-            track_mu, track_kappa, track_mask)
+        robot_pos_actions, robot_pos_log_probs, robot_pos_entropy, robot_pos_alpha, robot_pos_beta = self._beta_forward(
+            robot_mu_pos, robot_kappa_pos, robot_mask)
+        robot_neg_actions, robot_neg_log_probs, robot_neg_entropy, robot_neg_alpha, robot_neg_beta = self._beta_forward(
+            robot_mu_neg, robot_kappa_neg, robot_mask)
 
-        total_entropy = robot_entropy + track_entropy
+        track_pos_actions, track_pos_log_probs, track_pos_entropy, track_pos_alpha, track_pos_beta = self._beta_forward(
+            track_mu_pos, track_kappa_pos, track_mask)
+        track_neg_actions, track_neg_log_probs, track_neg_entropy, track_neg_alpha, track_neg_beta = self._beta_forward(
+            track_mu_neg, track_kappa_neg, track_mask)
+
+        robot_actions = torch.stack([robot_pos_actions, robot_neg_actions], dim=-1)
+        track_actions = torch.stack([track_pos_actions, track_neg_actions], dim=-1)
+
+        robot_log_probs = robot_pos_log_probs + robot_neg_log_probs
+        track_log_probs = track_pos_log_probs + track_neg_log_probs
+
+        total_entropy = robot_pos_entropy + robot_neg_entropy + track_pos_entropy + track_neg_entropy
+
+        robot_alpha = (robot_pos_alpha, robot_neg_alpha)
+        robot_beta = (robot_pos_beta, robot_neg_beta)
+        track_alpha = (track_pos_alpha, track_neg_alpha)
+        track_beta = (track_pos_beta, track_neg_beta)
 
         return robot_actions, track_actions, robot_log_probs, track_log_probs, total_entropy, \
                (robot_alpha, robot_beta), (track_alpha, track_beta)
@@ -370,51 +394,107 @@ class SetTransformerActor(nn.Module):
                         robot_track_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate log-probs/entropy for Beta actions with empty-set guards."""
 
-        (robot_mu, robot_kappa), (track_mu, track_kappa) = self.forward(
+        (robot_mu_pos, robot_kappa_pos, robot_mu_neg, robot_kappa_neg), (track_mu_pos, track_kappa_pos, track_mu_neg, track_kappa_neg) = self.forward(
             robot_features, track_features, robot_mask, track_mask, robot_track_mask)
 
-        robot_log_probs, robot_entropy = self._beta_forward(
-            robot_mu, robot_kappa, robot_mask, actions=robot_actions)
-        track_log_probs, track_entropy = self._beta_forward(
-            track_mu, track_kappa, track_mask, actions=track_actions)
+        robot_pos_actions = robot_actions[..., 0]
+        robot_neg_actions = robot_actions[..., 1]
+        track_pos_actions = track_actions[..., 0]
+        track_neg_actions = track_actions[..., 1]
 
-        total_entropy = robot_entropy + track_entropy
+        robot_pos_log_probs, robot_pos_entropy = self._beta_forward(
+            robot_mu_pos, robot_kappa_pos, robot_mask, actions=robot_pos_actions)
+        robot_neg_log_probs, robot_neg_entropy = self._beta_forward(
+            robot_mu_neg, robot_kappa_neg, robot_mask, actions=robot_neg_actions)
+
+        track_pos_log_probs, track_pos_entropy = self._beta_forward(
+            track_mu_pos, track_kappa_pos, track_mask, actions=track_pos_actions)
+        track_neg_log_probs, track_neg_entropy = self._beta_forward(
+            track_mu_neg, track_kappa_neg, track_mask, actions=track_neg_actions)
+
+        total_entropy = robot_pos_entropy + robot_neg_entropy + track_pos_entropy + track_neg_entropy
+
+        robot_log_probs = robot_pos_log_probs + robot_neg_log_probs
+        track_log_probs = track_pos_log_probs + track_neg_log_probs
 
         return robot_log_probs, track_log_probs, total_entropy
 
 class LearnableUpdater:
-    """Wrapper for the learnable updater policy with centralized critic for MAPPO"""
+    """Wrapper for the learnable updater policy with optional centralized critic for MAPPO"""
 
-    def __init__(self, model_path: str = None, device: str = 'cpu'):
+    def __init__(self,
+                 model_path: str = None,
+                 device: str = 'cpu',
+                 include_critic: bool = False):
         self.device = torch.device(device)
 
         # Initialize simplified actor and critic
         self.policy = SetTransformerActor(
-            robot_input_dim=6,  # trust_mean, strength, Δtrust, agent_score, score_conf, degree
-            track_input_dim=7,  # trust_mean, strength, Δtrust, maturity, track_score, score_conf, degree
+            robot_input_dim=5,  # trust_mean, Δtrust, agent_score, score_conf, degree
+            track_input_dim=5,  # trust_mean, Δtrust, track_score, score_conf, degree
             hidden_dim=128,
             dropout=0.1
         ).to(self.device)
 
-        self.critic = SetTransformerCritic(
-            robot_input_dim=3,
-            track_input_dim=3,
-            tier0_dim=8,
-            hidden_dim=64
-        ).to(self.device)
+        self.critic = None
+        if include_critic:
+            self.critic = SetTransformerCritic(
+                robot_input_dim=3,
+                track_input_dim=3,
+                tier0_dim=8,
+                hidden_dim=64
+            ).to(self.device)
 
         if model_path:
             try:
-                self.policy.load_state_dict(torch.load(model_path, map_location=self.device))
-                print(f"Loaded updater policy from {model_path}")
+                checkpoint = torch.load(model_path, map_location=self.device)
+                possible_keys = ['policy_state_dict', 'state_dict', 'model_state_dict']
+                if isinstance(checkpoint, dict) and not all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+                    state_dict = None
+                    for key in possible_keys:
+                        if key in checkpoint:
+                            state_dict = checkpoint[key]
+                            break
+                    if state_dict is None:
+                        state_dict = checkpoint
+                else:
+                    state_dict = checkpoint
+
+                policy_state = self.policy.state_dict()
+                matched_keys = []
+                mismatched_keys = []
+                for key, weight in state_dict.items():
+                    if not isinstance(weight, torch.Tensor):
+                        continue
+                    if key in policy_state:
+                        target_param = policy_state[key]
+                        if target_param.shape == weight.shape:
+                            policy_state[key] = weight.to(device=target_param.device, dtype=target_param.dtype)
+                            matched_keys.append(key)
+                        else:
+                            mismatched_keys.append((key, tuple(weight.shape), tuple(target_param.shape)))
+
+                if matched_keys:
+                    self.policy.load_state_dict(policy_state)
+                    print(f"Loaded updater policy from {model_path} (matched {len(matched_keys)} tensors)")
+                else:
+                    print(f"ℹ️ Updater checkpoint '{model_path}' has no compatible tensors. Using randomly initialized policy weights.")
+
+                if mismatched_keys:
+                    preview = ", ".join([f"{k}:ckpt{src}->model{dst}" for k, src, dst in mismatched_keys[:3]])
+                    if len(mismatched_keys) > 3:
+                        preview += ", ..."
+                    print(f"ℹ️ Skipped {len(mismatched_keys)} updater tensors with incompatible shapes ({preview})")
+
             except Exception as e:
                 print(f"Failed to load updater policy: {e}")
 
-        # Always initialize a fresh critic for training
-        print("Initialized fresh centralized critic for training")
+        if self.critic is not None:
+            print("Initialized centralized critic for training")
 
         self.policy.eval()
-        self.critic.eval()
+        if self.critic is not None:
+            self.critic.eval()
 
     def get_step_scales(self,
                        ego_robots: List[Robot],        # robots in ego graph
@@ -438,15 +518,15 @@ class LearnableUpdater:
             robot_lookup = {}
             for robot in participating_robots:
                 trust_mean = robot.trust_value
-                strength = robot.trust_alpha + robot.trust_beta
-                delta_trust = 0.0  # No previous step info in inference mode
+                prev_trust = getattr(robot, '_prev_trust_value', trust_mean)
+                delta_trust = abs(trust_mean - prev_trust)
                 agent_score = robot_scores.get(robot.id, 0.5)
                 score_conf = 2 * abs(agent_score - 0.5)  # Confidence as distance from 0.5
                 if track_observers:
                     degree = sum(1 for observers in track_observers.values() if robot.id in observers)
                 else:
                     degree = len(robot.get_current_timestep_tracks())
-                robot_features.append([trust_mean, strength, delta_trust, agent_score, score_conf, degree])
+                robot_features.append([trust_mean, delta_trust, agent_score, score_conf, degree])
                 robot_ids.append(robot.id)
                 robot_lookup[robot.id] = robot
 
@@ -455,21 +535,20 @@ class LearnableUpdater:
             track_lookup = {}
             for track in participating_tracks:
                 trust_mean = track.trust_value
-                strength = track.trust_alpha + track.trust_beta
-                delta_trust = 0.0  # No previous step info in inference mode
-                maturity = min(1.0, track.observation_count / 10.0)
+                prev_trust = getattr(track, '_prev_trust_value', trust_mean)
+                delta_trust = abs(trust_mean - prev_trust)
                 track_score = track_scores.get(track.track_id, 0.5)
                 score_conf = 2 * abs(track_score - 0.5)  # Confidence as distance from 0.5
                 observers = track_observers.get(track.track_id, []) if track_observers else []
                 if not observers:
                     observers = [robot.id for robot in ego_robots if robot.is_in_fov(track.position)]
                 degree = len(observers)
-                track_features.append([trust_mean, strength, delta_trust, maturity, track_score, score_conf, degree])
+                track_features.append([trust_mean, delta_trust, track_score, score_conf, degree])
                 track_ids.append(track.track_id)
                 track_lookup[track.track_id] = track
 
-            robot_features_tensor = torch.tensor(robot_features, dtype=torch.float32, device=self.device) if robot_features else torch.zeros(0, 6, device=self.device)
-            track_features_tensor = torch.tensor(track_features, dtype=torch.float32, device=self.device) if track_features else torch.zeros(0, 7, device=self.device)
+            robot_features_tensor = torch.tensor(robot_features, dtype=torch.float32, device=self.device) if robot_features else torch.zeros(0, 5, device=self.device)
+            track_features_tensor = torch.tensor(track_features, dtype=torch.float32, device=self.device) if track_features else torch.zeros(0, 5, device=self.device)
 
             # Build robot-to-track adjacency mask based on detections and field-of-view
             robot_track_mask = None
@@ -491,25 +570,24 @@ class LearnableUpdater:
             robot_features_batched = robot_features_tensor.unsqueeze(0) if robot_features_tensor.dim() == 2 else robot_features_tensor
             track_features_batched = track_features_tensor.unsqueeze(0) if track_features_tensor.dim() == 2 else track_features_tensor
 
-            (robot_mu, robot_kappa), (track_mu, track_kappa) = self.policy(
+            (robot_mu_pos, _, robot_mu_neg, _), (track_mu_pos, _, track_mu_neg, _) = self.policy(
                 robot_features_batched,
                 track_features_batched,
                 robot_track_mask=robot_track_mask.unsqueeze(0) if robot_track_mask is not None else None
             )
 
-            # Use μ directly as action (deterministic inference)
             robot_steps = {}
-            if robot_mu.size(1) > 0:  # Check actual number of robots (batch=0, robots=1)
-                robot_mus = robot_mu[0, :]  # [N_R] - remove batch dimension
-                # μ is already the mean of the Beta distribution, use directly
+            if robot_mu_pos.size(1) > 0:
+                robot_pos = robot_mu_pos[0, :]
+                robot_neg = robot_mu_neg[0, :]
                 for i, robot_id in enumerate(robot_ids):
-                    robot_steps[robot_id] = float(robot_mus[i])
+                    robot_steps[robot_id] = (float(robot_pos[i]), float(robot_neg[i]))
 
             track_steps = {}
-            if track_mu.size(1) > 0:  # Check actual number of tracks (batch=0, tracks=1)
-                track_mus = track_mu[0, :]  # [N_T] - remove batch dimension
-                # μ is already the mean of the Beta distribution, use directly
+            if track_mu_pos.size(1) > 0:
+                track_pos = track_mu_pos[0, :]
+                track_neg = track_mu_neg[0, :]
                 for i, track_id in enumerate(track_ids):
-                    track_steps[track_id] = float(track_mus[i])
+                    track_steps[track_id] = (float(track_pos[i]), float(track_neg[i]))
 
             return UpdateDecision(robot_steps, track_steps)

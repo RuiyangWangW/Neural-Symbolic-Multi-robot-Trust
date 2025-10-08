@@ -89,6 +89,7 @@ class RLScenarioGenerator:
         self.curriculum_min_episodes = max(1, curriculum_min_episodes)
         self.curriculum_progress_threshold = curriculum_progress_threshold
         self.episodes_in_level = 0
+        self.curriculum_completed = False
 
     def sample_scenario_parameters(self, episode_num: int) -> ScenarioParameters:
         """
@@ -102,6 +103,8 @@ class RLScenarioGenerator:
         """
         if self.curriculum_learning:
             complexity = float(self.level_complexities[self.curriculum_level])
+        elif self.curriculum_completed:
+            complexity = random.uniform(0.0, 1.0)
         else:
             complexity = random.uniform(0.0, 1.0)
 
@@ -262,7 +265,8 @@ class RLScenarioGenerator:
         ground_truth = {
             'adversarial_agents': [],
             'false_tracks': [],
-            'scenario_params': None
+            'scenario_params': None,
+            'true_objects': []
         }
 
         # Extract adversarial robot IDs
@@ -271,6 +275,12 @@ class RLScenarioGenerator:
             if hasattr(robot, 'is_adversarial') and robot.is_adversarial:
                 adversarial_agents.append(robot.id)
         ground_truth['adversarial_agents'] = adversarial_agents
+
+        # Record all legitimate ground truth objects
+        true_objects = []
+        for gt_obj in sim_env.ground_truth_objects:
+            true_objects.append(f"gt_obj_{gt_obj.id}")
+        ground_truth['true_objects'] = true_objects
 
         # Extract false positive track IDs from shared_fp_objects
         false_tracks = []
@@ -296,7 +306,8 @@ class RLScenarioGenerator:
                 'difficulty': None,
                 'avg_performance': None,
                 'episodes_in_level': None,
-                'levels_total': len(self.level_complexities)
+                'levels_total': len(self.level_complexities),
+                'completed': self.curriculum_completed
             }
 
         avg_perf = float(np.mean(self.curriculum_window)) if self.curriculum_window else None
@@ -307,7 +318,8 @@ class RLScenarioGenerator:
             'difficulty': float(self.level_complexities[self.curriculum_level]),
             'avg_performance': avg_perf,
             'episodes_in_level': self.episodes_in_level,
-            'levels_total': len(self.level_complexities)
+            'levels_total': len(self.level_complexities),
+            'completed': self.curriculum_completed
         }
 
     def reset_curriculum(self):
@@ -315,6 +327,8 @@ class RLScenarioGenerator:
         self.curriculum_level = 0
         self.curriculum_window.clear()
         self.episodes_in_level = 0
+        self.curriculum_completed = False
+        self.curriculum_learning = True
 
     def set_complexity(self, complexity: float):
         """Manually set target difficulty (0.0 easy, 1.0 hard)."""
@@ -332,13 +346,27 @@ class RLScenarioGenerator:
 
         Returns True if difficulty was increased.
         """
-        if not self.curriculum_learning or performance_metric is None:
+        if performance_metric is None:
+            return False
+
+        if self.curriculum_completed:
+            return False
+
+        if not self.curriculum_learning:
+            self.curriculum_window.append(performance_metric)
             return False
 
         self.curriculum_window.append(performance_metric)
         self.episodes_in_level += 1
 
         if self.curriculum_level >= len(self.level_complexities) - 1:
+            if len(self.curriculum_window) == self.curriculum_window.maxlen:
+                avg_perf = float(np.mean(self.curriculum_window))
+                if avg_perf >= self.curriculum_progress_threshold:
+                    self.curriculum_completed = True
+                    self.curriculum_learning = False
+                    print("Curriculum completed. Switching to full scenario sampling.")
+                    return True
             return False  # Already at max difficulty
 
         if self.episodes_in_level < self.curriculum_min_episodes:

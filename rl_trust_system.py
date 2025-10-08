@@ -6,7 +6,7 @@ Implements the exact ego-sweep procedure from the framework:
 1. Loop over all robots as ego
 2. Build ego graph, run GNN → per-node scores
 3. Updater outputs step scales for nodes in this ego graph
-4. Accumulate deltas using confidence, cross-weights, step scales
+4. Accumulate deltas using confidence, step scales
 5. Apply globally with forgetting, caps, budgets
 """
 
@@ -36,31 +36,29 @@ class RLTrustSystem:
                  device: str = 'cpu',
                  rho_min: float = 0.2,
                  c_min: float = 0.2,
-                 step_size: float = 0.1,
-                 strength_cap: float = 50.0,
+                 step_size: float = 1.0,
+                 include_critic: bool = False,
 ):
 
         # Components
         self.evidence_extractor = EvidenceExtractor(evidence_model_path, device)
-        self.updater = LearnableUpdater(updater_model_path, device)
+        self.updater = LearnableUpdater(updater_model_path, device, include_critic=include_critic)
 
         # Hyperparameters
         self.rho_min = rho_min
         self.c_min = c_min
         self.step_size = step_size
-        self.strength_cap = strength_cap
 
-    def compute_confidence(self, score: float, is_track: bool = False, maturity: float = 1.0) -> float:
+        # Track previous trust values for delta feature computation
+        self.prev_robot_trusts: Dict[int, float] = {}
+        self.prev_track_trusts: Dict[str, float] = {}
+
+    def compute_confidence(self, score: float) -> float:
         """Compute confidence from GNN score and track maturity"""
         # Factor 1: prediction sharpness
         pred_conf = 2 * abs(score - 0.5)
 
-        if is_track:
-            # Factor 2: track maturity for tracks only
-            final_conf = pred_conf * maturity
-            return max(self.c_min, final_conf)  # Floor for new tracks
-        else:
-            return pred_conf
+        return max(self.c_min, pred_conf)  # Floor for new tracks
 
     def get_detections_this_step(self, all_robots: List[Robot]) -> Tuple[Dict[int, List[str]], Dict[str, List[int]]]:
         """
@@ -85,62 +83,6 @@ class RLTrustSystem:
 
         return robot_detections, dict(track_detectors)
 
-    def compute_cross_weights(self,
-                             robot_detections: Dict[int, List[str]],
-                             track_detectors: Dict[str, List[int]],
-                             all_robots: List[Robot]) -> Tuple[Dict[int, float], Dict[str, float]]:
-        """
-        Compute cross-weights ρ_i^fromTracks(t) and ρ_j^fromAgents(t)
-        """
-        # Build robot and track lookup
-        robot_lookup = {robot.id: robot for robot in all_robots}
-        track_lookup = {}
-        for robot in all_robots:
-            for track in robot.get_current_timestep_tracks():
-                track_lookup[track.track_id] = track
-
-        # Pre-compute FoV visibility for each robot to extend detections
-        robot_visible_tracks = {}
-        for robot in all_robots:
-            visible = []
-            for track in track_lookup.values():
-                if robot.is_in_fov(track.position):
-                    visible.append(track.track_id)
-            robot_visible_tracks[robot.id] = visible
-
-        rho_robot = {}  # ρ_i^fromTracks(t)
-        rho_track = {}  # ρ_j^fromAgents(t)
-
-        # Gate robot i by tracks it detected or has in FoV
-        for robot in all_robots:
-            detected_track_ids = set(robot_detections.get(robot.id, []))
-            fov_track_ids = set(robot_visible_tracks.get(robot.id, []))
-            observed_track_ids = detected_track_ids | fov_track_ids
-            if observed_track_ids:
-                track_means = []
-                for track_id in observed_track_ids:
-                    if track_id in track_lookup:
-                        t_j = track_lookup[track_id].trust_value
-                        track_means.append(max(self.rho_min, np.clip(2 * t_j, 0, 1)))
-                if track_means:
-                    rho_robot[robot.id] = np.mean(track_means)
-
-        # Gate track j by robots that detected it or have it in FoV
-        for track_id, track in track_lookup.items():
-            detecting_robot_ids = set(track_detectors.get(track_id, []))
-            fov_robot_ids = {robot.id for robot in all_robots if track_id in robot_visible_tracks.get(robot.id, [])}
-            observer_ids = detecting_robot_ids | fov_robot_ids
-            if observer_ids:
-                robot_means = []
-                for robot_id in observer_ids:
-                    if robot_id in robot_lookup:
-                        m_i = robot_lookup[robot_id].trust_value
-                        robot_means.append(max(self.rho_min, np.clip(2 * m_i, 0, 1)))
-                if robot_means:
-                    rho_track[track_id] = np.mean(robot_means)
-
-        return rho_robot, rho_track
-
     def ego_sweep_step(self, all_robots: List[Robot], precomputed_decisions: Dict = None) -> TrustDeltas:
         """
         Perform one ego-sweep step following the exact procedure
@@ -155,8 +97,6 @@ class RLTrustSystem:
 
         # Get global detection info
         robot_detections, track_detectors = self.get_detections_this_step(all_robots)
-        rho_robot, rho_track = self.compute_cross_weights(robot_detections, track_detectors, all_robots)
-
         # Build track lookup for easy access
         track_lookup = {}
         for robot in all_robots:
@@ -197,6 +137,12 @@ class RLTrustSystem:
             if not participating_robots and not participating_tracks:
                 continue  # No participating nodes in this ego graph
 
+            # Attach previous trust values for feature extraction
+            for robot in participating_robots:
+                setattr(robot, '_prev_trust_value', self.prev_robot_trusts.get(robot.id, robot.trust_value))
+            for track in participating_tracks:
+                setattr(track, '_prev_trust_value', self.prev_track_trusts.get(track.track_id, track.trust_value))
+
             # Get step scales from updater (use precomputed if available)
             if precomputed_decisions and ego_robot.id in precomputed_decisions:
                 step_decision = precomputed_decisions[ego_robot.id]
@@ -209,39 +155,34 @@ class RLTrustSystem:
             # Accumulate robot deltas
             for robot in participating_robots:
                 robot_id = robot.id
-                if robot_id not in step_decision.robot_steps or robot_id not in rho_robot:
-                    continue  # Skip if no step scale or cross-weight
+                if robot_id not in step_decision.robot_steps:
+                    continue  # Skip if no step scale
 
                 agent_score = scores.agent_scores.get(robot_id, 0.5)
-                confidence = self.compute_confidence(agent_score, is_track=False)
-                step_scale = step_decision.robot_steps[robot_id]
-                cross_weight = rho_robot[robot_id]
+                scale_pos, scale_neg = step_decision.robot_steps[robot_id]
+                conf_score = self.compute_confidence(agent_score)
 
-                # Scale agent_score by (step_scale × confidence × cross_weight)
-                #effective_weight = step_scale * confidence * cross_weight
-                effective_weight = step_scale
-                # Accumulate pseudo-counts
-                robot_deltas[robot_id][0] += effective_weight * agent_score
-                robot_deltas[robot_id][1] += effective_weight * (1 - agent_score)
+                alpha_contrib = conf_score*scale_pos * agent_score
+                beta_contrib = conf_score*scale_neg * (1 - agent_score)  
+
+                robot_deltas[robot_id][0] += alpha_contrib
+                robot_deltas[robot_id][1] += beta_contrib
 
             # Accumulate track deltas
             for track in participating_tracks:
                 track_id = track.track_id
-                if track_id not in step_decision.track_steps or track_id not in rho_track:
-                    continue  # Skip if no step scale or cross-weight
+                if track_id not in step_decision.track_steps:
+                    continue  # Skip if no step scale
 
                 track_score = scores.track_scores.get(track_id, 0.5)
-                maturity = min(1.0, track.observation_count / 10.0)
-                confidence = self.compute_confidence(track_score, is_track=True, maturity=maturity)
-                step_scale = step_decision.track_steps[track_id]
-                cross_weight = rho_track[track_id]
+                scale_pos, scale_neg = step_decision.track_steps[track_id]
+                conf_score = self.compute_confidence(track_score)
+                alpha_contrib = conf_score*scale_pos * track_score
+                beta_contrib = conf_score*scale_neg * (1 - track_score)
 
-                # Scale track_score by (step_scale × confidence × cross_weight)
-                #effective_weight = step_scale * confidence * cross_weight
-                effective_weight = step_scale
-                # Accumulate pseudo-counts
-                track_deltas[track_id][0] += effective_weight * track_score
-                track_deltas[track_id][1] += effective_weight * (1 - track_score)
+
+                track_deltas[track_id][0] += alpha_contrib
+                track_deltas[track_id][1] += beta_contrib
 
         # Convert to final format
         final_robot_deltas = {k: tuple(v) for k, v in robot_deltas.items()}
@@ -272,25 +213,19 @@ class RLTrustSystem:
                 track.trust_alpha += self.step_size * delta_alpha
                 track.trust_beta += self.step_size * delta_beta
 
-        # Apply strength caps
-        for robot in all_robots:
-
-            # Strength cap
-            total = robot.trust_alpha + robot.trust_beta
-            if total > self.strength_cap:
-                scale = self.strength_cap / total
-                robot.trust_alpha *= scale
-                robot.trust_beta *= scale
+        # Refresh previous trust caches for next step
+        current_robot_ids = set()
+        current_track_ids = set(track_lookup.keys())
 
         for robot in all_robots:
+            current_robot_ids.add(robot.id)
+            self.prev_robot_trusts[robot.id] = robot.trust_value
             for track in robot.get_current_timestep_tracks():
+                current_track_ids.add(track.track_id)
+                self.prev_track_trusts[track.track_id] = track.trust_value
 
-                # Strength cap
-                total = track.trust_alpha + track.trust_beta
-                if total > self.strength_cap:
-                    scale = self.strength_cap / total
-                    track.trust_alpha *= scale
-                    track.trust_beta *= scale
+        self.prev_robot_trusts = {rid: self.prev_robot_trusts[rid] for rid in current_robot_ids}
+        self.prev_track_trusts = {tid: self.prev_track_trusts[tid] for tid in current_track_ids}
 
     def update_trust(self, all_robots: List[Robot], precomputed_decisions: Dict = None):
         """

@@ -40,7 +40,7 @@ class TrainingConfig:
     max_tracks: int = 200  # Maximum number of tracks to pad to
 
     # Training schedule (safe starting point)
-    num_episodes: int = 5000  # Total episodes for training
+    num_episodes: int = 1000  # Total episodes for training
     steps_per_episode: int = 100
     update_every_episodes: int = 5  # How often to run PPO updates
     ppo_epochs: int = 4  # PPO epochs per update
@@ -48,25 +48,24 @@ class TrainingConfig:
     
     # Trust system defaults from framework
     step_size: float = 1.0
-    strength_cap: float = 50.0
 
     # Thresholds for classification
-    robot_negative_threshold: float = 0.30  # Below this = adversarial
-    robot_positive_threshold: float = 0.70  # Above this = legitimate
-    track_negative_threshold: float = 0.30  # Below this = false track
-    track_positive_threshold: float = 0.70  # Above this = legitimate track
+    robot_negative_threshold: float = 0.20  # Below this = adversarial
+    robot_positive_threshold: float = 0.80  # Above this = legitimate
+    track_negative_threshold: float = 0.20  # Below this = false track
+    track_positive_threshold: float = 0.80  # Above this = legitimate track
 
     # Confidence and cross-weight floors
     c_min: float = 0.2
     rho_min: float = 0.2
 
     # Training options
-    reward_scale: float = 1.0  # Let advantage normalization handle scaling
     clip_rewards: bool = True  # Clip rewards for stability
     reward_clip_range: float = 200.0  # Reward clipping range
     baseline_step_scale: float = 0.5  # Reference step scale used for baseline comparison
-    step_reward_scale: float = 1000.0  # Scale factor applied to per-step alignment improvements
-    final_classification_weight: float = 100.0  # Scale factor for final classification bonus
+    step_reward_scale: float = 100.0  # Scale factor applied to per-step alignment improvements
+    final_classification_weight: float = 10.0  # Scale factor for final classification bonus
+    diversity_coef: float = 0.01  # Encourages deviation from uniform step scales
 
     # Advantage processing (blueprint options)
     divide_advantage_by_ego_count: bool = True  # Divide by ego count for balanced gradient mass
@@ -90,7 +89,7 @@ class PPOTrainer:
             rho_min=config.rho_min,
             c_min=config.c_min,
             step_size=config.step_size,
-            strength_cap=config.strength_cap
+            include_critic=True,
         )
 
         # Use the trust system's updater directly
@@ -158,7 +157,7 @@ class PPOTrainer:
                                   track_observers: Optional[Dict[str, List[int]]] = None) -> Tuple[List[int], torch.Tensor, Optional[torch.Tensor]]:
         """Create actor feature tensor and mask for ego robots"""
         if not ego_robots:
-            empty = torch.zeros(0, 6, device=self.device)
+            empty = torch.zeros(0, 5, device=self.device)
             return [], empty, None
 
         robot_lookup = {robot.id: robot for robot in ego_robots}
@@ -173,7 +172,6 @@ class PPOTrainer:
         for robot_id in robot_ids:
             robot = robot_lookup[robot_id]
             trust_mean = robot.trust_value
-            strength = robot.trust_alpha + robot.trust_beta
             prev_trust = self.prev_robot_trusts.get(robot_id, 0.5)
             delta_trust = abs(trust_mean - prev_trust)
             agent_score = agent_scores.get(robot_id, 0.5)
@@ -182,7 +180,7 @@ class PPOTrainer:
                 degree = sum(1 for observers in track_observers.values() if robot_id in observers)
             else:
                 degree = len(robot.get_current_timestep_tracks())
-            rows.append([trust_mean, strength, delta_trust, agent_score, score_conf, degree])
+            rows.append([trust_mean, delta_trust, agent_score, score_conf, degree])
             mask_vals.append(1.0 if robot_id in participating_ids else 0.0)
 
         features = torch.tensor(rows, dtype=torch.float32, device=self.device)
@@ -195,7 +193,7 @@ class PPOTrainer:
                                   track_detectors: Dict[str, List[int]]) -> Tuple[List[str], torch.Tensor, Optional[torch.Tensor]]:
         """Create actor feature tensor for detected tracks"""
         if not participating_tracks:
-            empty = torch.zeros(0, 7, device=self.device)
+            empty = torch.zeros(0, 5, device=self.device)
             return [], empty, None
 
         track_lookup = {track.track_id: track for track in participating_tracks}
@@ -205,14 +203,12 @@ class PPOTrainer:
         for track_id in track_ids:
             track = track_lookup[track_id]
             trust_mean = track.trust_value
-            strength = track.trust_alpha + track.trust_beta
             prev_trust = self.prev_track_trusts.get(track_id, 0.5)
             delta_trust = abs(trust_mean - prev_trust)
-            maturity = min(1.0, track.observation_count / 10.0)
             track_score = track_scores.get(track_id, 0.5)
             score_conf = 2 * abs(track_score - 0.5)
             degree = len(track_detectors.get(track_id, []))
-            rows.append([trust_mean, strength, delta_trust, maturity, track_score, score_conf, degree])
+            rows.append([trust_mean, delta_trust, track_score, score_conf, degree])
 
         features = torch.tensor(rows, dtype=torch.float32, device=self.device)
         mask_tensor = torch.ones(features.shape[0], dtype=torch.float32, device=self.device)
@@ -243,7 +239,9 @@ class PPOTrainer:
         return mask
 
 
-    def compute_alignment_score(self, all_robots: List[Robot], ground_truth: Dict) -> float:
+    def compute_alignment_score(self, all_robots: List[Robot], ground_truth: Dict,
+                                robot_subset: Optional[Set[int]] = None,
+                                track_subset: Optional[Set[str]] = None) -> float:
         """Average trust alignment with ground truth for robots and tracks."""
         total_score = 0.0
         entity_count = 0
@@ -252,6 +250,8 @@ class PPOTrainer:
         true_false_tracks = set(ground_truth.get('false_tracks', []))
 
         for robot in all_robots:
+            if robot_subset is not None and robot.id not in robot_subset:
+                continue
             entity_count += 1
             if robot.id in true_adversarial:
                 total_score += (1.0 - robot.trust_value)
@@ -260,6 +260,8 @@ class PPOTrainer:
 
         for robot in all_robots:
             for track in robot.get_current_timestep_tracks():
+                if track_subset is not None and track.track_id not in track_subset:
+                    continue
                 entity_count += 1
 
                 if track.track_id in true_false_tracks:
@@ -603,8 +605,6 @@ class PPOTrainer:
                 # Pull ground truth before applying updates for critic features
                 ground_truth_pre_update = self.scenario_generator._extract_ground_truth(sim_env)
 
-                alignment_before = self.compute_alignment_score(robots, ground_truth_pre_update)
-
                 # Loop over all robots as ego robots (like in ego_sweep_step)
                 for ego_robot in robots:
                     # Get GNN scores for this ego graph
@@ -677,11 +677,15 @@ class PPOTrainer:
                     # Convert sampled actions to step decision format for trust updater
                     step_decision = UpdateDecision({}, {})
                     for i, robot_id in enumerate(robot_ids):
-                        if i < len(robot_actions):
-                            step_decision.robot_steps[robot_id] = float(robot_actions[i].detach())
+                        if i < robot_actions.size(0):
+                            pos = float(robot_actions[i, 0].detach()) if robot_actions.size(1) > 0 else 0.0
+                            neg = float(robot_actions[i, 1].detach()) if robot_actions.size(1) > 1 else 0.0
+                            step_decision.robot_steps[robot_id] = (pos, neg)
                     for i, track_id in enumerate(track_ids):
-                        if i < len(track_actions):
-                            step_decision.track_steps[track_id] = float(track_actions[i].detach())
+                        if i < track_actions.size(0):
+                            pos = float(track_actions[i, 0].detach()) if track_actions.size(1) > 0 else 0.0
+                            neg = float(track_actions[i, 1].detach()) if track_actions.size(1) > 1 else 0.0
+                            step_decision.track_steps[track_id] = (pos, neg)
 
                     precomputed_decisions[ego_robot.id] = step_decision
 
@@ -736,14 +740,35 @@ class PPOTrainer:
                         track_mask.unsqueeze(0)
                     ).item()
 
+                # Identify which robots/tracks receive updates this step for alignment calculations
+                robot_update_ids: Set[int] = set()
+                track_update_ids: Set[str] = set()
+                for decision in precomputed_decisions.values():
+                    robot_update_ids.update(decision.robot_steps.keys())
+                    track_update_ids.update(decision.track_steps.keys())
+
+                subset_robot_ids = robot_update_ids if robot_update_ids else None
+                subset_track_ids = track_update_ids if track_update_ids else None
+                has_subset = subset_robot_ids is not None or subset_track_ids is not None
+
+                alignment_before_subset = 0.0
+                if has_subset:
+                    alignment_before_subset = self.compute_alignment_score(
+                        robots, ground_truth_pre_update, subset_robot_ids, subset_track_ids
+                    )
+
                 # Baseline comparison using fixed step scales
                 baseline_alignment_delta = 0.0
                 baseline_decisions = {}
-                baseline_scale = max(0.0, float(self.config.baseline_step_scale))
-                if baseline_scale > 0 and precomputed_decisions:
+                baseline_scale = max(0.0, min(1.0, float(self.config.baseline_step_scale)))
+                if has_subset and baseline_scale > 1e-6 and precomputed_decisions:
                     for ego_id, decision in precomputed_decisions.items():
-                        baseline_robot_steps = {rid: baseline_scale for rid in decision.robot_steps}
-                        baseline_track_steps = {tid: baseline_scale for tid in decision.track_steps}
+                        baseline_robot_steps = {rid: (baseline_scale, baseline_scale)
+                                               for rid in decision.robot_steps.keys()
+                                               if subset_robot_ids is None or rid in subset_robot_ids}
+                        baseline_track_steps = {tid: (baseline_scale, baseline_scale)
+                                               for tid in decision.track_steps.keys()
+                                               if subset_track_ids is None or tid in subset_track_ids}
                         if baseline_robot_steps or baseline_track_steps:
                             baseline_decisions[ego_id] = UpdateDecision(baseline_robot_steps, baseline_track_steps)
 
@@ -758,8 +783,10 @@ class PPOTrainer:
                     }
 
                     self.trust_system.update_trust(robots, baseline_decisions)
-                    baseline_alignment_after = self.compute_alignment_score(robots, ground_truth_pre_update)
-                    baseline_alignment_delta = baseline_alignment_after - alignment_before
+                    baseline_alignment_after = self.compute_alignment_score(
+                        robots, ground_truth_pre_update, subset_robot_ids, subset_track_ids
+                    )
+                    baseline_alignment_delta = baseline_alignment_after - alignment_before_subset
 
                     # Restore original trust state before applying actual policy decisions
                     for robot in robots:
@@ -780,12 +807,16 @@ class PPOTrainer:
                 # Update ground truth for dynamic false tracks (changes as robots move)
                 current_ground_truth = self.scenario_generator._extract_ground_truth(sim_env)
 
-                alignment_after = self.compute_alignment_score(robots, current_ground_truth)
+                if has_subset:
+                    alignment_after_subset = self.compute_alignment_score(
+                        robots, current_ground_truth, subset_robot_ids, subset_track_ids
+                    )
+                    alignment_delta = alignment_after_subset - alignment_before_subset
+                    improvement_alignment = alignment_delta - baseline_alignment_delta
+                else:
+                    improvement_alignment = 0.0
 
-                alignment_delta = alignment_after - alignment_before
-                improvement_alignment = alignment_delta - baseline_alignment_delta
-
-                step_reward = improvement_alignment * self.config.step_reward_scale * self.config.reward_scale
+                step_reward = improvement_alignment * self.config.step_reward_scale 
 
                 # REWARD WIRING: Add classification bonus to R_t at the last step (blueprint requirement)
                 if step == scenario_params.episode_length - 1:
@@ -828,8 +859,8 @@ class PPOTrainer:
                     ego_item_idx = len(self.ego_R_feats)
                     self.ego_R_feats.append(robot_features_tensor.detach())  # Tensor[N_R, F_R] - robot features
                     self.ego_T_feats.append(track_features_tensor.detach())  # Tensor[N_T, F_T] - track features
-                    self.ego_a_R.append(robot_actions.detach())  # Tensor[N_R] - robot actions
-                    self.ego_a_T.append(track_actions.detach())  # Tensor[N_T] - track actions
+                    self.ego_a_R.append(robot_actions.detach())  # Tensor[N_R, 2] - robot actions (pos/neg)
+                    self.ego_a_T.append(track_actions.detach())  # Tensor[N_T, 2] - track actions (pos/neg)
                     self.ego_logp_R.append(robot_log_probs.detach())  # Tensor[N_R] - robot log probs (old)
                     self.ego_logp_T.append(track_log_probs.detach())  # Tensor[N_T] - track log probs (old)
                     self.ego_entropy.append(float(entropy_value))  # float - entropy
@@ -914,11 +945,11 @@ class PPOTrainer:
                         track_mask = self.ego_track_mask[i].to(self.device) if self.ego_track_mask[i].numel() > 0 else None
                         robot_track_mask = self.ego_robot_track_mask[i].to(self.device) if self.ego_robot_track_mask[i].numel() > 0 else None
 
-                        robot_actions = self.ego_a_R[i].to(self.device)  # [N_R] - taken robot actions
-                        track_actions = self.ego_a_T[i].to(self.device)  # [N_T] - taken track actions
+                        robot_actions = self.ego_a_R[i].to(self.device)  # [N_R, 2] - taken robot actions
+                        track_actions = self.ego_a_T[i].to(self.device)  # [N_T, 2] - taken track actions
 
-                        logp_R_old = self.ego_logp_R[i].to(self.device)  # [N_R] - old log-probs
-                        logp_T_old = self.ego_logp_T[i].to(self.device)  # [N_T] - old log-probs
+                        logp_R_old = self.ego_logp_R[i].to(self.device)  # [N_R] - old log-probs (sum of components)
+                        logp_T_old = self.ego_logp_T[i].to(self.device)  # [N_T] - old log-probs (sum of components)
 
                         # Get new log-probs from current policy using the simplified actor interface
                         logp_R_new, logp_T_new, entropy = self.updater.policy.evaluate_actions(
@@ -954,6 +985,14 @@ class PPOTrainer:
                         surr1 = ratio * advantage
                         surr2 = torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon) * advantage
                         policy_loss = -torch.min(surr1, surr2)
+
+                        if self.config.diversity_coef > 0:
+                            diversity_term = 0.0
+                            if robot_actions.numel() > 0:
+                                diversity_term += torch.mean(torch.abs(robot_actions - 0.5))
+                            if track_actions.numel() > 0:
+                                diversity_term += torch.mean(torch.abs(track_actions - 0.5))
+                            policy_loss = policy_loss - self.config.diversity_coef * diversity_term
 
                         # Use centralized critic for value loss
                         if step_idx >= 0 and step_idx < len(self.step_S):

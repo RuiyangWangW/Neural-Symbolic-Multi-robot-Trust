@@ -3,7 +3,7 @@
 Data Generation for Supervised Trust Learning
 
 This script generates training data from simulation environments with ground truth labels
-for whether each robot/track is trustworthy. Uses the paper trust algorithm for realistic
+for whether each robot/track is trustworthy. Uses the RL trust update system for realistic
 trust updates and adds agent-to-agent trustworthiness comparison edges.
 """
 
@@ -14,12 +14,12 @@ from typing import List, Tuple, Dict, Union
 import pickle
 from dataclasses import dataclass
 import random
+from pathlib import Path
 
 # Import existing simulation components
 from simulation_environment import SimulationEnvironment
-from neural_symbolic_trust_algorithm import NeuralSymbolicTrustAlgorithm
-from paper_trust_algorithm import PaperTrustAlgorithm
 from supervised_trust_gnn import TrustFeatureCalculator, EgoGraphBuilder
+from rl_trust_system import RLTrustSystem
 
 
 @dataclass
@@ -38,7 +38,7 @@ class SupervisedDataSample:
 
 class SupervisedDataGenerator:
     """
-    Generates supervised learning data from simulation environment using paper trust algorithm
+    Generates supervised learning data from simulation environment using the RL trust update system
     """
 
     def __init__(self,
@@ -51,7 +51,10 @@ class SupervisedDataGenerator:
                  proximal_range: float = 50.0,
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
-                 max_steps_per_episode: int = 100):
+                 max_steps_per_episode: int = 100,
+                 gnn_model_path: str = "trained_gnn_model.pth",
+                 rl_model_path: str = "rl_trust_model.pth",
+                 device: str = 'cpu'):
         """
         Initialize data generator
 
@@ -66,6 +69,9 @@ class SupervisedDataGenerator:
             fov_range: Field of view range (kept constant)
             fov_angle: Field of view angle (kept constant)
             max_steps_per_episode: Maximum steps per episode
+            gnn_model_path: Path to trained (or untrained) ego-graph evidence model
+            rl_model_path: Path to trained (or untrained) RL updater model
+            device: Torch device for trust models
         """
         self.max_steps_per_episode = max_steps_per_episode
 
@@ -88,17 +94,68 @@ class SupervisedDataGenerator:
         self.fov_range = fov_range
         self.fov_angle = fov_angle
 
+        self.device = device
+        self.gnn_model_path = Path(gnn_model_path) if gnn_model_path else None
+        self.rl_model_path = Path(rl_model_path) if rl_model_path else None
+
         # Initialize simulation environment (will be recreated for each episode with sampled parameters)
         self.sim_env = None
-
-        # Initialize paper trust algorithm for realistic trust updates
-        self.paper_trust_algorithm = PaperTrustAlgorithm()
 
         # Initialize enhanced feature calculator for proper neural symbolic features
         self.feature_calculator = TrustFeatureCalculator()
 
         # Initialize ego graph builder (will be updated for each episode)
         self.ego_graph_builder = None
+
+        # Initialize RL trust system (preferred trust updater)
+        self.rl_trust_system = None
+        self._initialize_rl_trust_system()
+
+    def _initialize_rl_trust_system(self) -> None:
+        """Set up the RL trust update system, falling back to fresh weights if checkpoints are absent"""
+        evidence_path = str(self.gnn_model_path) if self.gnn_model_path and self.gnn_model_path.exists() else None
+        updater_path = str(self.rl_model_path) if self.rl_model_path and self.rl_model_path.exists() else None
+
+        if self.gnn_model_path and not self.gnn_model_path.exists():
+            print(f"ℹ️ GNN evidence model '{self.gnn_model_path}' not found. Initializing with fresh weights.")
+        if self.rl_model_path and not self.rl_model_path.exists():
+            print(f"ℹ️ RL updater model '{self.rl_model_path}' not found. Initializing with fresh weights.")
+
+        try:
+            self.rl_trust_system = RLTrustSystem(
+                evidence_model_path=evidence_path,
+                updater_model_path=updater_path,
+                device=self.device,
+                rho_min=0.2,
+                c_min=0.2,
+                step_size=1.0
+            )
+            gnn_label = evidence_path if evidence_path else "fresh initialization"
+            rl_label = updater_path if updater_path else "fresh initialization"
+            print(f"✅ RL trust system ready (GNN={gnn_label}, updater={rl_label})")
+        except Exception as e:
+            print(f"⚠️ Failed to initialize RL trust system: {e}")
+            self.rl_trust_system = None
+            raise
+
+    def _simulate_step_with_rl(self, step_idx: int):
+        """
+        Execute a single environment step and apply RL trust updates, mirroring compare_trust_methods.
+        """
+        frame_data = self.sim_env.step()
+
+        for robot in self.sim_env.robots:
+            robot.update_current_timestep_tracks()
+
+        if self.rl_trust_system is None:
+            self._initialize_rl_trust_system()
+
+        if self.rl_trust_system is None:
+            raise RuntimeError("RL trust system unavailable after initialization attempt")
+
+        self.rl_trust_system.update_trust(self.sim_env.robots)
+
+        return frame_data
 
     def _sample_episode_parameters(self) -> Dict:
         """
@@ -246,11 +303,9 @@ class SupervisedDataGenerator:
 
         return agent_labels, track_labels
 
-
-
     def generate_episode_data(self, episode_idx: int = 0) -> Tuple[List[SupervisedDataSample], Dict]:
         """
-        Generate supervised data for one episode using paper trust algorithm
+        Generate supervised data for one episode using RL trust algorithm
 
         Args:
             episode_idx: Episode index for tracking
@@ -267,34 +322,18 @@ class SupervisedDataGenerator:
         # Create simulation environment with sampled parameters
         self._create_simulation_environment(episode_params)
 
-        # Reset simulation environment
-        self.sim_env.reset()
         episode_data = []
 
         for step in range(self.max_steps_per_episode):
             try:
-                self.sim_env.step()
-
-                # Check if simulation should end (can be enhanced with specific conditions)
-                if step >= self.max_steps_per_episode:
-                    break
-
+                self._simulate_step_with_rl(step)
             except Exception as e:
-                print(f"Warning: Error during simulation step {step}: {e}")
+                print(f"Warning: RL trust step failed at step {step}: {e}")
                 break
-            
-            # Get current robots
+
             robots = self.sim_env.robots
-            for robot in robots:
-                robot.update_current_timestep_tracks()
             if not robots:
                 print(f"Warning: No robots at step {step}")
-                continue
-            
-            # Build global state from current simulation state
-            global_state = self._build_global_state()
-            if global_state is None:
-                print(f"Warning: No global state at step {step}")
                 continue
 
             # Generate ego graphs for each robot (same as RL training loop)
@@ -326,43 +365,8 @@ class SupervisedDataGenerator:
                 except Exception as e:
                     print(f"Warning: Error generating ego graph for robot {ego_robot.id} at step {step}: {e}")
                     continue
-            
-            try:
-                trust_updates = self.paper_trust_algorithm.update_trust(robots, self.sim_env)
-                print(f"  Step {step}: Applied trust updates to {len(trust_updates)} robots")
-            except Exception as e:
-                print(f"Warning: Trust update failed at step {step}: {e}")
         print(f"Generated {len(episode_data)} samples for episode {episode_idx}")
         return episode_data, episode_params
-
-    def _build_global_state(self):
-        """
-        Build global state from current simulation environment
-
-        Returns:
-            HeteroData representing the global state
-        """
-        try:
-            robots = self.sim_env.robots
-            if not robots:
-                return None
-
-            # Get all tracks from all robots
-            all_tracks = []
-            for robot in robots:
-                robot_tracks = robot.get_all_current_tracks()
-                all_tracks.extend(robot_tracks)
-
-            # Build global graph using ego graph builder with all robots
-            # Allow building graph even with no tracks initially
-            global_graph = self.ego_graph_builder._build_multi_robot_graph(
-                robots, [], all_tracks, {}  # No fused tracks, all individual
-            )
-            return global_graph
-
-        except Exception as e:
-            print(f"Warning: Failed to build global state: {e}")
-            return None
 
     def generate_dataset(self,
                         num_episodes: int = 10,
@@ -387,7 +391,9 @@ class SupervisedDataGenerator:
         print(f"   - World size (square): {self.world_size_range[0][0]} to {self.world_size_range[1][0]}")
         print(f"   - Proximal range (fixed): {self.proximal_range}")
         print(f"⏱️  Max steps per episode: {self.max_steps_per_episode}")
-        print(f"🧠 Using paper trust algorithm for realistic trust updates")
+        gnn_label = str(self.gnn_model_path) if self.gnn_model_path and self.gnn_model_path.exists() else ("fresh initialization" if self.gnn_model_path is None else f"{self.gnn_model_path} (fresh init)")
+        rl_label = str(self.rl_model_path) if self.rl_model_path and self.rl_model_path.exists() else ("fresh initialization" if self.rl_model_path is None else f"{self.rl_model_path} (fresh init)")
+        print(f"🧠 Using RL trust system for updates (GNN: {gnn_label}, updater: {rl_label})")
 
         all_data = []
         all_episode_params = []
@@ -556,7 +562,10 @@ def main():
                        help='Max steps per episode (default: 100)')
     parser.add_argument('--output', type=str, default='supervised_trust_dataset.pkl',
                        help='Output file path (default: supervised_trust_dataset.pkl)')
-
+    parser.add_argument('--gnn-model', type=str, default='trained_gnn_model.pth',
+                        help='Path to the trained GNN evidence model (default: trained_gnn_model.pth)')
+    parser.add_argument('--rl-model', type=str, default='rl_trust_model.pth',
+                        help='Path to the trained RL updater model (default: rl_trust_model.pth)')
     args = parser.parse_args()
 
     # Parse parameter ranges
@@ -593,7 +602,9 @@ def main():
         false_positive_rate=false_positive_rate_range,
         false_negative_rate=false_negative_rate_range,
         proximal_range=args.proximal_range,
-        max_steps_per_episode=args.steps
+        max_steps_per_episode=args.steps,
+        gnn_model_path=args.gnn_model,
+        rl_model_path=args.rl_model
     )
 
     # Generate dataset
@@ -604,7 +615,9 @@ def main():
 
     print(f"\n🎯 Dataset generation complete!")
     print(f"📈 {len(dataset)} samples from {len(episode_params)} episodes saved to {args.output}")
-    print(f"🧠 Trust updates applied using paper trust algorithm")
+    gnn_summary = str(generator.gnn_model_path) if generator.gnn_model_path and generator.gnn_model_path.exists() else ("fresh initialization" if generator.gnn_model_path is None else f"{generator.gnn_model_path} (fresh init)")
+    rl_summary = str(generator.rl_model_path) if generator.rl_model_path and generator.rl_model_path.exists() else ("fresh initialization" if generator.rl_model_path is None else f"{generator.rl_model_path} (fresh init)")
+    print(f"🧠 Trust updates applied using RL trust system (GNN: {gnn_summary}, updater: {rl_summary})")
     print(f"🔗 Agent comparison edges included")
     print(f"📉 Alpha/beta features removed from node features")
     print(f"🎲 Parameter diversity across episodes for more robust training")

@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import HeteroConv, GATConv, Linear
 from torch_geometric.data import HeteroData
 from typing import Dict, List, Tuple
+from pathlib import Path
 import numpy as np
 import math
 
@@ -385,27 +386,66 @@ class SupervisedTrustPredictor:
         self._load_model(model_path)
 
     def _load_model(self, model_path: str):
-        """Load trained model from checkpoint"""
-        try:
-            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+        """Load trained model from checkpoint or initialize fresh weights if unavailable"""
+        # Always create the model so we can fall back to fresh weights when needed
+        self.model = SupervisedTrustGNN(
+            agent_features=4,  # 4 neural-symbolic predicates
+            track_features=5,  # 5 neural-symbolic predicates
+            hidden_dim=64
+        )
 
-            # Create model with correct architecture
-            self.model = SupervisedTrustGNN(
-                agent_features=4,  # 4 neural-symbolic predicates
-                track_features=5,  # 5 neural-symbolic predicates
-                hidden_dim=64
-            )
+        resolved_path = Path(model_path) if model_path else None
 
-            # Load model weights
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.model.to(self.device)
-            self.model.eval()
+        if resolved_path and resolved_path.exists():
+            try:
+                checkpoint = torch.load(resolved_path, map_location=self.device, weights_only=False)
+                state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
 
-            print(f"✅ Loaded supervised trust model from {model_path}")
+                model_state = self.model.state_dict()
+                matched_keys = []
+                mismatched_keys = []
+                unexpected_keys = []
 
-        except Exception as e:
-            print(f"⚠️ Failed to load supervised trust model: {e}")
-            self.model = None
+                for key, weight in state_dict.items():
+                    if not isinstance(weight, torch.Tensor):
+                        continue  # Skip non-tensor entries (metadata, optimizer state, etc.)
+
+                    if key in model_state:
+                        target_param = model_state[key]
+                        if target_param.shape == weight.shape:
+                            model_state[key] = weight.to(device=target_param.device, dtype=target_param.dtype)
+                            matched_keys.append(key)
+                        else:
+                            mismatched_keys.append((key, tuple(weight.shape), tuple(model_state[key].shape)))
+                    else:
+                        unexpected_keys.append(key)
+
+                if matched_keys:
+                    self.model.load_state_dict(model_state)
+                    loaded_msg = f"✅ Loaded supervised trust model from {resolved_path} (matched {len(matched_keys)} tensors)"
+                    print(loaded_msg)
+                else:
+                    print(f"ℹ️ Checkpoint '{resolved_path}' has no compatible tensors. Using randomly initialized weights.")
+
+                if mismatched_keys:
+                    preview = ", ".join([f"{k}:ckpt{src}->model{dst}" for k, src, dst in mismatched_keys[:3]])
+                    if len(mismatched_keys) > 3:
+                        preview += ", ..."
+                    print(f"ℹ️ Skipped {len(mismatched_keys)} tensors with incompatible shapes ({preview})")
+                if unexpected_keys:
+                    print(f"ℹ️ Ignored {len(unexpected_keys)} unexpected tensors from checkpoint.")
+
+            except Exception as e:
+                print(f"⚠️ Failed to load supervised trust model from {resolved_path}: {e}")
+                print("ℹ️ Proceeding with randomly initialized GNN weights.")
+        else:
+            if resolved_path:
+                print(f"ℹ️ GNN checkpoint '{resolved_path}' not found. Using randomly initialized weights.")
+            else:
+                print("ℹ️ No GNN checkpoint provided. Using randomly initialized weights.")
+
+        self.model.to(self.device)
+        self.model.eval()
 
     def predict_from_robots_tracks(self,
                                  ego_robot: 'Robot',
@@ -778,5 +818,3 @@ class EgoGraphBuilder:
     def _track_in_robot_fov(self, robot, track):
         """Determine if track is in robot's field of view using Robot's built-in method"""
         return robot.is_in_fov(track.position)  # Use Robot class's is_in_fov method
-
-

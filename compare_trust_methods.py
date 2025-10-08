@@ -30,7 +30,7 @@ class TrustMethodComparison:
     """Compares paper algorithm vs supervised model vs RL model"""
 
     def __init__(self,
-                 supervised_model_path: str = "supervised_trust_model.pth",
+                 supervised_model_path: str = "trained_gnn_model.pth",
                  rl_model_path: str = "rl_trust_model.pth",
                  num_robots: int = 5,
                  num_targets: int = 10,
@@ -54,8 +54,8 @@ class TrustMethodComparison:
             fov_range: Field of view range for robots
             fov_angle: Field of view angle for robots
         """
-        self.supervised_model_path = supervised_model_path
-        self.rl_model_path = rl_model_path
+        self.supervised_model_path = Path(supervised_model_path) if supervised_model_path else None
+        self.rl_model_path = Path(rl_model_path) if rl_model_path else None
         self.num_robots = num_robots
         self.num_targets = num_targets
         self.num_timesteps = num_timesteps
@@ -85,16 +85,23 @@ class TrustMethodComparison:
 
         # Try to load supervised model after proximal_range is set
         try:
-            self.supervised_predictor = SupervisedTrustPredictor(supervised_model_path, proximal_range=self.proximal_range)
-            print(f"✅ Loaded supervised trust model from {supervised_model_path}")
+            gnn_path_str = str(self.supervised_model_path) if self.supervised_model_path else None
+            self.supervised_predictor = SupervisedTrustPredictor(gnn_path_str, proximal_range=self.proximal_range)
+            if self.supervised_model_path and self.supervised_model_path.exists():
+                print(f"✅ Supervised trust predictor ready ({gnn_path_str})")
+            else:
+                print("ℹ️ Supervised trust predictor initialized with fresh weights")
         except Exception as e:
-            print(f"⚠️ Failed to load supervised model: {e}")
+            print(f"⚠️ Failed to initialize supervised predictor: {e}")
 
         # Try to load RL model
         try:
             self._initialize_rl_system()
-            model_label = self.rl_model_path if self.rl_model_path else "fresh initialization"
-            print(f"✅ Loaded RL trust model from {model_label}")
+            if self.rl_model_path and self.rl_model_path.exists():
+                model_label = str(self.rl_model_path)
+            else:
+                model_label = "fresh initialization"
+            print(f"✅ RL trust system ready ({model_label})")
         except Exception as e:
             print(f"⚠️ Failed to load RL model: {e}")
 
@@ -109,41 +116,48 @@ class TrustMethodComparison:
         """Initialize the RL trust update system with ego-centric architecture"""
         device = 'cpu'  # Use CPU for comparison consistency
 
-        if self.rl_model_path:
-            model_path = Path(self.rl_model_path)
-            if not model_path.exists():
-                legacy_path = Path('rl_trust_model.pth')
-                if legacy_path.exists():
-                    print(f"ℹ️ RL model '{model_path}' not found. Falling back to '{legacy_path}'.")
-                    self.rl_model_path = str(legacy_path)
-                else:
-                    print(f"⚠️ RL model '{model_path}' not found and no legacy model available. Using fresh weights.")
-                    self.rl_model_path = None
-        else:
-            self.rl_model_path = None
+        rl_model_path = self.rl_model_path
+        rl_checkpoint_missing = False
+        if rl_model_path and not rl_model_path.exists():
+            legacy_path = Path('rl_trust_model.pth')
+            if legacy_path.exists():
+                print(f"ℹ️ RL model '{rl_model_path}' not found. Falling back to '{legacy_path}'.")
+                self.rl_model_path = legacy_path
+            else:
+                print(f"⚠️ RL model '{rl_model_path}' not found and no legacy model available. Using fresh weights.")
+                self.rl_model_path = None
+                rl_checkpoint_missing = True
+        elif self.rl_model_path is None:
+            rl_checkpoint_missing = True
+
+        evidence_path = str(self.supervised_model_path) if self.supervised_model_path and self.supervised_model_path.exists() else None
+        updater_path = str(self.rl_model_path) if self.rl_model_path and self.rl_model_path.exists() else None
+
+        if self.supervised_model_path and not self.supervised_model_path.exists():
+            print(f"ℹ️ Supervised evidence model '{self.supervised_model_path}' not found. Initializing with fresh weights.")
+        if rl_checkpoint_missing:
+            print("ℹ️ RL updater model not found. Initializing with fresh weights.")
 
         # Initialize RLTrustSystem with updated ego-centric parameters
         self.rl_trust_system = RLTrustSystem(
-            evidence_model_path=self.supervised_model_path,
-            updater_model_path=self.rl_model_path,
+            evidence_model_path=evidence_path,
+            updater_model_path=updater_path,
             device=device,
             rho_min=0.2,
             c_min=0.2,
             step_size=1.0,
-            strength_cap=50.0
         )
 
     def _initialize_baseline_system(self):
         """Set up an RL trust system with fixed step scales."""
         device = 'cpu'
         self.baseline_trust_system = RLTrustSystem(
-            evidence_model_path=self.supervised_model_path,
+            evidence_model_path=str(self.supervised_model_path) if self.supervised_model_path and self.supervised_model_path.exists() else None,
             updater_model_path=None,
             device=device,
             rho_min=0.2,
             c_min=0.2,
             step_size=1.0,
-            strength_cap=50.0
         )
 
         updater = self.baseline_trust_system.updater
@@ -152,8 +166,8 @@ class TrustMethodComparison:
         def fixed_get_step_scales(self_updater, ego_robots, ego_tracks, participating_robots,
                                   participating_tracks, robot_scores, track_scores, track_observers):
             scale = float(self_updater.baseline_scale)
-            robot_steps = {robot.id: scale for robot in participating_robots}
-            track_steps = {track.track_id: scale for track in participating_tracks}
+            robot_steps = {robot.id: (scale, scale) for robot in participating_robots}
+            track_steps = {track.track_id: (scale, scale) for track in participating_tracks}
             return UpdateDecision(robot_steps, track_steps)
 
         updater.get_step_scales = types.MethodType(fixed_get_step_scales, updater)
@@ -322,73 +336,6 @@ class TrustMethodComparison:
         print(f"✅ {label} simulation completed")
         return results
 
-    def _update_trust_from_predictions(self, predictions: Dict, graph_data):
-        """
-        Update alpha/beta values based on supervised model predictions using correct node mappings
-
-        Args:
-            predictions: Model predictions containing trust probabilities
-            graph_data: Graph data with node mappings (agent_nodes, track_nodes)
-        """
-
-        # Update agent (robot) trust values using correct mappings
-        if 'agent' in predictions and hasattr(graph_data, 'agent_nodes'):
-            agent_probs = predictions['agent']['probabilities']
-
-            # Use the exact node mapping from graph_data
-            for robot_id, node_idx in graph_data.agent_nodes.items():
-                if node_idx < len(agent_probs):
-                    p = agent_probs[node_idx][0]  # Extract probability from array
-
-                    # Convert probability to alpha/beta update
-                    if p >= 0.5:
-                        # High trust prediction - increase alpha
-                        delta_alpha = p
-                        delta_beta = 0.0
-                    else:
-                        # Low trust prediction - increase beta
-                        delta_alpha = 0.0
-                        delta_beta = (1 - p)
-
-                    # Find the robot object and apply update
-                    for robot in graph_data._proximal_robots:
-                        if robot.id == robot_id:
-                            # Apply update with small step size to prevent rapid changes
-                            step_size = 0.1
-                            robot.update_trust(delta_alpha * step_size, delta_beta * step_size)
-                            break
-
-        # Update track trust values using correct mappings
-        if 'track' in predictions and hasattr(graph_data, 'track_nodes'):
-            track_probs = predictions['track']['probabilities']
-
-            # Use the exact node mapping from graph_data
-            for track_id, node_idx in graph_data.track_nodes.items():
-                if node_idx < len(track_probs):
-                    p = track_probs[node_idx][0]  # Extract probability from array
-
-                    # Convert probability to alpha/beta update
-                    if p >= 0.5:
-                        # High trust prediction - increase alpha
-                        delta_alpha = p
-                        delta_beta = 0.0
-                    else:
-                        # Low trust prediction - increase beta
-                        delta_alpha = 0.0
-                        delta_beta = (1 - p)
-
-                    # Find the track object and apply update
-                    for robot in graph_data._proximal_robots:
-                        for track in robot.get_all_tracks():
-                            if track.track_id == track_id:
-                                # Apply update with small step size
-                                step_size = 0.1
-                                track.update_trust(delta_alpha * step_size, delta_beta * step_size)
-                                break
-
-    # Note: _update_robots_from_rl_beliefs method removed -
-    # Now using IntegratedRLBeliefState which works directly on robot/track objects
-
     def run_comparison(self) -> Dict:
         """Run complete comparison between both methods"""
         print("🔄 Starting trust method comparison...")
@@ -415,7 +362,7 @@ class TrustMethodComparison:
                 'num_targets': self.num_targets,
                 'num_timesteps': self.num_timesteps,
                 'random_seed': self.random_seed,
-                'rl_model_path': self.rl_model_path,
+                'rl_model_path': str(self.rl_model_path) if self.rl_model_path else None,
                 'fixed_step_scale': self.fixed_step_scale
             },
             'paper_results': self.paper_results,
@@ -530,7 +477,7 @@ class TrustMethodComparison:
                 'num_targets': self.num_targets,
                 'num_timesteps': self.num_timesteps,
                 'random_seed': self.random_seed,
-                'rl_model_path': self.rl_model_path,
+                'rl_model_path': str(self.rl_model_path) if self.rl_model_path else None,
                 'fixed_step_scale': self.fixed_step_scale
             },
             'paper_results': self.paper_results,
@@ -695,7 +642,8 @@ class TrustMethodComparison:
         metrics = self._compute_comparison_metrics()
 
         print(f"Configuration: {self.num_robots} robots, {self.num_timesteps} steps, seed {self.random_seed}")
-        print(f"RL Model: {self.rl_model_path}")
+        rl_label = str(self.rl_model_path) if self.rl_model_path else "fresh initialization"
+        print(f"RL Model: {rl_label}")
         print(f"Fixed Step Scale: {self.fixed_step_scale:.2f}")
 
         # Final trust values by robot type
@@ -754,17 +702,17 @@ def main():
     NUM_ROBOTS = 10
     NUM_TARGETS = 20
     NUM_TIMESTEPS = 100
-    RANDOM_SEED = 11
+    RANDOM_SEED = 8
 
     # Environment Parameters
-    WORLD_SIZE = 120.0
+    WORLD_SIZE = 100.0
     ADVERSARIAL_RATIO = 0.3
     PROXIMAL_RANGE = 50.0
     FOV_RANGE = 50.0
     FOV_ANGLE = np.pi/3
 
     # Model Parameters
-    SUPERVISED_MODEL_PATH = "supervised_trust_model.pth"
+    SUPERVISED_MODEL_PATH = "trained_gnn_model.pth"
     RL_MODEL_PATH = "rl_trust_model.pth"
 
     # Scenario-specific parameters (only FP/FN rates vary)
