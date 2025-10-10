@@ -143,8 +143,6 @@ class TrustMethodComparison:
             evidence_model_path=evidence_path,
             updater_model_path=updater_path,
             device=device,
-            rho_min=0.2,
-            c_min=0.2,
             step_size=1.0,
         )
 
@@ -155,8 +153,6 @@ class TrustMethodComparison:
             evidence_model_path=str(self.supervised_model_path) if self.supervised_model_path and self.supervised_model_path.exists() else None,
             updater_model_path=None,
             device=device,
-            rho_min=0.2,
-            c_min=0.2,
             step_size=1.0,
         )
 
@@ -712,7 +708,7 @@ def main():
     FOV_ANGLE = np.pi/3
 
     # Model Parameters
-    SUPERVISED_MODEL_PATH = "trained_gnn_model.pth"
+    SUPERVISED_MODEL_PATH = "supervised_trust_model.pth"
     RL_MODEL_PATH = "rl_trust_model.pth"
 
     # Scenario-specific parameters (only FP/FN rates vary)
