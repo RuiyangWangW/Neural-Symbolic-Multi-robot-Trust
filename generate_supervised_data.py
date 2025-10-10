@@ -54,7 +54,9 @@ class SupervisedDataGenerator:
                  max_steps_per_episode: int = 100,
                  gnn_model_path: str = "trained_gnn_model.pth",
                  rl_model_path: str = "rl_trust_model.pth",
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 trust_step_size: float = 1.0,
+                 trust_strength_cap: float = 100.0):
         """
         Initialize data generator
 
@@ -72,6 +74,8 @@ class SupervisedDataGenerator:
             gnn_model_path: Path to trained (or untrained) ego-graph evidence model
             rl_model_path: Path to trained (or untrained) RL updater model
             device: Torch device for trust models
+            trust_step_size: Global step size multiplier for trust updates
+            trust_strength_cap: Maximum combined alpha+beta strength before normalization
         """
         self.max_steps_per_episode = max_steps_per_episode
 
@@ -97,6 +101,8 @@ class SupervisedDataGenerator:
         self.device = device
         self.gnn_model_path = Path(gnn_model_path) if gnn_model_path else None
         self.rl_model_path = Path(rl_model_path) if rl_model_path else None
+        self.trust_step_size = trust_step_size
+        self.trust_strength_cap = trust_strength_cap
 
         # Initialize simulation environment (will be recreated for each episode with sampled parameters)
         self.sim_env = None
@@ -126,9 +132,9 @@ class SupervisedDataGenerator:
                 evidence_model_path=evidence_path,
                 updater_model_path=updater_path,
                 device=self.device,
-                rho_min=0.2,
-                c_min=0.2,
-                step_size=1.0
+                step_size=self.trust_step_size,
+                include_critic=False,
+                strength_cap=self.trust_strength_cap,
             )
             gnn_label = evidence_path if evidence_path else "fresh initialization"
             rl_label = updater_path if updater_path else "fresh initialization"

@@ -55,9 +55,8 @@ class TrainingConfig:
     track_negative_threshold: float = 0.20  # Below this = false track
     track_positive_threshold: float = 0.80  # Above this = legitimate track
 
-    # Confidence and cross-weight floors
-    c_min: float = 0.2
-    rho_min: float = 0.2
+    # Trust strength management
+    strength_cap: float = 100.0
 
     # Training options
     clip_rewards: bool = True  # Clip rewards for stability
@@ -86,10 +85,9 @@ class PPOTrainer:
             evidence_model_path=supervised_model_path,
             updater_model_path=None,
             device=str(self.device),
-            rho_min=config.rho_min,
-            c_min=config.c_min,
             step_size=config.step_size,
             include_critic=True,
+            strength_cap=config.strength_cap,
         )
 
         # Use the trust system's updater directly

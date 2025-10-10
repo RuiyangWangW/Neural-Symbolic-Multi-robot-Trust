@@ -34,10 +34,9 @@ class RLTrustSystem:
                  evidence_model_path: str,
                  updater_model_path: str = None,
                  device: str = 'cpu',
-                 rho_min: float = 0.2,
-                 c_min: float = 0.2,
                  step_size: float = 1.0,
                  include_critic: bool = False,
+                 strength_cap: float = 100.0,
 ):
 
         # Components
@@ -45,9 +44,8 @@ class RLTrustSystem:
         self.updater = LearnableUpdater(updater_model_path, device, include_critic=include_critic)
 
         # Hyperparameters
-        self.rho_min = rho_min
-        self.c_min = c_min
         self.step_size = step_size
+        self.strength_cap = strength_cap
 
         # Track previous trust values for delta feature computation
         self.prev_robot_trusts: Dict[int, float] = {}
@@ -58,7 +56,7 @@ class RLTrustSystem:
         # Factor 1: prediction sharpness
         pred_conf = 2 * abs(score - 0.5)
 
-        return max(self.c_min, pred_conf)  # Floor for new tracks
+        return pred_conf
 
     def get_detections_this_step(self, all_robots: List[Robot]) -> Tuple[Dict[int, List[str]], Dict[str, List[int]]]:
         """
@@ -212,6 +210,22 @@ class RLTrustSystem:
             if track:
                 track.trust_alpha += self.step_size * delta_alpha
                 track.trust_beta += self.step_size * delta_beta
+
+        # Apply strength caps to keep alpha/beta bounded
+        if self.strength_cap is not None and self.strength_cap > 0:
+            for robot in all_robots:
+                total = robot.trust_alpha + robot.trust_beta
+                if total > self.strength_cap:
+                    scale = self.strength_cap / total
+                    robot.trust_alpha *= scale
+                    robot.trust_beta *= scale
+
+            for track in track_lookup.values():
+                total = track.trust_alpha + track.trust_beta
+                if total > self.strength_cap:
+                    scale = self.strength_cap / total
+                    track.trust_alpha *= scale
+                    track.trust_beta *= scale
 
         # Refresh previous trust caches for next step
         current_robot_ids = set()

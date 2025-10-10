@@ -762,9 +762,9 @@ def main():
     parser = argparse.ArgumentParser(description='Train supervised trust prediction model')
     parser.add_argument('--data', type=str, default='supervised_trust_dataset.pkl',
                        help='Path to dataset file')
-    parser.add_argument('--epochs', type=int, default=100,
+    parser.add_argument('--epochs', type=int, default=1000,
                        help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=128,
+    parser.add_argument('--batch-size', type=int, default=256,
                        help='Batch size for training (supports both batched and individual processing)')
     parser.add_argument('--lr', type=float, default=1e-3,
                        help='Learning rate')
