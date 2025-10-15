@@ -52,7 +52,7 @@ class SupervisedDataGenerator:
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
                  max_steps_per_episode: int = 100,
-                 gnn_model_path: str = "trained_gnn_model.pth",
+                 gnn_model_path: str = "supervised_trust_model.pth",
                  rl_model_path: str = "rl_trust_model.pth",
                  device: str = 'cpu',
                  trust_step_size: float = 1.0,
