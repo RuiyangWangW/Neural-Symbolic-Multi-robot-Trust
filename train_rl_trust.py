@@ -37,7 +37,7 @@ class TrainingConfig:
 
     # Fixed padding limits (to prevent tensor size mismatches)
     max_robots: int = 50  # Maximum number of robots to pad to
-    max_tracks: int = 200  # Maximum number of tracks to pad to
+    max_tracks: int = 500  # Maximum number of tracks to pad to
 
     # Training schedule (safe starting point)
     num_episodes: int = 1000  # Total episodes for training

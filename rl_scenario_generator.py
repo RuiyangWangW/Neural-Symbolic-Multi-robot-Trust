@@ -17,6 +17,8 @@ from simulation_environment import SimulationEnvironment
 @dataclass
 class ScenarioParameters:
     """Parameters for a single RL training scenario"""
+    robot_density: float
+    target_density: float
     num_robots: int
     num_targets: int
     adversarial_ratio: float
@@ -34,12 +36,12 @@ class RLScenarioGenerator:
     """
 
     def __init__(self,
-                 num_robots_range: Tuple[int, int] = (3, 10),
-                 num_targets_range: Tuple[int, int] = (10, 30),
+                 robot_density_range: Tuple[float, float] = (0.0005, 0.0030),
+                 target_density_range: Tuple[float, float] = (0.0010, 0.0050),
                  adversarial_ratio_range: Tuple[float, float] = (0.2, 0.5),
                  false_positive_rate_range: Tuple[float, float] = (0.1, 0.7),
                  false_negative_rate_range: Tuple[float, float] = (0.0, 0.3),
-                 world_size_range: Tuple[Tuple[float, float], Tuple[float, float]] = ((40, 40), (100, 100)),
+                 world_size: float = 100.0,
                  proximal_range: float = 50.0,
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
@@ -53,12 +55,12 @@ class RLScenarioGenerator:
         Initialize RL scenario generator
 
         Args:
-            num_robots_range: Range of number of robots (min, max)
-            num_targets_range: Range of number of targets (min, max)
+            robot_density_range: Range of robot densities (min, max) per unit area
+            target_density_range: Range of target densities (min, max) per unit area
             adversarial_ratio_range: Range of adversarial robot ratios (min, max)
             false_positive_rate_range: Range of false positive rates (min, max)
             false_negative_rate_range: Range of false negative rates (min, max)
-            world_size_range: Range of world sizes ((min_x, min_y), (max_x, max_y))
+            world_size: Side length of fixed square world (meters)
             proximal_range: Communication/sensing range
             fov_range: Field of view range
             fov_angle: Field of view angle
@@ -69,12 +71,13 @@ class RLScenarioGenerator:
             curriculum_min_episodes: Minimum episodes to run at a level before considering promotion
             curriculum_progress_threshold: Average performance required to advance to the next level
         """
-        self.num_robots_range = num_robots_range
-        self.num_targets_range = num_targets_range
+        self.robot_density_range = robot_density_range
+        self.target_density_range = target_density_range
         self.adversarial_ratio_range = adversarial_ratio_range
         self.false_positive_rate_range = false_positive_rate_range
         self.false_negative_rate_range = false_negative_rate_range
-        self.world_size_range = world_size_range
+        self.world_size = (world_size, world_size)
+        self.world_area = self.world_size[0] * self.world_size[1]
         self.proximal_range = proximal_range
         self.fov_range = fov_range
         self.fov_angle = fov_angle
@@ -115,6 +118,8 @@ class RLScenarioGenerator:
         params = self._apply_curriculum_scaling(params, complexity)
 
         return ScenarioParameters(
+            robot_density=params['robot_density'],
+            target_density=params['target_density'],
             num_robots=params['num_robots'],
             num_targets=params['num_targets'],
             adversarial_ratio=params['adversarial_ratio'],
@@ -126,20 +131,25 @@ class RLScenarioGenerator:
             difficulty_level=complexity  # Low complexity = low difficulty, high complexity = high difficulty
         )
 
+    @staticmethod
+    def _sample_density(range_tuple: Tuple[float, float], step: float) -> float:
+        min_val, max_val = range_tuple
+        min_val = float(min_val)
+        max_val = float(max_val)
+        if max_val <= min_val + 1e-9:
+            return min_val
+        step = max(step, 1e-6)
+        steps = max(1, int(round((max_val - min_val) / step)))
+        idx = random.randint(0, steps)
+        return round(min_val + idx * step, 8)
+
     def _sample_base_parameters(self) -> Dict:
         """Sample base parameters with increments like supervised data generation"""
 
-        # Sample num_robots
-        num_robots = random.randint(self.num_robots_range[0], self.num_robots_range[1])
-
-        # Sample num_targets with increment of 5
-        min_targets, max_targets = self.num_targets_range
-        target_steps = (max_targets - min_targets) // 5
-        if target_steps > 0:
-            target_step = random.randint(0, target_steps)
-            num_targets = min_targets + (target_step * 5)
-        else:
-            num_targets = min_targets
+        robot_density = self._sample_density(self.robot_density_range, 0.0001)
+        target_density = self._sample_density(self.target_density_range, 0.0001)
+        num_robots = max(1, int(round(robot_density * self.world_area)))
+        num_targets = max(1, int(round(target_density * self.world_area)))
 
         # Sample adversarial_ratio with increment of 0.1
         min_adv, max_adv = self.adversarial_ratio_range
@@ -168,26 +178,18 @@ class RLScenarioGenerator:
         else:
             false_negative_rate = min_fn
 
-        # Sample world_size with increment of 10
-        min_world, max_world = self.world_size_range
-        min_size, max_size = min_world[0], max_world[0]
-        size_steps = int((max_size - min_size) / 10)
-        if size_steps > 0:
-            size_step = random.randint(0, size_steps)
-            world_size = min_size + (size_step * 10)
-        else:
-            world_size = min_size
-
         # Use fixed episode length
         episode_length = self.episode_length
 
         return {
+            'robot_density': robot_density,
+            'target_density': target_density,
             'num_robots': num_robots,
             'num_targets': num_targets,
             'adversarial_ratio': adversarial_ratio,
             'false_positive_rate': false_positive_rate,
             'false_negative_rate': false_negative_rate,
-            'world_size': (world_size, world_size),
+            'world_size': self.world_size,
             'episode_length': episode_length
         }
 
@@ -202,32 +204,18 @@ class RLScenarioGenerator:
         if not self.curriculum_learning:
             return params
 
-        # Start with MIN robots/targets and gradually increase to larger scenarios
-        robot_range_size = self.num_robots_range[1] - self.num_robots_range[0]
-        target_range_size = self.num_targets_range[1] - self.num_targets_range[0]
-        world_range_size = self.world_size_range[1][0] - self.world_size_range[0][0]
+        # Start with lower densities and gradually increase
+        min_robot_density, max_robot_density = self.robot_density_range
+        min_target_density, max_target_density = self.target_density_range
 
-        # complexity = 0.0: use min values (fewer robots/targets)
-        # complexity = 1.0: use max values (lots of robots/targets)
-        curriculum_robots = int(self.num_robots_range[0] + complexity * robot_range_size)
-        curriculum_targets = int(self.num_targets_range[0] + complexity * target_range_size)
-        curriculum_world = self.world_size_range[0][0] + complexity * world_range_size
+        curriculum_robot_density = min_robot_density + complexity * (max_robot_density - min_robot_density)
+        curriculum_target_density = min_target_density + complexity * (max_target_density - min_target_density)
 
-        # Ensure at least minimum values
-        curriculum_robots = max(self.num_robots_range[0], curriculum_robots)
-        curriculum_targets = max(self.num_targets_range[0], curriculum_targets)
-        max_world = self.world_size_range[1][0]
-        curriculum_world = max(self.world_size_range[0][0], min(curriculum_world, max_world))
-
-        # Override base parameters with curriculum-adjusted values
-        params['num_robots'] = curriculum_robots
-        params['num_targets'] = curriculum_targets
-        params['world_size'] = (curriculum_world, curriculum_world)
-
-        # Keep adversarial parameters as randomly sampled (no curriculum scaling)
-        # Only num_robots and num_targets follow curriculum progression
-
-        # Use fixed episode length (no curriculum scaling for episode length)
+        params['robot_density'] = float(curriculum_robot_density)
+        params['target_density'] = float(curriculum_target_density)
+        params['num_robots'] = max(1, int(round(params['robot_density'] * self.world_area)))
+        params['num_targets'] = max(1, int(round(params['target_density'] * self.world_area)))
+        params['world_size'] = self.world_size
         params['episode_length'] = self.episode_length
 
         return params
@@ -244,10 +232,10 @@ class RLScenarioGenerator:
         """
         # Create simulation environment
         sim_env = SimulationEnvironment(
-            num_robots=params.num_robots,
-            num_targets=params.num_targets,
-            adversarial_ratio=params.adversarial_ratio,
             world_size=params.world_size,
+            robot_density=params.robot_density,
+            target_density=params.target_density,
+            adversarial_ratio=params.adversarial_ratio,
             false_positive_rate=params.false_positive_rate,
             false_negative_rate=params.false_negative_rate,
             proximal_range=params.proximal_range,
@@ -393,8 +381,8 @@ if __name__ == "__main__":
     # Create scenario generator
     generator = RLScenarioGenerator(
         curriculum_learning=True,
-        num_robots_range=(3, 8),
-        num_targets_range=(10, 30),
+        robot_density_range=(0.0004, 0.0008),
+        target_density_range=(0.0016, 0.0030),
         adversarial_ratio_range=(0.0, 0.6)
     )
 
@@ -409,8 +397,8 @@ if __name__ == "__main__":
         print(f"\nEpisode {episode}:")
         print(f"  Curriculum level: {stats['current_level']} / {stats['levels_total'] - 1}")
         print(f"  Difficulty: {stats['difficulty']:.3f}")
-        print(f"  Robots: {params.num_robots} (range: {generator.num_robots_range})")
-        print(f"  Targets: {params.num_targets} (range: {generator.num_targets_range})")
+        print(f"  Robots: {params.num_robots} (density: {params.robot_density:.6f})")
+        print(f"  Targets: {params.num_targets} (density: {params.target_density:.6f})")
         print(f"  Adversarial ratio: {params.adversarial_ratio:.1f}")
         print(f"  False positive rate: {params.false_positive_rate:.1f}")
         print(f"  Episode length: {params.episode_length}")

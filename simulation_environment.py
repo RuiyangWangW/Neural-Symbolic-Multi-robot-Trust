@@ -42,22 +42,25 @@ class GroundTruthObject:
 class SimulationEnvironment:
     """Multi-robot simulation environment with pluggable trust algorithms"""
     
-    def __init__(self, num_robots: int = 5, num_targets: int = 10, 
-                 world_size: Tuple[float, float] = (60.0, 60.0),
+    def __init__(self,
+                 world_size: Tuple[float, float] = (100.0, 100.0),
+                 robot_density: float = 0.0005,
+                 target_density: float = 0.002,
                  adversarial_ratio: float = 0.3,
                  proximal_range: float = 100.0,
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
                  false_positive_rate: float = 0.5,
-                 false_negative_rate: float = 0.0
-):
+                 false_negative_rate: float = 0.0,
+                 num_robots: Optional[int] = None,
+                 num_targets: Optional[int] = None):
         """
         Initialize simulation environment
         
         Args:
-            num_robots: Number of robots in the simulation
-            num_targets: Number of ground truth objects
-            world_size: Size of the simulation world
+            world_size: Size of the simulation world (fixed for density-based configuration)
+            robot_density: Robots per unit area (used when num_robots not provided)
+            target_density: Ground-truth targets per unit area (used when num_targets not provided)
             adversarial_ratio: Fraction of robots that are adversarial
             proximal_range: Maximum distance for robots to be considered proximal
             fov_range: Field of view range for robots (default: 20.0)
@@ -65,9 +68,23 @@ class SimulationEnvironment:
             false_positive_rate: Rate of false positive detections (default: 0.5)
             false_negative_rate: Rate of false negative detections (default: 0.0)
         """
-        self.num_robots = num_robots
-        self.num_targets = num_targets
         self.world_size = world_size
+        self.area = self.world_size[0] * self.world_size[1]
+
+        if num_robots is not None:
+            self.num_robots = max(1, int(num_robots))
+            self.robot_density = self.num_robots / self.area
+        else:
+            self.robot_density = max(1e-6, float(robot_density))
+            self.num_robots = max(1, int(round(self.robot_density * self.area)))
+
+        if num_targets is not None:
+            self.num_targets = max(1, int(num_targets))
+            self.target_density = self.num_targets / self.area
+        else:
+            self.target_density = max(1e-6, float(target_density))
+            self.num_targets = max(1, int(round(self.target_density * self.area)))
+
         self.adversarial_ratio = adversarial_ratio
         self.proximal_range = proximal_range
         self.fov_range = fov_range
@@ -815,7 +832,9 @@ def main():
     # Test with paper's algorithm first
     print("\n=== Testing with Paper's Trust Algorithm ===")
     env_paper = SimulationEnvironment(
-        num_robots=5, num_targets=20, world_size=(60.0, 60.0)
+        world_size=(100.0, 100.0),
+        robot_density=0.0005,
+        target_density=0.0020
     )
     
     # Initialize paper trust algorithm

@@ -42,10 +42,10 @@ class SupervisedDataGenerator:
     """
 
     def __init__(self,
-                 num_robots: Union[int, Tuple[int, int]] = 5,
-                 num_targets: Union[int, Tuple[int, int]] = 20,
+                 robot_density: Union[float, Tuple[float, float]] = 0.0005,
+                 target_density: Union[float, Tuple[float, float]] = 0.0020,
                  adversarial_ratio: Union[float, Tuple[float, float]] = 0.5,
-                 world_size: Union[Tuple[float, float], Tuple[Tuple[float, float], Tuple[float, float]]] = (60, 60),
+                 world_size: Tuple[float, float] = (100.0, 100.0),
                  false_positive_rate: Union[float, Tuple[float, float]] = 0.5,
                  false_negative_rate: Union[float, Tuple[float, float]] = 0.0,
                  proximal_range: float = 50.0,
@@ -80,17 +80,10 @@ class SupervisedDataGenerator:
         self.max_steps_per_episode = max_steps_per_episode
 
         # Store parameter ranges for sampling
-        self.num_robots_range = num_robots if isinstance(num_robots, tuple) else (num_robots, num_robots)
-        self.num_targets_range = num_targets if isinstance(num_targets, tuple) else (num_targets, num_targets)
+        self.robot_density_range = robot_density if isinstance(robot_density, tuple) else (robot_density, robot_density)
+        self.target_density_range = target_density if isinstance(target_density, tuple) else (target_density, target_density)
         self.adversarial_ratio_range = adversarial_ratio if isinstance(adversarial_ratio, tuple) else (adversarial_ratio, adversarial_ratio)
-
-        # Handle world_size range - check if it's a range of tuples or a single tuple
-        if isinstance(world_size, tuple) and len(world_size) == 2 and isinstance(world_size[0], tuple):
-            # Range format: ((min_x, min_y), (max_x, max_y))
-            self.world_size_range = world_size
-        else:
-            # Single size format: (x, y)
-            self.world_size_range = (world_size, world_size)
+        self.world_size = world_size
 
         self.false_positive_rate_range = false_positive_rate if isinstance(false_positive_rate, tuple) else (false_positive_rate, false_positive_rate)
         self.false_negative_rate_range = false_negative_rate if isinstance(false_negative_rate, tuple) else (false_negative_rate, false_negative_rate)
@@ -163,6 +156,21 @@ class SupervisedDataGenerator:
 
         return frame_data
 
+    @staticmethod
+    def _sample_density(range_tuple: Tuple[float, float], step: float) -> float:
+        """Sample a density value within a range using discrete increments for reproducibility."""
+        min_val, max_val = range_tuple
+        min_val = float(min_val)
+        max_val = float(max_val)
+
+        if max_val <= min_val + 1e-9:
+            return min_val
+
+        step = max(step, 1e-6)
+        steps = max(1, int(round((max_val - min_val) / step)))
+        idx = random.randint(0, steps)
+        return round(min_val + idx * step, 8)
+
     def _sample_episode_parameters(self) -> Dict:
         """
         Sample parameters for a single episode from the specified ranges with specific increments
@@ -170,17 +178,12 @@ class SupervisedDataGenerator:
         Returns:
             Dictionary containing sampled parameters
         """
-        # Sample integer parameters
-        num_robots = random.randint(self.num_robots_range[0], self.num_robots_range[1])
-
-        # Sample num_targets with increment of 5 from lower bound
-        min_targets, max_targets = self.num_targets_range
-        target_steps = (max_targets - min_targets) // 5
-        if target_steps > 0:
-            target_step = random.randint(0, target_steps)
-            num_targets = min_targets + (target_step * 5)
-        else:
-            num_targets = min_targets
+        # Sample density-driven population sizes
+        robot_density = self._sample_density(self.robot_density_range, step=0.0001)
+        target_density = self._sample_density(self.target_density_range, step=0.0001)
+        area = self.world_size[0] * self.world_size[1]
+        num_robots = max(1, int(round(robot_density * area)))
+        num_targets = max(1, int(round(target_density * area)))
 
         # Sample adversarial_ratio with increment of 0.1
         min_adv, max_adv = self.adversarial_ratio_range
@@ -209,25 +212,15 @@ class SupervisedDataGenerator:
         else:
             false_negative_rate = min_fn
 
-        # Sample world_size with increment of 10 (square world: x = y)
-        min_world, max_world = self.world_size_range
-
-        # Sample square world size (same for both x and y)
-        min_size, max_size = min_world[0], max_world[0]  # Use x dimension for both
-        size_steps = int((max_size - min_size) / 10)
-        if size_steps > 0:
-            size_step = random.randint(0, size_steps)
-            world_size = min_size + (size_step * 10)
-        else:
-            world_size = min_size
-
         return {
+            'robot_density': robot_density,
+            'target_density': target_density,
             'num_robots': num_robots,
             'num_targets': num_targets,
             'adversarial_ratio': adversarial_ratio,
             'false_positive_rate': false_positive_rate,
             'false_negative_rate': false_negative_rate,
-            'world_size': (world_size, world_size),  # Square world
+            'world_size': self.world_size,
             'proximal_range': self.proximal_range  # Fixed value
         }
 
@@ -239,10 +232,10 @@ class SupervisedDataGenerator:
             params: Dictionary of sampled parameters
         """
         self.sim_env = SimulationEnvironment(
-            num_robots=params['num_robots'],
-            num_targets=params['num_targets'],
+            world_size=self.world_size,
+            robot_density=params['robot_density'],
+            target_density=params['target_density'],
             adversarial_ratio=params['adversarial_ratio'],
-            world_size=params['world_size'],
             false_positive_rate=params['false_positive_rate'],
             false_negative_rate=params['false_negative_rate'],
             proximal_range=params['proximal_range'],
@@ -389,12 +382,12 @@ class SupervisedDataGenerator:
         """
         print(f"🔄 Generating supervised dataset with {num_episodes} episodes...")
         print(f"📊 Parameter ranges:")
-        print(f"   - Robots: {self.num_robots_range}")
-        print(f"   - Targets: {self.num_targets_range}")
+        print(f"   - Robot density: {self.robot_density_range}")
+        print(f"   - Target density: {self.target_density_range}")
         print(f"   - Adversarial ratio: {self.adversarial_ratio_range}")
         print(f"   - False positive rate: {self.false_positive_rate_range}")
         print(f"   - False negative rate: {self.false_negative_rate_range}")
-        print(f"   - World size (square): {self.world_size_range[0][0]} to {self.world_size_range[1][0]}")
+        print(f"   - World size (square): {self.world_size[0]} x {self.world_size[1]}")
         print(f"   - Proximal range (fixed): {self.proximal_range}")
         print(f"⏱️  Max steps per episode: {self.max_steps_per_episode}")
         gnn_label = str(self.gnn_model_path) if self.gnn_model_path and self.gnn_model_path.exists() else ("fresh initialization" if self.gnn_model_path is None else f"{self.gnn_model_path} (fresh init)")
@@ -461,6 +454,16 @@ class SupervisedDataGenerator:
                     'max': max(p['num_targets'] for p in all_episode_params),
                     'avg': np.mean([p['num_targets'] for p in all_episode_params])
                 },
+                'robot_density': {
+                    'min': min(p['robot_density'] for p in all_episode_params),
+                    'max': max(p['robot_density'] for p in all_episode_params),
+                    'avg': np.mean([p['robot_density'] for p in all_episode_params])
+                },
+                'target_density': {
+                    'min': min(p['target_density'] for p in all_episode_params),
+                    'max': max(p['target_density'] for p in all_episode_params),
+                    'avg': np.mean([p['target_density'] for p in all_episode_params])
+                },
                 'adversarial_ratio': {
                     'min': min(p['adversarial_ratio'] for p in all_episode_params),
                     'max': max(p['adversarial_ratio'] for p in all_episode_params),
@@ -507,12 +510,12 @@ class SupervisedDataGenerator:
             'samples': all_data,
             'episode_parameters': all_episode_params,
             'parameter_ranges': {
-                'num_robots': self.num_robots_range,
-                'num_targets': self.num_targets_range,
+                'robot_density': self.robot_density_range,
+                'target_density': self.target_density_range,
                 'adversarial_ratio': self.adversarial_ratio_range,
                 'false_positive_rate': self.false_positive_rate_range,
                 'false_negative_rate': self.false_negative_rate_range,
-                'world_size': self.world_size_range,
+                'world_size': self.world_size,
                 'proximal_range': self.proximal_range  # Fixed value
             },
             'statistics': {
@@ -550,18 +553,18 @@ def main():
     parser = argparse.ArgumentParser(description='Generate supervised trust learning dataset with diverse parameters')
     parser.add_argument('--episodes', type=int, default=10,
                        help='Number of episodes to generate (default: 10)')
-    parser.add_argument('--robots', type=str, default='3,10',
-                       help='Number of robots: single value or range "min,max" (default: 3,10)')
-    parser.add_argument('--targets', type=str, default='10,30',
-                       help='Number of targets: single value or range "min,max" (default: 10,30)')
+    parser.add_argument('--robot-density', type=str, default='0.0005,0.0030',
+                       help='Robot density range in robots per square unit (default: 0.0005,0.0030)')
+    parser.add_argument('--target-density', type=str, default='0.0010,0.0050',
+                       help='Target density range in objects per square unit (default: 0.0010,0.0050)')
     parser.add_argument('--adversarial-ratio', type=str, default='0.2,0.5',
                        help='Adversarial robot ratio: single value or range "min,max" (default: 0.2,0.5)')
     parser.add_argument('--false-positive-rate', type=str, default='0.1,0.7',
                        help='False positive rate: single value or range "min,max" (default: 0.1,0.7)')
     parser.add_argument('--false-negative-rate', type=str, default='0.0,0.3',
                        help='False negative rate: single value or range "min,max" (default: 0.0,0.3)')
-    parser.add_argument('--world-size', type=str, default='50,100',
-                       help='Square world size: single value or range "min,max" (default: 50,100)')
+    parser.add_argument('--world-size', type=float, default=100.0,
+                       help='Side length of the square world (fixed, default: 100.0)')
     parser.add_argument('--proximal-range', type=float, default=50.0,
                        help='Proximal sensing range: fixed value (default: 50.0)')
     parser.add_argument('--steps', type=int, default=100,
@@ -575,36 +578,29 @@ def main():
     args = parser.parse_args()
 
     # Parse parameter ranges
-    robots_range = parse_range(args.robots)
-    targets_range = parse_range(args.targets)
+    robot_density_range = parse_range(args.robot_density)
+    target_density_range = parse_range(args.target_density)
     adversarial_ratio_range = parse_range(args.adversarial_ratio)
     false_positive_rate_range = parse_range(args.false_positive_rate)
     false_negative_rate_range = parse_range(args.false_negative_rate)
-    world_size_range = parse_range(args.world_size)
-
-    # Convert robot and target ranges to integers
-    robots_range = (int(robots_range[0]), int(robots_range[1]))
-    targets_range = (int(targets_range[0]), int(targets_range[1]))
-
-    # Convert world size range to square format: ((min, min), (max, max))
-    world_size_range = ((world_size_range[0], world_size_range[0]),
-                       (world_size_range[1], world_size_range[1]))
+    world_size_value = float(args.world_size)
+    world_size = (world_size_value, world_size_value)
 
     print(f"🎯 Using parameter ranges:")
-    print(f"   - Robots: {robots_range}")
-    print(f"   - Targets: {targets_range}")
+    print(f"   - Robot density: {robot_density_range}")
+    print(f"   - Target density: {target_density_range}")
     print(f"   - Adversarial ratio: {adversarial_ratio_range}")
     print(f"   - False positive rate: {false_positive_rate_range}")
     print(f"   - False negative rate: {false_negative_rate_range}")
-    print(f"   - World size (square): {world_size_range[0][0]} to {world_size_range[1][0]}")
+    print(f"   - World size (square): {world_size_value} x {world_size_value}")
     print(f"   - Proximal range (fixed): {args.proximal_range}")
 
     # Create data generator
     generator = SupervisedDataGenerator(
-        num_robots=robots_range,
-        num_targets=targets_range,
+        robot_density=robot_density_range,
+        target_density=target_density_range,
         adversarial_ratio=adversarial_ratio_range,
-        world_size=world_size_range,
+        world_size=world_size,
         false_positive_rate=false_positive_rate_range,
         false_negative_rate=false_negative_rate_range,
         proximal_range=args.proximal_range,

@@ -32,11 +32,11 @@ class TrustMethodComparison:
     def __init__(self,
                  supervised_model_path: str = "trained_gnn_model.pth",
                  rl_model_path: str = "rl_trust_model.pth",
-                 num_robots: int = 5,
-                 num_targets: int = 10,
+                 robot_density: float = 0.0005,
+                 target_density: float = 0.002,
                  num_timesteps: int = 500,
                  random_seed: int = 42,
-                 world_size: float = 60.0,
+                 world_size: float = 100.0,
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
                  fixed_step_scale: float = 0.5):
@@ -46,21 +46,24 @@ class TrustMethodComparison:
         Args:
             supervised_model_path: Path to trained supervised trust model
             rl_model_path: Path to trained RL trust model
-            num_robots: Number of robots in simulation
-            num_targets: Number of ground truth targets
+            robot_density: Robots per unit area in the fixed world
+            target_density: Ground-truth targets per unit area in the fixed world
             num_timesteps: Number of simulation steps
             random_seed: Random seed for reproducibility
-            world_size: Size of the simulation world
+            world_size: Side length of the (square) simulation world
             fov_range: Field of view range for robots
             fov_angle: Field of view angle for robots
         """
         self.supervised_model_path = Path(supervised_model_path) if supervised_model_path else None
         self.rl_model_path = Path(rl_model_path) if rl_model_path else None
-        self.num_robots = num_robots
-        self.num_targets = num_targets
+        self.world_size = float(world_size)
+        self.world_area = self.world_size * self.world_size
+        self.robot_density = float(robot_density)
+        self.target_density = float(target_density)
+        self.num_robots = max(1, int(round(self.robot_density * self.world_area)))
+        self.num_targets = max(1, int(round(self.target_density * self.world_area)))
         self.num_timesteps = num_timesteps
         self.random_seed = random_seed
-        self.world_size = world_size
         self.fov_range = fov_range
         self.fov_angle = fov_angle
         self.fixed_step_scale = max(0.0, min(1.0, fixed_step_scale))
@@ -176,9 +179,9 @@ class TrustMethodComparison:
             random.seed(self.random_seed)
             torch.manual_seed(self.random_seed)
             env = SimulationEnvironment(
-                num_robots=self.num_robots,
-                num_targets=self.num_targets,
                 world_size=(self.world_size, self.world_size),
+                robot_density=self.robot_density,
+                target_density=self.target_density,
                 adversarial_ratio=self.adversarial_ratio,
                 proximal_range=self.proximal_range,
                 fov_range=self.fov_range,
@@ -277,6 +280,13 @@ class TrustMethodComparison:
 
         results = []
 
+        def classify_track_object(object_id: str) -> str:
+            if object_id.startswith("gt_"):
+                return "ground_truth"
+            if object_id.startswith("fp_"):
+                return "false_positive"
+            return "unknown"
+
         for step in range(self.num_timesteps):
             # CRITICAL: Reset random seed for each step to ensure identical randomness
             step_seed = self.random_seed + step
@@ -324,6 +334,83 @@ class TrustMethodComparison:
                     for track in robot.get_all_tracks()
                 }
 
+            # Store per-frame robot state and detections for downstream visualisations
+            robot_states = []
+            robot_detections = {}
+            ego_graph_snapshots = {}
+
+            for robot in env.robots:
+                robot_states.append({
+                    'id': robot.id,
+                    'position': robot.position[:2].tolist() if hasattr(robot.position, '__iter__') else [float(robot.position)],
+                    'orientation': float(getattr(robot, 'orientation', 0.0)),
+                    'trust_value': float(robot.trust_value),
+                    'is_adversarial': bool(robot.is_adversarial),
+                    'fov_range': float(robot.fov_range),
+                    'fov_angle': float(robot.fov_angle),
+                    'velocity': robot.velocity[:2].tolist() if hasattr(robot.velocity, '__iter__') else [float(robot.velocity)],
+                })
+
+                detections = []
+                for track in robot.get_current_timestep_tracks():
+                    detections.append({
+                        'track_id': track.track_id,
+                        'object_id': track.object_id,
+                        'position': track.position[:2].tolist() if hasattr(track.position, '__iter__') else [float(track.position)],
+                        'type': classify_track_object(track.object_id),
+                        'trust_value': float(track.trust_value),
+                    })
+                robot_detections[str(robot.id)] = detections
+
+                # Capture ego-graph snapshot if GNN evidence is available
+                if trust_system.evidence_extractor.available:
+                    try:
+                        ego_result = trust_system.evidence_extractor.predictor.predict_from_robots_tracks(robot, env.robots)
+                        predictions = ego_result['predictions']
+                        graph_data = ego_result['graph_data']
+
+                        agent_scores_array = predictions.get('agent', {}).get('trust_scores', [])
+                        track_scores_array = predictions.get('track', {}).get('trust_scores', [])
+                        agent_nodes = getattr(graph_data, 'agent_nodes', {})
+                        track_nodes = getattr(graph_data, 'track_nodes', {})
+
+                        agent_scores = {}
+                        for agent_id, idx in agent_nodes.items():
+                            if idx < len(agent_scores_array):
+                                agent_scores[str(agent_id)] = float(np.clip(np.asarray(agent_scores_array[idx]).item(), 0.0, 1.0))
+                            else:
+                                agent_scores[str(agent_id)] = 0.5
+
+                        track_scores = {}
+                        for track_id, idx in track_nodes.items():
+                            if idx < len(track_scores_array):
+                                track_scores[track_id] = float(np.clip(np.asarray(track_scores_array[idx]).item(), 0.0, 1.0))
+                            else:
+                                track_scores[track_id] = 0.5
+
+                        edge_index = {}
+                        for edge_type, edge_tensor in graph_data.edge_index_dict.items():
+                            key = "|".join(edge_type)
+                            edge_index[key] = edge_tensor.detach().cpu().numpy().tolist()
+
+                        ego_graph_snapshots[str(robot.id)] = {
+                            'agent_nodes': {str(rid): idx for rid, idx in agent_nodes.items()},
+                            'track_nodes': track_nodes,
+                            'agent_scores': agent_scores,
+                            'track_scores': track_scores,
+                            'edges': edge_index,
+                        }
+                    except Exception as graph_err:
+                        print(f"⚠️ Failed to capture ego graph for robot {robot.id} at step {step}: {graph_err}")
+
+            step_result['frame_state'] = {
+                'world_size': list(env.world_size),
+                'robots': robot_states,
+                'detections': robot_detections,
+            }
+            if ego_graph_snapshots:
+                step_result['ego_graphs'] = ego_graph_snapshots
+
             results.append(step_result)
 
             if step % 100 == 0:
@@ -335,7 +422,11 @@ class TrustMethodComparison:
     def run_comparison(self) -> Dict:
         """Run complete comparison between both methods"""
         print("🔄 Starting trust method comparison...")
-        print(f"Configuration: {self.num_robots} robots, {self.num_targets} targets, {self.num_timesteps} steps")
+        print(
+            f"Configuration: world={self.world_size}m, robots={self.num_robots} "
+            f"(density {self.robot_density:.6f}), targets={self.num_targets} "
+            f"(density {self.target_density:.6f}), steps={self.num_timesteps}"
+        )
         print(f"Random seed: {self.random_seed}")
 
         # Create identical environments for each method
@@ -354,8 +445,11 @@ class TrustMethodComparison:
         # Generate comparison results
         comparison_results = {
             'configuration': {
-                'num_robots': self.num_robots,
-                'num_targets': self.num_targets,
+                'world_size': self.world_size,
+                'robot_density': self.robot_density,
+                'target_density': self.target_density,
+                'derived_num_robots': self.num_robots,
+                'derived_num_targets': self.num_targets,
                 'num_timesteps': self.num_timesteps,
                 'random_seed': self.random_seed,
                 'rl_model_path': str(self.rl_model_path) if self.rl_model_path else None,
@@ -637,7 +731,11 @@ class TrustMethodComparison:
 
         metrics = self._compute_comparison_metrics()
 
-        print(f"Configuration: {self.num_robots} robots, {self.num_timesteps} steps, seed {self.random_seed}")
+        print(
+            f"Configuration: world={self.world_size}m, robots≈{self.num_robots} "
+            f"(density {self.robot_density:.6f}), targets≈{self.num_targets} "
+            f"(density {self.target_density:.6f}), steps={self.num_timesteps}, seed {self.random_seed}"
+        )
         rl_label = str(self.rl_model_path) if self.rl_model_path else "fresh initialization"
         print(f"RL Model: {rl_label}")
         print(f"Fixed Step Scale: {self.fixed_step_scale:.2f}")
@@ -695,10 +793,10 @@ def main():
     # =============================================================================
 
     # Simulation Parameters
-    NUM_ROBOTS = 10
-    NUM_TARGETS = 20
+    ROBOT_DENSITY = 0.0010  # ≈10 robots in 100x100 world
+    TARGET_DENSITY = 0.0020  # ≈20 targets in 100x100 world
     NUM_TIMESTEPS = 100
-    RANDOM_SEED = 8
+    RANDOM_SEED = 42
 
     # Environment Parameters
     WORLD_SIZE = 100.0
@@ -726,7 +824,7 @@ def main():
         {
             "name": "Scenario_3_Low_FP_High_FN",
             "false_positive_rate": 0.3,
-            "false_negative_rate": 0.5
+            "false_negative_rate": 0.3
         }
     ]
 
@@ -758,8 +856,8 @@ def main():
         comparison = TrustMethodComparison(
             supervised_model_path=SUPERVISED_MODEL_PATH,
             rl_model_path=RL_MODEL_PATH,
-            num_robots=NUM_ROBOTS,
-            num_targets=NUM_TARGETS,
+            robot_density=ROBOT_DENSITY,
+            target_density=TARGET_DENSITY,
             num_timesteps=NUM_TIMESTEPS,
             random_seed=RANDOM_SEED,
             world_size=WORLD_SIZE,
@@ -863,10 +961,12 @@ def main():
         'scenarios': all_results,
         'summary_statistics': summary_stats,
         'configuration': {
-            'num_robots': NUM_ROBOTS,
-            'num_targets': NUM_TARGETS,
-            'adversarial_ratio': ADVERSARIAL_RATIO,
             'world_size': WORLD_SIZE,
+            'robot_density': ROBOT_DENSITY,
+            'target_density': TARGET_DENSITY,
+            'derived_num_robots': int(round(ROBOT_DENSITY * WORLD_SIZE * WORLD_SIZE)),
+            'derived_num_targets': int(round(TARGET_DENSITY * WORLD_SIZE * WORLD_SIZE)),
+            'adversarial_ratio': ADVERSARIAL_RATIO,
             'proximal_range': PROXIMAL_RANGE,
             'fov_range': FOV_RANGE,
             'fov_angle': 'π/3',
