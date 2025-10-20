@@ -19,6 +19,7 @@ class ScenarioParameters:
     """Parameters for a single RL training scenario"""
     robot_density: float
     target_density: float
+    target_density_multiplier: float
     num_robots: int
     num_targets: int
     adversarial_ratio: float
@@ -37,7 +38,7 @@ class RLScenarioGenerator:
 
     def __init__(self,
                  robot_density_range: Tuple[float, float] = (0.0005, 0.0030),
-                 target_density_range: Tuple[float, float] = (0.0010, 0.0050),
+                 target_density_multiplier_range: Union[float, Tuple[float, float]] = (2.0, 2.0),
                  adversarial_ratio_range: Tuple[float, float] = (0.2, 0.5),
                  false_positive_rate_range: Tuple[float, float] = (0.1, 0.7),
                  false_negative_rate_range: Tuple[float, float] = (0.0, 0.3),
@@ -56,7 +57,7 @@ class RLScenarioGenerator:
 
         Args:
             robot_density_range: Range of robot densities (min, max) per unit area
-            target_density_range: Range of target densities (min, max) per unit area
+            target_density_multiplier_range: Range or fixed multiplier applied to sampled robot density
             adversarial_ratio_range: Range of adversarial robot ratios (min, max)
             false_positive_rate_range: Range of false positive rates (min, max)
             false_negative_rate_range: Range of false negative rates (min, max)
@@ -72,7 +73,11 @@ class RLScenarioGenerator:
             curriculum_progress_threshold: Average performance required to advance to the next level
         """
         self.robot_density_range = robot_density_range
-        self.target_density_range = target_density_range
+        if isinstance(target_density_multiplier_range, tuple):
+            self.target_density_multiplier_range = target_density_multiplier_range
+        else:
+            self.target_density_multiplier_range = (target_density_multiplier_range,
+                                                    target_density_multiplier_range)
         self.adversarial_ratio_range = adversarial_ratio_range
         self.false_positive_rate_range = false_positive_rate_range
         self.false_negative_rate_range = false_negative_rate_range
@@ -120,6 +125,7 @@ class RLScenarioGenerator:
         return ScenarioParameters(
             robot_density=params['robot_density'],
             target_density=params['target_density'],
+            target_density_multiplier=params['target_density_multiplier'],
             num_robots=params['num_robots'],
             num_targets=params['num_targets'],
             adversarial_ratio=params['adversarial_ratio'],
@@ -147,7 +153,8 @@ class RLScenarioGenerator:
         """Sample base parameters with increments like supervised data generation"""
 
         robot_density = self._sample_density(self.robot_density_range, 0.0001)
-        target_density = self._sample_density(self.target_density_range, 0.0001)
+        target_multiplier = self._sample_density(self.target_density_multiplier_range, 0.1)
+        target_density = round(robot_density * target_multiplier, 8)
         num_robots = max(1, int(round(robot_density * self.world_area)))
         num_targets = max(1, int(round(target_density * self.world_area)))
 
@@ -184,6 +191,7 @@ class RLScenarioGenerator:
         return {
             'robot_density': robot_density,
             'target_density': target_density,
+            'target_density_multiplier': target_multiplier,
             'num_robots': num_robots,
             'num_targets': num_targets,
             'adversarial_ratio': adversarial_ratio,
@@ -206,12 +214,14 @@ class RLScenarioGenerator:
 
         # Start with lower densities and gradually increase
         min_robot_density, max_robot_density = self.robot_density_range
-        min_target_density, max_target_density = self.target_density_range
+        min_target_multiplier, max_target_multiplier = self.target_density_multiplier_range
 
         curriculum_robot_density = min_robot_density + complexity * (max_robot_density - min_robot_density)
-        curriculum_target_density = min_target_density + complexity * (max_target_density - min_target_density)
+        curriculum_target_multiplier = min_target_multiplier + complexity * (max_target_multiplier - min_target_multiplier)
+        curriculum_target_density = round(curriculum_robot_density * curriculum_target_multiplier, 8)
 
         params['robot_density'] = float(curriculum_robot_density)
+        params['target_density_multiplier'] = float(curriculum_target_multiplier)
         params['target_density'] = float(curriculum_target_density)
         params['num_robots'] = max(1, int(round(params['robot_density'] * self.world_area)))
         params['num_targets'] = max(1, int(round(params['target_density'] * self.world_area)))
@@ -382,7 +392,7 @@ if __name__ == "__main__":
     generator = RLScenarioGenerator(
         curriculum_learning=True,
         robot_density_range=(0.0004, 0.0008),
-        target_density_range=(0.0016, 0.0030),
+        target_density_multiplier_range=(3.0, 4.0),
         adversarial_ratio_range=(0.0, 0.6)
     )
 
@@ -398,6 +408,7 @@ if __name__ == "__main__":
         print(f"  Curriculum level: {stats['current_level']} / {stats['levels_total'] - 1}")
         print(f"  Difficulty: {stats['difficulty']:.3f}")
         print(f"  Robots: {params.num_robots} (density: {params.robot_density:.6f})")
+        print(f"  Target multiplier: {params.target_density_multiplier:.2f}")
         print(f"  Targets: {params.num_targets} (density: {params.target_density:.6f})")
         print(f"  Adversarial ratio: {params.adversarial_ratio:.1f}")
         print(f"  False positive rate: {params.false_positive_rate:.1f}")

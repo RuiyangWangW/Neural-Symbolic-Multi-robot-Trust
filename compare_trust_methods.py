@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import json
 import types
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 # Import required modules
 from simulation_environment import SimulationEnvironment
@@ -33,7 +33,8 @@ class TrustMethodComparison:
                  supervised_model_path: str = "trained_gnn_model.pth",
                  rl_model_path: str = "rl_trust_model.pth",
                  robot_density: float = 0.0005,
-                 target_density: float = 0.002,
+                 target_density_multiplier: Optional[float] = 2.0,
+                 target_density: Optional[float] = None,
                  num_timesteps: int = 500,
                  random_seed: int = 42,
                  world_size: float = 100.0,
@@ -47,7 +48,8 @@ class TrustMethodComparison:
             supervised_model_path: Path to trained supervised trust model
             rl_model_path: Path to trained RL trust model
             robot_density: Robots per unit area in the fixed world
-            target_density: Ground-truth targets per unit area in the fixed world
+            target_density_multiplier: Multiplier applied to robot density to derive target density
+            target_density: Optional explicit target density (overrides multiplier if provided)
             num_timesteps: Number of simulation steps
             random_seed: Random seed for reproducibility
             world_size: Side length of the (square) simulation world
@@ -59,7 +61,18 @@ class TrustMethodComparison:
         self.world_size = float(world_size)
         self.world_area = self.world_size * self.world_size
         self.robot_density = float(robot_density)
-        self.target_density = float(target_density)
+
+        resolved_multiplier = target_density_multiplier
+        if target_density is not None and resolved_multiplier is None:
+            if self.robot_density <= 0:
+                raise ValueError("Robot density must be positive to derive target density multiplier.")
+            resolved_multiplier = float(target_density) / self.robot_density
+
+        if resolved_multiplier is None:
+            raise ValueError("Either target_density_multiplier or target_density must be provided.")
+
+        self.target_density_multiplier = float(resolved_multiplier)
+        self.target_density = round(self.robot_density * self.target_density_multiplier, 8)
         self.num_robots = max(1, int(round(self.robot_density * self.world_area)))
         self.num_targets = max(1, int(round(self.target_density * self.world_area)))
         self.num_timesteps = num_timesteps
@@ -425,7 +438,8 @@ class TrustMethodComparison:
         print(
             f"Configuration: world={self.world_size}m, robots={self.num_robots} "
             f"(density {self.robot_density:.6f}), targets={self.num_targets} "
-            f"(density {self.target_density:.6f}), steps={self.num_timesteps}"
+            f"(multiplier {self.target_density_multiplier:.3f}, density {self.target_density:.6f}), "
+            f"steps={self.num_timesteps}"
         )
         print(f"Random seed: {self.random_seed}")
 
@@ -448,6 +462,7 @@ class TrustMethodComparison:
                 'world_size': self.world_size,
                 'robot_density': self.robot_density,
                 'target_density': self.target_density,
+                'target_density_multiplier': self.target_density_multiplier,
                 'derived_num_robots': self.num_robots,
                 'derived_num_targets': self.num_targets,
                 'num_timesteps': self.num_timesteps,
@@ -563,6 +578,9 @@ class TrustMethodComparison:
         """Save comparison results to file"""
         results = {
             'configuration': {
+                'robot_density': self.robot_density,
+                'target_density_multiplier': self.target_density_multiplier,
+                'target_density': self.target_density,
                 'num_robots': self.num_robots,
                 'num_targets': self.num_targets,
                 'num_timesteps': self.num_timesteps,
@@ -734,7 +752,8 @@ class TrustMethodComparison:
         print(
             f"Configuration: world={self.world_size}m, robots≈{self.num_robots} "
             f"(density {self.robot_density:.6f}), targets≈{self.num_targets} "
-            f"(density {self.target_density:.6f}), steps={self.num_timesteps}, seed {self.random_seed}"
+            f"(multiplier {self.target_density_multiplier:.3f}, density {self.target_density:.6f}), "
+            f"steps={self.num_timesteps}, seed {self.random_seed}"
         )
         rl_label = str(self.rl_model_path) if self.rl_model_path else "fresh initialization"
         print(f"RL Model: {rl_label}")
@@ -794,7 +813,7 @@ def main():
 
     # Simulation Parameters
     ROBOT_DENSITY = 0.0010  # ≈10 robots in 100x100 world
-    TARGET_DENSITY = 0.0020  # ≈20 targets in 100x100 world
+    TARGET_DENSITY_MULTIPLIER = 2.0  # Targets are twice robot density
     NUM_TIMESTEPS = 100
     RANDOM_SEED = 42
 
@@ -804,6 +823,11 @@ def main():
     PROXIMAL_RANGE = 50.0
     FOV_RANGE = 50.0
     FOV_ANGLE = np.pi/3
+
+    WORLD_AREA = WORLD_SIZE * WORLD_SIZE
+    TARGET_DENSITY = round(ROBOT_DENSITY * TARGET_DENSITY_MULTIPLIER, 8)
+    NUM_ROBOTS = max(1, int(round(ROBOT_DENSITY * WORLD_AREA)))
+    NUM_TARGETS = max(1, int(round(TARGET_DENSITY * WORLD_AREA)))
 
     # Model Parameters
     SUPERVISED_MODEL_PATH = "supervised_trust_model.pth"
@@ -842,6 +866,7 @@ def main():
         print(f"Configuration:")
         print(f"  - Robots: {NUM_ROBOTS}")
         print(f"  - Targets: {NUM_TARGETS}")
+        print(f"  - Target multiplier: {TARGET_DENSITY_MULTIPLIER}")
         print(f"  - Timesteps: {NUM_TIMESTEPS}")
         print(f"  - Random seed: {RANDOM_SEED}")
         print(f"  - Adversarial ratio: {ADVERSARIAL_RATIO}")
@@ -857,7 +882,7 @@ def main():
             supervised_model_path=SUPERVISED_MODEL_PATH,
             rl_model_path=RL_MODEL_PATH,
             robot_density=ROBOT_DENSITY,
-            target_density=TARGET_DENSITY,
+            target_density_multiplier=TARGET_DENSITY_MULTIPLIER,
             num_timesteps=NUM_TIMESTEPS,
             random_seed=RANDOM_SEED,
             world_size=WORLD_SIZE,
@@ -898,6 +923,7 @@ def main():
                     'false_positive_rate': scenario['false_positive_rate'],
                     'false_negative_rate': scenario['false_negative_rate'],
                     'fixed_step_scale': comparison.fixed_step_scale,
+                    'target_density_multiplier': comparison.target_density_multiplier,
                     'legitimate_paper': legit_stats.get('paper', {}).get('mean', 0),
                     'legitimate_baseline': legit_stats.get('baseline', {}).get('mean', 0),
                     'legitimate_rl': legit_stats.get('rl', {}).get('mean', 0),
@@ -964,6 +990,7 @@ def main():
             'world_size': WORLD_SIZE,
             'robot_density': ROBOT_DENSITY,
             'target_density': TARGET_DENSITY,
+            'target_density_multiplier': TARGET_DENSITY_MULTIPLIER,
             'derived_num_robots': int(round(ROBOT_DENSITY * WORLD_SIZE * WORLD_SIZE)),
             'derived_num_targets': int(round(TARGET_DENSITY * WORLD_SIZE * WORLD_SIZE)),
             'adversarial_ratio': ADVERSARIAL_RATIO,
