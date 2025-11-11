@@ -3,8 +3,8 @@
 Data Generation for Supervised Trust Learning
 
 This script generates training data from simulation environments with ground truth labels
-for whether each robot/track is trustworthy. Uses the RL trust update system for realistic
-trust updates and adds agent-to-agent trustworthiness comparison edges.
+for whether each robot/track is trustworthy. Uses ground truth trust assignment based on
+adversarial labels to create realistic trust distributions.
 """
 
 import torch
@@ -19,7 +19,6 @@ from pathlib import Path
 # Import existing simulation components
 from simulation_environment import SimulationEnvironment
 from supervised_trust_gnn import TrustFeatureCalculator, EgoGraphBuilder
-from rl_trust_system import RLTrustSystem
 
 
 @dataclass
@@ -38,7 +37,7 @@ class SupervisedDataSample:
 
 class SupervisedDataGenerator:
     """
-    Generates supervised learning data from simulation environment using the RL trust update system
+    Generates supervised learning data from simulation environment using ground truth trust assignment
     """
 
     def __init__(self,
@@ -51,14 +50,9 @@ class SupervisedDataGenerator:
                  proximal_range: float = 50.0,
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
-                 max_steps_per_episode: int = 100,
-                 gnn_model_path: str = "supervised_trust_model.pth",
-                 rl_model_path: str = "rl_trust_model.pth",
-                 device: str = 'cpu',
-                 trust_step_size: float = 1.0,
-                 trust_strength_cap: float = 100.0):
+                 max_steps_per_episode: int = 100):
         """
-        Initialize data generator
+        Initialize data generator with ground truth trust assignment
 
         Args:
             robot_density: Robot density (float) or range (min, max) used to sample populations
@@ -71,11 +65,6 @@ class SupervisedDataGenerator:
             fov_range: Field of view range (kept constant)
             fov_angle: Field of view angle (kept constant)
             max_steps_per_episode: Maximum steps per episode
-            gnn_model_path: Path to trained (or untrained) ego-graph evidence model
-            rl_model_path: Path to trained (or untrained) RL updater model
-            device: Torch device for trust models
-            trust_step_size: Global step size multiplier for trust updates
-            trust_strength_cap: Maximum combined alpha+beta strength before normalization
         """
         self.max_steps_per_episode = max_steps_per_episode
 
@@ -93,12 +82,6 @@ class SupervisedDataGenerator:
         self.fov_range = fov_range
         self.fov_angle = fov_angle
 
-        self.device = device
-        self.gnn_model_path = Path(gnn_model_path) if gnn_model_path else None
-        self.rl_model_path = Path(rl_model_path) if rl_model_path else None
-        self.trust_step_size = trust_step_size
-        self.trust_strength_cap = trust_strength_cap
-
         # Initialize simulation environment (will be recreated for each episode with sampled parameters)
         self.sim_env = None
 
@@ -108,53 +91,103 @@ class SupervisedDataGenerator:
         # Initialize ego graph builder (will be updated for each episode)
         self.ego_graph_builder = None
 
-        # Initialize RL trust system (preferred trust updater)
-        self.rl_trust_system = None
-        self._initialize_rl_trust_system()
+    def _assign_ground_truth_trust(self, robots: List):
+        """
+        Assign trust values based on ground truth labels with controlled noise.
 
-    def _initialize_rl_trust_system(self) -> None:
-        """Set up the RL trust update system, falling back to fresh weights if checkpoints are absent"""
-        evidence_path = str(self.gnn_model_path) if self.gnn_model_path and self.gnn_model_path.exists() else None
-        updater_path = str(self.rl_model_path) if self.rl_model_path and self.rl_model_path.exists() else None
+        80% of the time: Perfect ground truth trust
+        - Legitimate robots/tracks: trust randomly from 0.7 to 1.0
+        - Adversarial robots/false positive tracks: trust randomly from 0.0 to 0.3
 
-        if self.gnn_model_path and not self.gnn_model_path.exists():
-            print(f"ℹ️ GNN evidence model '{self.gnn_model_path}' not found. Initializing with fresh weights.")
-        if self.rl_model_path and not self.rl_model_path.exists():
-            print(f"ℹ️ RL updater model '{self.rl_model_path}' not found. Initializing with fresh weights.")
+        20% of the time: Random noise trust
+        - Any entity: trust randomly from 0.0 to 1.0 (regardless of ground truth)
 
-        try:
-            self.rl_trust_system = RLTrustSystem(
-                evidence_model_path=evidence_path,
-                updater_model_path=updater_path,
-                device=self.device,
-                step_size=self.trust_step_size,
-                include_critic=False,
-                strength_cap=self.trust_strength_cap,
-            )
-            gnn_label = evidence_path if evidence_path else "fresh initialization"
-            rl_label = updater_path if updater_path else "fresh initialization"
-            print(f"✅ RL trust system ready (GNN={gnn_label}, updater={rl_label})")
-        except Exception as e:
-            print(f"⚠️ Failed to initialize RL trust system: {e}")
-            self.rl_trust_system = None
-            raise
+        This creates a more comprehensive dataset for supervised learning.
+        """
+        import random
+
+        for robot in robots:
+            # 80% chance of ground truth, 20% chance of random noise
+            if random.random() < 0.8:
+                # Ground truth trust assignment
+                if robot.is_adversarial:
+                    # Adversarial robot: low trust (0.0 to 0.3)
+                    trust_value = random.uniform(0.0, 0.3)
+                else:
+                    # Legitimate robot: high trust (0.7 to 1.0)
+                    trust_value = random.uniform(0.7, 1.0)
+            else:
+                # Random noise: any value between 0 and 1
+                trust_value = random.uniform(0.0, 1.0)
+
+            # Calculate confidence based on certainty
+            # High confidence when trust is close to 0 or 1
+            # Use distance from 0.5 as measure of certainty
+            certainty = abs(trust_value - 0.5) * 2  # 0 to 1 scale
+            # Map certainty to κ (kappa): higher certainty = higher κ = higher confidence
+            # κ range: [5, 30] where 5 = low confidence, 30 = high confidence
+            kappa = 5 + certainty * 25
+
+            # Calculate alpha and beta from trust and kappa
+            # mean = alpha/(alpha+beta) = trust_value
+            # alpha + beta = kappa
+            alpha = trust_value * kappa
+            beta = (1.0 - trust_value) * kappa
+
+            # Ensure minimum values
+            alpha = max(1.0, alpha)
+            beta = max(1.0, beta)
+
+            # Assign to robot
+            robot.trust_alpha = alpha
+            robot.trust_beta = beta
+
+            # Also assign trust to all tracks from this robot
+            for track in robot.get_all_tracks():
+                # 80% chance of ground truth, 20% chance of random noise
+                if random.random() < 0.8:
+                    # Ground truth trust assignment for tracks
+                    # Determine if track is false positive using same logic as label generation
+                    track_id_str = str(track.object_id)
+                    is_false_positive = track_id_str.startswith('fp_obj_')
+
+                    # Track trust should be based on whether it's a false positive,
+                    # NOT on whether the robot is adversarial
+                    # (adversarial robots can detect real objects too!)
+                    if is_false_positive:
+                        # False positive track: low trust
+                        track_trust_value = random.uniform(0.0, 0.3)
+                    else:
+                        # True positive track: high trust
+                        track_trust_value = random.uniform(0.7, 1.0)
+                else:
+                    # Random noise: any value between 0 and 1
+                    track_trust_value = random.uniform(0.0, 1.0)
+
+                # Calculate confidence for track
+                track_certainty = abs(track_trust_value - 0.5) * 2
+                track_kappa = 5 + track_certainty * 25
+
+                track_alpha = track_trust_value * track_kappa
+                track_beta = (1.0 - track_trust_value) * track_kappa
+
+                track_alpha = max(1.0, track_alpha)
+                track_beta = max(1.0, track_beta)
+
+                track.trust_alpha = track_alpha
+                track.trust_beta = track_beta
 
     def _simulate_step_with_rl(self, step_idx: int):
         """
-        Execute a single environment step and apply RL trust updates, mirroring compare_trust_methods.
+        Execute a single environment step and apply ground truth trust assignment.
         """
         frame_data = self.sim_env.step()
 
         for robot in self.sim_env.robots:
             robot.update_current_timestep_tracks()
 
-        if self.rl_trust_system is None:
-            self._initialize_rl_trust_system()
-
-        if self.rl_trust_system is None:
-            raise RuntimeError("RL trust system unavailable after initialization attempt")
-
-        self.rl_trust_system.update_trust(self.sim_env.robots)
+        # Assign ground truth trust values instead of using RL trust system
+        self._assign_ground_truth_trust(self.sim_env.robots)
 
         return frame_data
 
@@ -250,30 +283,41 @@ class SupervisedDataGenerator:
         # Update ego graph builder with fixed proximal range
         self.ego_graph_builder = EgoGraphBuilder(proximal_range=params['proximal_range'])
 
-    def _generate_labels_from_ego_graph(self, ego_graph: HeteroData) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _generate_labels_from_ego_graph(self, ego_robot, ego_graph: HeteroData) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Generate labels directly from ego graph's robot and track information
+        Generate labels for ALL robots and tracks in the ego graph.
+
+        IMPORTANT: Since we're using ground truth trust assignment for supervised learning,
+        ALL robots and tracks in the ego graph have correct trust values and should receive labels.
+        This ensures features and labels are properly aligned.
 
         Args:
+            ego_robot: The ego robot for this graph
             ego_graph: The ego graph with robot and track data
 
         Returns:
             Tuple of (agent_labels, track_labels) where 1 = trustworthy, 0 = adversarial
+            - agent_labels: [num_agents, 1] tensor for ALL robots in ego graph
+            - track_labels: [num_tracks, 1] tensor for ALL tracks in ego graph
         """
-        # Generate agent labels from proximal robots (stored in ego graph during construction)
+        # Generate labels for ALL robots in ego graph
+        # NOTE: proximal_robots already INCLUDES ego robot (at index 0)
         agent_labels = []
+
+        # Get all proximal robots (includes ego robot)
         proximal_robots = getattr(ego_graph, '_proximal_robots', [])
+
+        # Labels for ALL proximal robots (ego robot is already first in this list)
         for robot in proximal_robots:
-            # Honest robot = 1, Adversarial robot = 0
             label = 1.0 if not robot.is_adversarial else 0.0
             agent_labels.append(label)
 
-        agent_labels = torch.tensor(agent_labels, dtype=torch.float32).unsqueeze(1) if agent_labels else torch.empty(0, 1, dtype=torch.float32)
+        agent_labels = torch.tensor(agent_labels, dtype=torch.float32).unsqueeze(1)
 
-        # Generate track labels from track objects (stored in ego graph during construction)
+        # Generate labels for ALL tracks in ego graph
         track_labels = []
         if 'track' in ego_graph.x_dict and ego_graph.x_dict['track'].shape[0] > 0:
-            # Get tracks in the same order as ego graph construction
+            # Get all proximal robot tracks
             proximal_robot_tracks = {}
             for robot in proximal_robots:
                 robot_tracks = robot.get_all_current_tracks()
@@ -286,6 +330,7 @@ class SupervisedDataGenerator:
 
             ground_truth_objects = getattr(self.sim_env, 'ground_truth_objects', [])
 
+            # Create labels for ALL tracks (not just ego-owned)
             for track in all_tracks[:ego_graph.x_dict['track'].shape[0]]:
                 track_id_str = str(track.object_id)
 
@@ -347,8 +392,8 @@ class SupervisedDataGenerator:
                     if ego_graph is None:
                         continue
 
-                    # Generate labels directly from ego graph data
-                    agent_labels, track_labels = self._generate_labels_from_ego_graph(ego_graph)
+                    # Generate labels ONLY for ego robot and its tracks (corrected MDP)
+                    agent_labels, track_labels = self._generate_labels_from_ego_graph(ego_robot, ego_graph)
 
                     # Create clean data sample
                     sample = SupervisedDataSample(
@@ -373,33 +418,63 @@ class SupervisedDataGenerator:
 
     def generate_dataset(self,
                         num_episodes: int = 10,
-                        save_path: str = "supervised_trust_dataset.pkl") -> Tuple[List[SupervisedDataSample], List[Dict]]:
+                        save_path: str = "supervised_trust_dataset.pkl",
+                        log_path: str = None) -> Tuple[List[SupervisedDataSample], List[Dict]]:
         """
         Generate complete dataset with multiple episodes using diverse parameters
 
         Args:
             num_episodes: Number of episodes to generate
             save_path: Path to save the dataset
+            log_path: Optional path to save generation log (default: save_path.replace('.pkl', '.log'))
 
         Returns:
             Tuple of (list of all data samples, list of episode parameters)
         """
-        print(f"🔄 Generating supervised dataset with {num_episodes} episodes...")
-        print(f"📊 Parameter ranges:")
-        print(f"   - Robot density: {self.robot_density_range}")
-        print(f"   - Target density multiplier: {self.target_density_multiplier_range}")
+        # Set up logging
+        if log_path is None:
+            log_path = save_path.replace('.pkl', '_generation.log')
+
+        import sys
+        import datetime
+
+        # Create log file and tee output
+        log_file = open(log_path, 'w')
+
+        def log_print(*args, **kwargs):
+            """Print to both console and log file"""
+            message = ' '.join(str(arg) for arg in args)
+            print(message, **kwargs)
+            log_file.write(message + '\n')
+            log_file.flush()
+
+        log_print(f"="*80)
+        log_print(f"Supervised Dataset Generation Log")
+        log_print(f"="*80)
+        log_print(f"Start time: {datetime.datetime.now()}")
+        log_print(f"Output: {save_path}")
+        log_print(f"Log: {log_path}")
+        log_print(f"")
+
+        log_print(f"🔄 Generating supervised dataset with {num_episodes} episodes...")
+        log_print(f"📊 Parameter ranges:")
+        log_print(f"   - Robot density: {self.robot_density_range}")
+        log_print(f"   - Target density multiplier: {self.target_density_multiplier_range}")
         derived_min = round(self.robot_density_range[0] * self.target_density_multiplier_range[0], 6)
         derived_max = round(self.robot_density_range[1] * self.target_density_multiplier_range[1], 6)
-        print(f"   - Target density (derived): ({derived_min}, {derived_max})")
-        print(f"   - Adversarial ratio: {self.adversarial_ratio_range}")
-        print(f"   - False positive rate: {self.false_positive_rate_range}")
-        print(f"   - False negative rate: {self.false_negative_rate_range}")
-        print(f"   - World size (square): {self.world_size[0]} x {self.world_size[1]}")
-        print(f"   - Proximal range (fixed): {self.proximal_range}")
-        print(f"⏱️  Max steps per episode: {self.max_steps_per_episode}")
-        gnn_label = str(self.gnn_model_path) if self.gnn_model_path and self.gnn_model_path.exists() else ("fresh initialization" if self.gnn_model_path is None else f"{self.gnn_model_path} (fresh init)")
-        rl_label = str(self.rl_model_path) if self.rl_model_path and self.rl_model_path.exists() else ("fresh initialization" if self.rl_model_path is None else f"{self.rl_model_path} (fresh init)")
-        print(f"🧠 Using RL trust system for updates (GNN: {gnn_label}, updater: {rl_label})")
+        log_print(f"   - Target density (derived): ({derived_min}, {derived_max})")
+        log_print(f"   - Adversarial ratio: {self.adversarial_ratio_range}")
+        log_print(f"   - False positive rate: {self.false_positive_rate_range}")
+        log_print(f"   - False negative rate: {self.false_negative_rate_range}")
+        log_print(f"   - World size (square): {self.world_size[0]} x {self.world_size[1]}")
+        log_print(f"   - Proximal range (fixed): {self.proximal_range}")
+        log_print(f"⏱️  Max steps per episode: {self.max_steps_per_episode}")
+
+        log_print(f"🧠 Using ground truth trust assignment:")
+        log_print(f"   - Legitimate robots/tracks: trust ∈ [0.7, 1.0]")
+        log_print(f"   - Adversarial robots/tracks: trust ∈ [0.0, 0.3]")
+        log_print(f"   - Confidence: Higher when trust is closer to 0 or 1")
+        log_print(f"")
 
         all_data = []
         all_episode_params = []
@@ -412,14 +487,72 @@ class SupervisedDataGenerator:
 
                 # Progress update
                 if (episode + 1) % 5 == 0:
-                    print(f"✅ Completed {episode + 1}/{num_episodes} episodes. Total samples: {len(all_data)}")
+                    log_print(f"✅ Completed {episode + 1}/{num_episodes} episodes. Total samples: {len(all_data)}")
 
             except Exception as e:
-                print(f"⚠️ Error generating episode {episode}: {e}")
+                log_print(f"⚠️ Error generating episode {episode}: {e}")
                 continue
 
-        print(f"🎉 Dataset generation complete!")
-        print(f"📈 Total samples: {len(all_data)}")
+        log_print(f"🎉 Dataset generation complete!")
+        log_print(f"📈 Total samples before balancing: {len(all_data)}")
+
+        # ========================================================================
+        # BALANCED SAMPLING: Equal adversarial and legitimate robot samples
+        # ========================================================================
+        log_print(f"\n" + "="*80)
+        log_print("BALANCED SAMPLING")
+        log_print("="*80)
+
+        # Separate samples by adversarial vs legitimate
+        adversarial_samples = []
+        legitimate_samples = []
+
+        for sample in all_data:
+            # agent_labels: 1.0 = legitimate, 0.0 = adversarial
+            if sample.agent_labels.shape[0] > 0:
+                agent_label = float(sample.agent_labels[0, 0])
+                if agent_label == 0.0:
+                    adversarial_samples.append(sample)
+                else:
+                    legitimate_samples.append(sample)
+            else:
+                # No agent label (shouldn't happen, but keep sample)
+                legitimate_samples.append(sample)
+
+        log_print(f"Adversarial robot samples: {len(adversarial_samples)}")
+        log_print(f"Legitimate robot samples:  {len(legitimate_samples)}")
+
+        # Balance: keep ALL adversarial, sample equal number of legitimate
+        num_adversarial = len(adversarial_samples)
+        num_legitimate = len(legitimate_samples)
+
+        if num_legitimate > num_adversarial:
+            # Randomly sample legitimate samples to match adversarial count
+            import random
+            random.seed(42)  # Reproducible sampling
+            sampled_legitimate = random.sample(legitimate_samples, num_adversarial)
+
+            log_print(f"\nBalancing dataset:")
+            log_print(f"  Keeping all {num_adversarial} adversarial samples")
+            log_print(f"  Sampling {num_adversarial} out of {num_legitimate} legitimate samples")
+            log_print(f"  Final ratio: 50% adversarial, 50% legitimate")
+
+            legitimate_samples = sampled_legitimate
+        elif num_adversarial > num_legitimate:
+            log_print(f"\nWarning: More adversarial ({num_adversarial}) than legitimate ({num_legitimate})!")
+            log_print(f"  Keeping all samples (cannot balance)")
+        else:
+            log_print(f"\nAlready balanced: {num_adversarial} adversarial, {num_legitimate} legitimate")
+
+        # Merge balanced samples
+        all_data = adversarial_samples + legitimate_samples
+        random.shuffle(all_data)  # Shuffle to mix adversarial and legitimate
+
+        log_print(f"\nBalanced dataset:")
+        log_print(f"  Total samples: {len(all_data)} (was {len(adversarial_samples) + num_legitimate})")
+        log_print(f"  Adversarial: {len(adversarial_samples)} ({100*len(adversarial_samples)/len(all_data):.1f}%)")
+        log_print(f"  Legitimate:  {len(legitimate_samples)} ({100*len(legitimate_samples)/len(all_data):.1f}%)")
+        log_print("="*80)
 
         # Calculate statistics
         agent_samples = sum(1 for sample in all_data if sample.agent_labels.shape[0] > 0)
@@ -504,19 +637,19 @@ class SupervisedDataGenerator:
                 }
             }
 
-        print(f"📊 Dataset Statistics:")
-        print(f"   - Samples with agents: {agent_samples}")
-        print(f"   - Samples with tracks: {track_samples}")
-        print(f"   - Samples with agent comparison edges: {comparison_edge_samples}")
-        print(f"   - Avg agents per sample: {avg_agents_per_sample:.1f}")
-        print(f"   - Avg tracks per sample: {avg_tracks_per_sample:.1f}")
-        print(f"   - Agent feature dimensions: {sample_agent_features} (alpha/beta removed)")
-        print(f"   - Track feature dimensions: {sample_track_features} (alpha/beta removed)")
+        log_print(f"\n📊 Dataset Statistics:")
+        log_print(f"   - Samples with agents: {agent_samples}")
+        log_print(f"   - Samples with tracks: {track_samples}")
+        log_print(f"   - Samples with agent comparison edges: {comparison_edge_samples}")
+        log_print(f"   - Avg agents per sample: {avg_agents_per_sample:.1f}")
+        log_print(f"   - Avg tracks per sample: {avg_tracks_per_sample:.1f}")
+        log_print(f"   - Agent feature dimensions: {sample_agent_features} (alpha/beta removed)")
+        log_print(f"   - Track feature dimensions: {sample_track_features} (alpha/beta removed)")
 
         if all_episode_params:
-            print(f"📈 Parameter Diversity:")
+            log_print(f"\n📈 Parameter Diversity:")
             for param_name, stats in param_stats.items():
-                print(f"   - {param_name}: {stats['min']:.3f} - {stats['max']:.3f} (avg: {stats['avg']:.3f})")
+                log_print(f"   - {param_name}: {stats['min']:.3f} - {stats['max']:.3f} (avg: {stats['avg']:.3f})")
 
         # Save dataset with parameters
         dataset_package = {
@@ -546,10 +679,17 @@ class SupervisedDataGenerator:
             }
         }
 
-        print(f"💾 Saving dataset to {save_path}...")
+        log_print(f"\n💾 Saving dataset to {save_path}...")
         with open(save_path, 'wb') as f:
             pickle.dump(dataset_package, f)
-        print(f"✅ Dataset saved successfully!")
+        log_print(f"✅ Dataset saved successfully!")
+
+        log_print(f"\n" + "="*80)
+        log_print(f"Completion time: {datetime.datetime.now()}")
+        log_print(f"="*80)
+
+        # Close log file
+        log_file.close()
 
         return all_data, all_episode_params
 
@@ -588,10 +728,6 @@ def main():
                        help='Max steps per episode (default: 100)')
     parser.add_argument('--output', type=str, default='supervised_trust_dataset.pkl',
                        help='Output file path (default: supervised_trust_dataset.pkl)')
-    parser.add_argument('--gnn-model', type=str, default='trained_gnn_model.pth',
-                        help='Path to the trained GNN evidence model (default: trained_gnn_model.pth)')
-    parser.add_argument('--rl-model', type=str, default='rl_trust_model.pth',
-                        help='Path to the trained RL updater model (default: rl_trust_model.pth)')
     args = parser.parse_args()
 
     # Parse parameter ranges
@@ -624,9 +760,7 @@ def main():
         false_positive_rate=false_positive_rate_range,
         false_negative_rate=false_negative_rate_range,
         proximal_range=args.proximal_range,
-        max_steps_per_episode=args.steps,
-        gnn_model_path=args.gnn_model,
-        rl_model_path=args.rl_model
+        max_steps_per_episode=args.steps
     )
 
     # Generate dataset
@@ -637,9 +771,10 @@ def main():
 
     print(f"\n🎯 Dataset generation complete!")
     print(f"📈 {len(dataset)} samples from {len(episode_params)} episodes saved to {args.output}")
-    gnn_summary = str(generator.gnn_model_path) if generator.gnn_model_path and generator.gnn_model_path.exists() else ("fresh initialization" if generator.gnn_model_path is None else f"{generator.gnn_model_path} (fresh init)")
-    rl_summary = str(generator.rl_model_path) if generator.rl_model_path and generator.rl_model_path.exists() else ("fresh initialization" if generator.rl_model_path is None else f"{generator.rl_model_path} (fresh init)")
-    print(f"🧠 Trust updates applied using RL trust system (GNN: {gnn_summary}, updater: {rl_summary})")
+    print(f"🧠 Trust assigned using ground truth labels:")
+    print(f"   - Legitimate robots/tracks: trust ∈ [0.7, 1.0]")
+    print(f"   - Adversarial robots/tracks: trust ∈ [0.0, 0.3]")
+    print(f"   - Confidence: Higher when trust is closer to 0 or 1")
     print(f"🔗 Agent comparison edges included")
     print(f"📉 Alpha/beta features removed from node features")
     print(f"🎲 Parameter diversity across episodes for more robust training")

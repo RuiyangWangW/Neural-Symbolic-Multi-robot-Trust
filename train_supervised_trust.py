@@ -774,8 +774,8 @@ def main():
                        help='Number of DataLoader workers (default: 0, use 2-4 for MPS/CUDA)')
     parser.add_argument('--force-cpu', action='store_true',
                        help='Force CPU training (useful if MPS has issues)')
-    parser.add_argument('--patience', type=int, default=20,
-                       help='Early stopping patience - epochs without improvement (default: 20)')
+    parser.add_argument('--patience', type=int, default=100,
+                       help='Early stopping patience - epochs without improvement (default: 100)')
     parser.add_argument('--output', type=str, default='supervised_trust_model.pth',
                        help='Output model path')
 
@@ -844,8 +844,8 @@ def main():
 
     # Create model with updated feature dimensions
     model = SupervisedTrustGNN(
-        agent_features=4,  # 4 neural-symbolic predicates: high_confidence, highly_trusted, high_connectivity, reliable_detector
-        track_features=5,  # 5 neural-symbolic predicates (unchanged)
+        agent_features=4,  # 4 neural-symbolic predicates: HasFusedTracks, HighlyTrusted, HighConnectivity, ReliableDetector
+        track_features=4,  # 4 neural-symbolic predicates: DetectedByReliableRobot, HighlyTrusted, MultiRobotTrack, MajorityReliableDetectors
         hidden_dim=64
     )
 

@@ -79,75 +79,142 @@ class TrustFeatureCalculator:
             # Compute trust-based predicates using Robot.trust_value property
             robot_trust = robot.trust_value
 
-            # Feature 1: HighConfidence(robot) - robot confidence > 5.0
-            robot_std = self._calculate_beta_std(robot.trust_alpha, robot.trust_beta)
-            robot_confidence = 1.0 / (robot_std + 1e-6)
-            high_confidence_pred = 1.0 if robot_confidence > 5.0 else 0.0
+            # Feature 0: HasFusedTracks(robot) - robot has at least 1 TRUSTWORTHY track that was fused
+            # Only count fused tracks with trust > 0.7 (similar to how tracks only consider reliable detectors)
+            has_fused_tracks_pred = 0.0
+            robot_track_ids = set(track.object_id for track in robot.get_current_timestep_tracks())
+            for track in all_tracks:
+                # Only consider trustworthy tracks (trust > 0.7)
+                if track.trust_value > 0.7:
+                    if hasattr(track, 'track_id') and 'fused_' in track.track_id:
+                        # Check if this robot's detection contributed to this fused track
+                        parts = track.track_id.split('_')
+                        if len(parts) > 1:
+                            for part in parts[1:-1]:
+                                if part.isdigit() and int(part) == robot.id:
+                                    # Found a trustworthy fused track that includes this robot
+                                    has_fused_tracks_pred = 1.0
+                                    break
+                    if has_fused_tracks_pred == 1.0:
+                        break
 
-            # Feature 2: HighlyTrusted(robot) - robot trust > 0.7
+            # Feature 1: HighlyTrusted(robot) - robot trust > 0.7
             highly_trusted_pred = 1.0 if robot_trust > 0.7 else 0.0
 
-            # Feature 3: HighConnectivity(robot) - robot observes many tracks
-            robot_track_count = sum(1 for track in all_tracks if self._robot_observes_track(robot, track))
+            # Feature 2: HighConnectivity(robot) - robot observes many TRUSTWORTHY tracks
+            # Only count tracks with trust > 0.7 (similar to how tracks only consider reliable detectors)
+            robot_track_count = sum(1 for track in all_tracks
+                                   if self._robot_observes_track(robot, track) and track.trust_value > 0.7)
             high_connectivity_pred = 1.0 if robot_track_count >= 3 else 0.0
 
-            # Feature 4: ReliableDetector(robot) - robot's tracks have high average trust
-            robot_tracks = robot.get_all_tracks()
-            if robot_tracks:
-                avg_track_trust = np.mean([track.trust_value for track in robot_tracks])
+            # Feature 3: ReliableDetector(robot) - robot's CURRENT TIMESTEP tracks have high average trust
+            current_tracks = robot.get_current_timestep_tracks()
+            if current_tracks:
+                avg_track_trust = np.mean([track.trust_value for track in current_tracks])
                 reliable_detector_pred = 1.0 if avg_track_trust > 0.6 else 0.0
             else:
                 reliable_detector_pred = 0.0
 
             agent_features.append([
-                high_confidence_pred,    # Feature 1
-                highly_trusted_pred,     # Feature 2
-                high_connectivity_pred,  # Feature 3
-                reliable_detector_pred,  # Feature 4
+                has_fused_tracks_pred,   # Feature 0
+                highly_trusted_pred,     # Feature 1
+                high_connectivity_pred,  # Feature 2
+                reliable_detector_pred,  # Feature 3
             ])
 
         return torch.tensor(agent_features, dtype=torch.float)
 
-    def calculate_track_features(self, all_tracks: List['Track'], fused_tracks: List['Track']) -> torch.Tensor:
+    def _calculate_reliable_detector_for_robot(self, robot: 'Robot') -> float:
+        """
+        Helper method to calculate ReliableDetector predicate for a robot.
+        Uses CURRENT TIMESTEP tracks only.
+
+        Args:
+            robot: Robot object
+
+        Returns:
+            1.0 if avg track trust > 0.6, else 0.0
+        """
+        current_tracks = robot.get_current_timestep_tracks()
+        if current_tracks:
+            avg_track_trust = np.mean([track.trust_value for track in current_tracks])
+            return 1.0 if avg_track_trust > 0.6 else 0.0
+        return 0.0
+
+    def calculate_track_features(self, all_tracks: List['Track'], fused_tracks: List['Track'], robots: List['Robot'] = None) -> torch.Tensor:
         """
         Calculate neural symbolic features for track nodes
 
         Args:
             all_tracks: List of all Track objects
             fused_tracks: List of fused Track objects
+            robots: List of Robot objects (needed for detector quality calculation)
 
         Returns:
-            Tensor of track features [num_tracks, 5]
+            Tensor of track features [num_tracks, 4]
         """
         track_features = []
 
+        # Create robot lookup map
+        robot_map = {}
+        if robots:
+            for robot in robots:
+                robot_map[robot.id] = robot
+
         for track in all_tracks:
-            # Compute trust and confidence based predicates using Track.trust_value property
+            # Compute trust-based predicates using Track.trust_value property
             track_trust = track.trust_value
 
-            # Feature 1: HighConfidence(track) - track confidence > 5.0
-            track_std = self._calculate_beta_std(track.trust_alpha, track.trust_beta)
-            track_confidence = 1.0 / (track_std + 1e-6)
-            high_confidence_pred = 1.0 if track_confidence > 5.0 else 0.0
+            # Get detecting robot IDs for this track
+            detecting_robot_ids = []
+            if track in fused_tracks:
+                # Fused track: extract robots that contributed to fusion
+                if hasattr(track, 'track_id') and 'fused_' in track.track_id:
+                    # Extract robot IDs from fused track ID (format: "fused_1_2_3_objectid")
+                    parts = track.track_id.split('_')
+                    if len(parts) > 1:
+                        for part in parts[1:-1]:
+                            if part.isdigit():
+                                detecting_robot_ids.append(int(part))
+            else:
+                # Individual track: single robot
+                if hasattr(track, 'robot_id'):
+                    detecting_robot_ids.append(track.robot_id)
 
-            # Feature 2: HighlyTrusted(track) - track trust > 0.7
+            # Calculate ReliableDetector for each detecting robot
+            reliable_detector_values = []
+            for rid in detecting_robot_ids:
+                if rid in robot_map:
+                    reliable_val = self._calculate_reliable_detector_for_robot(robot_map[rid])
+                    reliable_detector_values.append(reliable_val)
+
+            # Feature 0: DetectedByReliableRobot - at least 1 detecting robot has ReliableDetector=1
+            detected_by_reliable_pred = 0.0
+            if reliable_detector_values:
+                if max(reliable_detector_values) == 1.0:
+                    detected_by_reliable_pred = 1.0
+
+            # Feature 1: HighlyTrusted(track) - track trust > 0.7
             highly_trusted_pred = 1.0 if track_trust > 0.7 else 0.0
 
-            # Feature 3: Suspicious(track) - track trust < 0.3
-            suspicious_pred = 1.0 if track_trust < 0.3 else 0.0
-
-            # Feature 4: MultiRobotTrack(track) - track appears in fused_tracks
+            # Feature 2: MultiRobotTrack(track) - track appears in fused_tracks
             multi_robot_pred = 1.0 if track in fused_tracks else 0.0
 
-            # Feature 5: WellObserved(track) - track has been observed/updated many times
-            well_observed_pred = 1.0 if track.observation_count > 50 else 0.0
+            # Feature 3: MajorityReliableDetectors - >50% of detecting robots have ReliableDetector=1
+            # IMPORTANT: Only meaningful for multi-detector tracks (>= 2 detectors)
+            # Single-detector tracks always get 0 (no consensus possible)
+            majority_reliable_pred = 0.0
+            if reliable_detector_values and len(reliable_detector_values) >= 2:
+                reliable_count = sum(reliable_detector_values)
+                total_count = len(reliable_detector_values)
+                if reliable_count / total_count > 0.5:
+                    majority_reliable_pred = 1.0
 
             track_features.append([
-                high_confidence_pred,    # Feature 1
-                highly_trusted_pred,     # Feature 2
-                suspicious_pred,         # Feature 3
-                multi_robot_pred,        # Feature 4
-                well_observed_pred,      # Feature 5
+                detected_by_reliable_pred,  # Feature 0: DetectedByReliableRobot
+                highly_trusted_pred,        # Feature 1: HighlyTrusted
+                multi_robot_pred,           # Feature 2: MultiRobotTrack
+                majority_reliable_pred,     # Feature 3: MajorityReliableDetectors
             ])
 
         return torch.tensor(track_features, dtype=torch.float)
@@ -201,7 +268,7 @@ class SupervisedTrustGNN(nn.Module):
     Supervised GNN model for binary trust classification
     """
 
-    def __init__(self, agent_features: int = 5, track_features: int = 5, hidden_dim: int = 64):
+    def __init__(self, agent_features: int = 4, track_features: int = 4, hidden_dim: int = 64):
         super(SupervisedTrustGNN, self).__init__()
 
         self.hidden_dim = hidden_dim
@@ -389,8 +456,8 @@ class SupervisedTrustPredictor:
         """Load trained model from checkpoint or initialize fresh weights if unavailable"""
         # Always create the model so we can fall back to fresh weights when needed
         self.model = SupervisedTrustGNN(
-            agent_features=4,  # 4 neural-symbolic predicates
-            track_features=5,  # 5 neural-symbolic predicates
+            agent_features=4,  # 4 binary predicates
+            track_features=4,  # 4 binary predicates
             hidden_dim=64
         )
 
@@ -715,7 +782,7 @@ class EgoGraphBuilder:
 
         # Use TrustFeatureCalculator to compute features properly
         agent_features = self.feature_calculator.calculate_agent_features(robots, all_tracks)
-        track_features = self.feature_calculator.calculate_track_features(all_tracks, fused_tracks)
+        track_features = self.feature_calculator.calculate_track_features(all_tracks, fused_tracks, robots)
 
         # Set up node features
         graph_data['agent'].x = agent_features
