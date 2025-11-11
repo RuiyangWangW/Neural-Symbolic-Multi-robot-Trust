@@ -138,8 +138,8 @@ class SupervisedTrustTrainer:
             self.optimizer, mode='min', factor=0.7, patience=10
         )
 
-        # Binary cross-entropy loss for classification with sum reduction
-        self.criterion = nn.BCELoss(reduction='sum')
+        # Binary cross-entropy loss for classification with mean reduction
+        self.criterion = nn.BCELoss(reduction='mean')
 
         # Training history
         self.train_losses = []
@@ -218,17 +218,16 @@ class SupervisedTrustTrainer:
 
         if 'agent' in predictions and agent_labels.shape[0] > 0:
             agent_loss = self.criterion(predictions['agent'], agent_labels)
-            loss += agent_loss
+            loss += agent_loss 
             loss_components += 1
 
         if 'track' in predictions and track_labels.shape[0] > 0:
             track_loss = self.criterion(predictions['track'], track_labels)
-            loss += track_loss
+            loss += track_loss 
             loss_components += 1
 
         if loss_components > 0:
-            return loss  # Remove averaging to maintain proper loss magnitude
-
+            return loss * 100
         return None
 
     def _compute_metrics(self, predictions: Dict, labels: Dict) -> Dict:
