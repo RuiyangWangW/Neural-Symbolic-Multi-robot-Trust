@@ -110,79 +110,114 @@ The supervised GNN serves as the **evidence extractor** in the trust pipeline. I
 
 **Key Design Philosophy**: Use **behavioral features only** (no trust values) to ensure train-test consistency during deployment.
 
-### Neural-Symbolic Features
+### Trust-Free Continuous Features
 
-#### Robot Features (3 Binary Predicates)
+**NEW DESIGN**: Ratio-based features that are much more informative than binary features. All features are behavioral and completely trust-free, ensuring perfect train-test consistency.
 
-1. **HasFusedTracks** (Feature 0)
+#### Robot Features (6D Continuous)
+
+1. **observed_count** (Feature 0)
    ```python
-   HasFusedTracks(robot) = 1 if robot has ≥1 trustworthy fused track, else 0
-   # Checks if robot's detections contributed to multi-robot fusion
-   # Only counts fused tracks with trust > 0.7
+   observed_count = number of unique objects observed at current timestep
+   # Deduplicated by object_id
    ```
-   - **Interpretation**: Robot collaborates successfully with others
-   - **Behavioral indicator**: Multi-robot validation of detections
+   - **Type**: Integer count ≥ 0
+   - **Interpretation**: How actively is this robot detecting objects?
+   - **Behavioral indicator**: Detection activity level
 
-2. **HighConnectivity** (Feature 1)
+2. **fused_count** (Feature 1)
    ```python
-   HighConnectivity(robot) = 1 if robot observes ≥3 trustworthy tracks, else 0
-   # Only counts tracks with trust > 0.7
+   fused_count = number of fused tracks within observed tracks
+   # Only counts fused tracks that this robot is observing
    ```
-   - **Interpretation**: Robot is well-connected in the observation network
-   - **Behavioral indicator**: Active participation in collaborative sensing
+   - **Type**: Integer count ≥ 0
+   - **Interpretation**: How many collaborative validations is this robot participating in?
+   - **Behavioral indicator**: Fusion participation rate
 
-3. **ReliableDetector** (Feature 2)
+3. **expected_count** (Feature 2)
    ```python
-   ReliableDetector(robot) = 1 if avg(robot's current track trusts) > 0.6, else 0
-   # Uses current timestep tracks only
+   expected_count = objects in ego graph that are within this robot's FoV
+   # From all objects detected by all robots, how many could this robot see?
    ```
-   - **Interpretation**: Robot produces high-quality detections
-   - **Behavioral indicator**: Detection accuracy over time
+   - **Type**: Integer count ≥ 0
+   - **Interpretation**: How many objects could this robot potentially detect?
+   - **Behavioral indicator**: Coverage potential
 
-#### Track Features (3 Binary Predicates)
-
-1. **DetectedByReliableRobot** (Feature 0)
+4. **partner_count** (Feature 3)
    ```python
-   DetectedByReliableRobot(track) = 1 if ≥1 detecting robot has ReliableDetector=1, else 0
-   # For fused tracks: checks all contributing robots
-   # For individual tracks: checks the single detector
+   partner_count = number of robots in ego graph with fused tracks with this robot
+   # How many robots has this robot co-detected objects with?
    ```
-   - **Interpretation**: Track has validation from a reliable source
-   - **Behavioral indicator**: Quality of detecting robots
+   - **Type**: Integer count ≥ 0
+   - **Interpretation**: How collaborative is this robot?
+   - **Behavioral indicator**: Collaboration network size
 
-2. **MultiRobotTrack** (Feature 1)
+5. **detection_ratio** (Feature 4)
    ```python
-   MultiRobotTrack(track) = 1 if track is fused (detected by ≥2 robots), else 0
+   detection_ratio = observed_count / (expected_count + ε)
+   # ε = 1e-8 to avoid division by zero
    ```
-   - **Interpretation**: Multiple robots independently detected this object
-   - **Behavioral indicator**: Cross-validation through fusion
+   - **Type**: Float ratio ∈ [0, ∞)
+   - **Interpretation**: What fraction of detectable objects is this robot actually detecting?
+   - **Behavioral indicator**: Detection efficiency
+   - **Adversarial pattern**: Legitimate robots have high ratios, adversarial robots may miss real objects
 
-3. **MajorityReliableDetectors** (Feature 2)
+6. **validator_ratio** (Feature 5)
    ```python
-   MajorityReliableDetectors(track) = 1 if >50% of detecting robots have ReliableDetector=1, else 0
-   # Only meaningful for fused tracks (≥2 detectors)
-   # Single-detector tracks get 0 (no consensus possible)
+   validator_ratio = partner_count / (robots_with_detections_in_fov + ε)
+   # How many of the nearby active robots does this robot collaborate with?
    ```
-   - **Interpretation**: Consensus among reliable detectors
-   - **Behavioral indicator**: Strong multi-source validation
+   - **Type**: Float ratio ∈ [0, ∞)
+   - **Interpretation**: What fraction of nearby robots validate this robot's detections?
+   - **Behavioral indicator**: Collaboration rate
+   - **Adversarial pattern**: Legitimate robots collaborate frequently, adversarial robots may be isolated
 
-**Why We Removed HighlyTrusted Feature**:
+#### Track Features (2D Continuous)
 
-❌ **Original Design** (4 features): Included `HighlyTrusted(entity) = 1 if trust > 0.7`
+1. **detector_count** (Feature 0)
+   ```python
+   detector_count = number of robots in ego graph that detected this track at current timestep
+   # For fused tracks: all contributing robots
+   # For individual tracks: always 1
+   ```
+   - **Type**: Integer count ≥ 1
+   - **Interpretation**: How many robots independently observed this object?
+   - **Behavioral indicator**: Multi-robot consensus
+   - **Adversarial pattern**: Real objects detected by multiple robots, false positives usually solo
 
-**Problem**: Train-test distribution mismatch
-- **Training**: Robots/tracks have ground-truth trust values (0.7-1.0 for legitimate, 0.0-0.3 for adversarial)
-  - Model learns: `HighlyTrusted=1` → legitimate, `HighlyTrusted=0` → adversarial
-  - Achieves ~97% accuracy (feature leaks the answer!)
-- **Deployment**: All robots/tracks start with trust ≈ 0.5 (uninformed prior)
-  - All entities have `HighlyTrusted=0` → Model predicts all as adversarial ❌
-  - Massive false positive rate (legitimate robots incorrectly flagged)
+2. **detector_ratio** (Feature 1)
+   ```python
+   detector_ratio = detector_count / (robots_with_fov_containing_track + ε)
+   # What fraction of robots that could see this object actually detected it?
+   ```
+   - **Type**: Float ratio ∈ [0, ∞)
+   - **Interpretation**: Agreement rate among robots that could see this object
+   - **Behavioral indicator**: Detection consistency
+   - **Adversarial pattern**: Real objects have high ratios, false positives have low ratios
 
-✅ **Current Design** (3 features): Only behavioral features
-- **Training**: Model learns from fusion patterns, connectivity, detection quality
-  - Achieves ~85-90% accuracy (lower but more robust)
-- **Deployment**: Same behavioral features available regardless of trust initialization
-  - Model generalizes correctly ✅
+### Design Philosophy: Trust-Free = Train-Test Consistent
+
+**Why Continuous Ratio Features?**
+
+✅ **Much more informative than binary features**:
+- Binary: `HasFusedTracks=1` (robot has at least 1 fused track)
+- Continuous: `fused_count=5` and `observed_count=8` → 62.5% fusion rate
+- The continuous version provides fine-grained information about behavior patterns
+
+✅ **Completely trust-free**:
+- NO features depend on trust values
+- All features based on observable events (detections, fusions, FoV geometry)
+- Features work identically during training and deployment
+
+✅ **Perfect train-test consistency**:
+- **Training**: Model learns from behavioral patterns (counts, ratios, collaboration)
+- **Deployment**: SAME behavioral patterns observable regardless of trust initialization
+- No distribution shift between training and deployment
+
+✅ **Adversarial discrimination**:
+- Legitimate robots: high detection_ratio, high validator_ratio, frequent fusion
+- Adversarial robots: low detection_ratio (miss real objects), low validator_ratio (isolated), inject false positives
+- Model learns these patterns WITHOUT using trust values
 
 ### GNN Architecture
 
@@ -197,15 +232,15 @@ The supervised GNN serves as the **evidence extractor** in the trust pipeline. I
 2. `('track', 'observed_and_in_fov_by', 'agent')`: Reverse of above
 3. `('agent', 'in_fov_only', 'track')`: Track in robot's FOV but not detected
 4. `('track', 'in_fov_only_by', 'agent')`: Reverse of above
-5. `('agent', 'more_trustworthy_than', 'agent')`: Robot comparison edges (based on trust)
+5. `('agent', 'co_detection', 'agent')`: **TRUST-FREE** robot-robot edges (robots detecting same object)
 
 **Architecture Details**:
 ```python
-Input: x_agent ∈ R^(N_agents × 3), x_track ∈ R^(N_tracks × 3)
+Input: x_agent ∈ R^(N_agents × 6), x_track ∈ R^(N_tracks × 2)
 
 # Layer 1: Embedding
-h_agent^(0) = Linear(3 → 64)(x_agent)
-h_track^(0) = Linear(3 → 64)(x_track)
+h_agent^(0) = Linear(6 → 64)(x_agent)
+h_track^(0) = Linear(2 → 64)(x_track)
 
 # Layers 1-3: Heterogeneous GAT with skip connections
 for layer in [1, 2, 3]:

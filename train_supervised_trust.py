@@ -841,10 +841,10 @@ def main():
                            shuffle=False, collate_fn=collate_batch,
                            num_workers=num_workers, pin_memory=pin_memory)
 
-    # Create model with updated feature dimensions (HighlyTrusted removed to fix train-test mismatch)
+    # Create model with NEW DESIGN: continuous ratio-based features (trust-free)
     model = SupervisedTrustGNN(
-        agent_features=3,  # 3 neural-symbolic predicates: HasFusedTracks, HighConnectivity, ReliableDetector
-        track_features=3,  # 3 neural-symbolic predicates: DetectedByReliableRobot, MultiRobotTrack, MajorityReliableDetectors
+        agent_features=6,  # 6D continuous: observed_count, fused_count, expected_count, partner_count, detection_ratio, validator_ratio
+        track_features=2,  # 2D continuous: detector_count, detector_ratio
         hidden_dim=64
     )
 

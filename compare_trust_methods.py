@@ -23,15 +23,16 @@ from robot_track_classes import Robot, Track
 
 # Import RL trust components
 from rl_trust_system import RLTrustSystem
-from rl_updater import LearnableUpdater, UpdateDecision
+from rl_updater import UpdateDecision
+from train_iql_trust import IQLConfig  # Needed for unpickling IQL checkpoints
 
 
 class TrustMethodComparison:
     """Compares paper algorithm vs supervised model vs RL model"""
 
     def __init__(self,
-                 supervised_model_path: str = "trained_gnn_model.pth",
-                 rl_model_path: str = "rl_trust_model.pth",
+                 supervised_model_path: str = "supervised_trust_model.pth",
+                 rl_model_path: str = "iql_final.pth",
                  robot_density: float = 0.0005,
                  target_density_multiplier: Optional[float] = 2.0,
                  target_density: Optional[float] = None,
@@ -45,8 +46,8 @@ class TrustMethodComparison:
         Initialize comparison with all three trust methods
 
         Args:
-            supervised_model_path: Path to trained supervised trust model
-            rl_model_path: Path to trained RL trust model
+            supervised_model_path: Path to trained supervised GNN trust model
+            rl_model_path: Path to trained IQL (offline RL) trust model
             robot_density: Robots per unit area in the fixed world
             target_density_multiplier: Multiplier applied to robot density to derive target density
             target_density: Optional explicit target density (overrides multiplier if provided)
@@ -55,6 +56,7 @@ class TrustMethodComparison:
             world_size: Side length of the (square) simulation world
             fov_range: Field of view range for robots
             fov_angle: Field of view angle for robots
+            fixed_step_scale: Step scale for baseline fixed-step method (default: 0.5)
         """
         self.supervised_model_path = Path(supervised_model_path) if supervised_model_path else None
         self.rl_model_path = Path(rl_model_path) if rl_model_path else None
@@ -135,12 +137,17 @@ class TrustMethodComparison:
         rl_model_path = self.rl_model_path
         rl_checkpoint_missing = False
         if rl_model_path and not rl_model_path.exists():
-            legacy_path = Path('rl_trust_model.pth')
-            if legacy_path.exists():
-                print(f"ℹ️ RL model '{rl_model_path}' not found. Falling back to '{legacy_path}'.")
-                self.rl_model_path = legacy_path
-            else:
-                print(f"⚠️ RL model '{rl_model_path}' not found and no legacy model available. Using fresh weights.")
+            # Try fallback to old model path for backwards compatibility
+            legacy_paths = [Path('rl_trust_model_final.pth'), Path('rl_trust_model.pth')]
+            found_legacy = False
+            for legacy_path in legacy_paths:
+                if legacy_path.exists():
+                    print(f"ℹ️ IQL model '{rl_model_path}' not found. Falling back to '{legacy_path}'.")
+                    self.rl_model_path = legacy_path
+                    found_legacy = True
+                    break
+            if not found_legacy:
+                print(f"⚠️ IQL model '{rl_model_path}' not found and no legacy model available. Using fresh weights.")
                 self.rl_model_path = None
                 rl_checkpoint_missing = True
         elif self.rl_model_path is None:
@@ -152,37 +159,51 @@ class TrustMethodComparison:
         if self.supervised_model_path and not self.supervised_model_path.exists():
             print(f"ℹ️ Supervised evidence model '{self.supervised_model_path}' not found. Initializing with fresh weights.")
         if rl_checkpoint_missing:
-            print("ℹ️ RL updater model not found. Initializing with fresh weights.")
+            print("ℹ️ IQL updater model not found. Initializing with fresh weights.")
 
-        # Initialize RLTrustSystem with updated ego-centric parameters
+        # Initialize RLTrustSystem with IQL configuration (6D features)
         self.rl_trust_system = RLTrustSystem(
             evidence_model_path=evidence_path,
             updater_model_path=updater_path,
             device=device,
             step_size=1.0,
+            include_critic=False,
+            decay_factor=0.99,  # Exponential decay for alpha/beta
+            trust_threshold=0.6,  # Match dataset generation
+            proximal_range=self.proximal_range,  # Match simulation environment
         )
 
     def _initialize_baseline_system(self):
-        """Set up an RL trust system with fixed step scales."""
+        """Set up an RL trust system with fixed step scales (6D features)."""
         device = 'cpu'
         self.baseline_trust_system = RLTrustSystem(
             evidence_model_path=str(self.supervised_model_path) if self.supervised_model_path and self.supervised_model_path.exists() else None,
             updater_model_path=None,
             device=device,
             step_size=1.0,
+            include_critic=False,
+            decay_factor=0.99,  # Exponential decay for alpha/beta
+            trust_threshold=0.6,  # Match dataset generation
+            proximal_range=self.proximal_range,  # Match simulation environment
         )
 
         updater = self.baseline_trust_system.updater
-        updater.baseline_scale = self.fixed_step_scale
+        updater.baseline_scale = float(self.fixed_step_scale)
 
-        def fixed_get_step_scales(self_updater, ego_robots, ego_tracks, participating_robots,
-                                  participating_tracks, robot_scores, track_scores, track_observers):
+        def fixed_predict_step_scales(self_updater, robot_items, track_ids):
+            """Fixed step scale predictor compatible with dual-action RL model.
+
+            Args:
+                robot_items: List of (robot_id, features) tuples
+                track_ids: List of track IDs (no features, just IDs)
+            """
             scale = float(self_updater.baseline_scale)
-            robot_steps = {robot.id: (scale, scale) for robot in participating_robots}
-            track_steps = {track.track_id: (scale, scale) for track in participating_tracks}
-            return UpdateDecision(robot_steps, track_steps)
+            # Dual-action: return (alpha_scale, beta_scale) tuples
+            robot_steps = {robot_id: (scale, scale) for robot_id, _ in robot_items}
+            track_steps = {track_id: (scale, scale) for track_id in track_ids}
+            return UpdateDecision(robot_steps=robot_steps, track_steps=track_steps)
 
-        updater.get_step_scales = types.MethodType(fixed_get_step_scales, updater)
+        updater.predict_step_scales = types.MethodType(fixed_predict_step_scales, updater)
 
     def create_identical_environments(self, count: int = 3) -> List[SimulationEnvironment]:
         """Create identical simulation environments for fair comparison."""
@@ -831,7 +852,7 @@ def main():
 
     # Model Parameters
     SUPERVISED_MODEL_PATH = "supervised_trust_model.pth"
-    RL_MODEL_PATH = "rl_trust_model.pth"
+    RL_MODEL_PATH = "iql_final.pth"  # IQL (offline RL) trust model
 
     # Scenario-specific parameters (only FP/FN rates vary)
     scenarios = [

@@ -62,101 +62,193 @@ class TrustFeatureCalculator:
         robot_tracks = robot.get_all_tracks() if hasattr(robot, 'get_all_tracks') else []
         return track in robot_tracks
 
-    def calculate_agent_features(self, robots: List['Robot'], all_tracks: List['Track']) -> torch.Tensor:
+    def _track_in_robot_fov(self, robot: 'Robot', track: 'Track') -> bool:
         """
-        Calculate neural symbolic features for agent nodes
-
-        NOTE: HighlyTrusted feature REMOVED to avoid train-test distribution mismatch.
-        During training, robots have ground-truth trust values, but during deployment,
-        all robots start with trust=0.5, causing the model to misclassify legitimate
-        robots as adversarial.
+        Check if track is within robot's field of view.
 
         Args:
-            robots: List of Robot objects
-            all_tracks: List of all Track objects
+            robot: Robot object
+            track: Track object
 
         Returns:
-            Tensor of agent features [num_agents, 3]
+            True if track is in robot's FoV, False otherwise
+        """
+        if hasattr(robot, 'is_in_fov') and hasattr(track, 'position'):
+            return robot.is_in_fov(track.position)
+        return False
+
+    def calculate_agent_features(self, robots: List['Robot'], all_tracks: List['Track']) -> torch.Tensor:
+        """
+        Calculate TRUST-FREE continuous features for agent nodes.
+
+        NEW DESIGN (6D): Ratio-based features that are much more informative than binary features.
+        All features are behavioral and fully trust-free.
+
+        Features:
+        0. observed_count: Number of unique objects observed at current step
+        1. fused_count: Number of fused tracks within observed tracks
+        2. expected_count: Objects in ego graph that are within this robot's FoV
+        3. partner_count: Number of robots in ego graph with fused tracks with this robot
+        4. detection_ratio: observed_count / expected_count (with epsilon)
+        5. validator_ratio: partner_count / robots_with_detections_in_fov (with epsilon)
+
+        Args:
+            robots: List of Robot objects (all robots in ego graph)
+            all_tracks: List of all Track objects (all tracks in ego graph)
+
+        Returns:
+            Tensor of agent features [num_agents, 6]
         """
         agent_features = []
+        epsilon = 1e-8  # To avoid division by zero
 
-        for robot in robots:
-            # Feature 0: HasFusedTracks(robot) - robot has at least 1 TRUSTWORTHY track that was fused
-            # Only count fused tracks with trust > 0.7 (similar to how tracks only consider reliable detectors)
-            has_fused_tracks_pred = 0.0
-            robot_track_ids = set(track.object_id for track in robot.get_current_timestep_tracks())
+        # Build object-to-robots mapping for the entire ego graph
+        # object_id -> set of robot indices that detected it
+        object_detectors = {}
+        for idx, robot in enumerate(robots):
+            current_tracks = robot.get_current_timestep_tracks()
+            for track in current_tracks:
+                if hasattr(track, 'object_id'):
+                    obj_id = track.object_id
+                    if obj_id not in object_detectors:
+                        object_detectors[obj_id] = set()
+                    object_detectors[obj_id].add(idx)
+
+        # Build fused track partnerships: robot_id -> set of partner robot_ids
+        fusion_partners = {robot.id: set() for robot in robots}
+        for track in all_tracks:
+            if hasattr(track, 'track_id') and 'fused_' in track.track_id:
+                # Extract robot IDs from fused track ID (format: "fused_1_2_3_objectid")
+                parts = track.track_id.split('_')
+                contributing_robots = []
+                if len(parts) > 1:
+                    for part in parts[1:-1]:
+                        if part.isdigit():
+                            contributing_robots.append(int(part))
+
+                # Each robot in fusion is partnered with all others
+                for robot_id in contributing_robots:
+                    for other_robot_id in contributing_robots:
+                        if robot_id != other_robot_id and robot_id in fusion_partners:
+                            fusion_partners[robot_id].add(other_robot_id)
+
+        for robot_idx, robot in enumerate(robots):
+            current_tracks = robot.get_current_timestep_tracks()
+
+            # Deduplicate tracks by object_id
+            observed_objects = set()
+            for track in current_tracks:
+                if hasattr(track, 'object_id'):
+                    observed_objects.add(track.object_id)
+
+            # Feature 0: observed_count - number of unique objects observed at current step
+            observed_count = len(observed_objects)
+
+            # Feature 1: fused_count - number of fused tracks that this robot participated in
+            # and whose objects are in the robot's observed objects
+            fused_count = 0
             for track in all_tracks:
-                # Only consider trustworthy tracks (trust > 0.7)
-                if track.trust_value > 0.7:
-                    if hasattr(track, 'track_id') and 'fused_' in track.track_id:
-                        # Check if this robot's detection contributed to this fused track
-                        parts = track.track_id.split('_')
-                        if len(parts) > 1:
-                            for part in parts[1:-1]:
-                                if part.isdigit() and int(part) == robot.id:
-                                    # Found a trustworthy fused track that includes this robot
-                                    has_fused_tracks_pred = 1.0
-                                    break
-                    if has_fused_tracks_pred == 1.0:
+                if hasattr(track, 'track_id') and 'fused_' in track.track_id:
+                    # Check if this robot participated in the fusion
+                    parts = track.track_id.split('_')
+                    if len(parts) > 1:
+                        contributing_robot_ids = [int(part) for part in parts[1:-1] if part.isdigit()]
+                        # Check if this robot participated and the object is observed
+                        if robot.id in contributing_robot_ids:
+                            if hasattr(track, 'object_id') and track.object_id in observed_objects:
+                                fused_count += 1
+
+            # Feature 2: expected_count - from all objects detected by all robots in ego graph,
+            # how many are within this robot's FoV
+            expected_count = 0
+            for obj_id in object_detectors.keys():
+                # Find any track for this object to check position
+                track_for_object = None
+                for track in all_tracks:
+                    if hasattr(track, 'object_id') and track.object_id == obj_id:
+                        track_for_object = track
                         break
 
-            # Feature 1: HighConnectivity(robot) - robot observes many TRUSTWORTHY tracks
-            # Only count tracks with trust > 0.7 (similar to how tracks only consider reliable detectors)
-            robot_track_count = sum(1 for track in all_tracks
-                                   if self._robot_observes_track(robot, track) and track.trust_value > 0.7)
-            high_connectivity_pred = 1.0 if robot_track_count >= 3 else 0.0
+                if track_for_object and self._track_in_robot_fov(robot, track_for_object):
+                    expected_count += 1
 
-            # Feature 2: ReliableDetector(robot) - robot's CURRENT TIMESTEP tracks have high average trust
-            current_tracks = robot.get_current_timestep_tracks()
-            if current_tracks:
-                avg_track_trust = np.mean([track.trust_value for track in current_tracks])
-                reliable_detector_pred = 1.0 if avg_track_trust > 0.6 else 0.0
-            else:
-                reliable_detector_pred = 0.0
+            # Feature 3: partner_count - number of robots in ego graph that has fused tracks with this robot
+            partner_count = len(fusion_partners.get(robot.id, set()))
+
+            # Feature 4: detection_ratio = observed_count / expected_count
+            detection_ratio = observed_count / (expected_count + epsilon)
+
+            # Feature 5: validator_ratio = partner_count / (robots with detections in this robot's FoV)
+            # Count robots that detected objects within this robot's FoV
+            robots_in_fov = 0
+            for other_idx, other_robot in enumerate(robots):
+                if other_idx == robot_idx:
+                    continue  # Skip self
+
+                other_tracks = other_robot.get_current_timestep_tracks()
+                for other_track in other_tracks:
+                    if self._track_in_robot_fov(robot, other_track):
+                        robots_in_fov += 1
+                        break  # Count each robot only once
+
+            validator_ratio = partner_count / (robots_in_fov + epsilon)
 
             agent_features.append([
-                has_fused_tracks_pred,   # Feature 0
-                high_connectivity_pred,  # Feature 1 (was Feature 2)
-                reliable_detector_pred,  # Feature 2 (was Feature 3)
+                float(observed_count),    # Feature 0
+                float(fused_count),       # Feature 1
+                float(expected_count),    # Feature 2
+                float(partner_count),     # Feature 3
+                float(detection_ratio),   # Feature 4
+                float(validator_ratio),   # Feature 5
             ])
 
         return torch.tensor(agent_features, dtype=torch.float)
 
-    def _calculate_reliable_detector_for_robot(self, robot: 'Robot') -> float:
+    def _calculate_active_detector_for_robot(self, robot: 'Robot', all_tracks: List['Track']) -> float:
         """
-        Helper method to calculate ReliableDetector predicate for a robot.
-        Uses CURRENT TIMESTEP tracks only.
+        TRUST-FREE helper method to calculate ActiveDetector predicate for a robot.
+        Measures behavioral activity rather than trust values.
 
         Args:
             robot: Robot object
+            all_tracks: List of all tracks
 
         Returns:
-            1.0 if avg track trust > 0.6, else 0.0
+            1.0 if robot is active (detects >= 2 tracks OR participates in >= 1 fusion), else 0.0
         """
         current_tracks = robot.get_current_timestep_tracks()
-        if current_tracks:
-            avg_track_trust = np.mean([track.trust_value for track in current_tracks])
-            return 1.0 if avg_track_trust > 0.6 else 0.0
-        return 0.0
+        detection_count = len(current_tracks)
+
+        # Check fusion participation
+        fused_count = sum(1 for track in all_tracks
+                        if hasattr(track, 'track_id') and 'fused_' in track.track_id
+                        and any(part.isdigit() and int(part) == robot.id
+                              for part in track.track_id.split('_')[1:-1]))
+
+        # Active if: detects >= 2 tracks OR participates in >= 1 fusion
+        return 1.0 if (detection_count >= 2 or fused_count >= 1) else 0.0
 
     def calculate_track_features(self, all_tracks: List['Track'], fused_tracks: List['Track'], robots: List['Robot'] = None) -> torch.Tensor:
         """
-        Calculate neural symbolic features for track nodes
+        Calculate TRUST-FREE continuous features for track nodes.
 
-        NOTE: HighlyTrusted feature REMOVED to avoid train-test distribution mismatch.
-        During training, tracks have ground-truth trust values, but during deployment,
-        all tracks start with trust=0.5, causing the model to misclassify legitimate
-        tracks as false positives.
+        NEW DESIGN (2D): Simple, informative ratio-based features.
+        All features are behavioral and fully trust-free.
+
+        Features:
+        0. detector_count: Number of robots in ego graph that detected this track at current timestep
+        1. detector_ratio: detector_count / robots_with_fov_containing_track (with epsilon)
 
         Args:
             all_tracks: List of all Track objects
             fused_tracks: List of fused Track objects
-            robots: List of Robot objects (needed for detector quality calculation)
+            robots: List of Robot objects (needed for FoV calculation)
 
         Returns:
-            Tensor of track features [num_tracks, 3]
+            Tensor of track features [num_tracks, 2]
         """
         track_features = []
+        epsilon = 1e-8  # To avoid division by zero
 
         # Create robot lookup map
         robot_map = {}
@@ -165,7 +257,7 @@ class TrustFeatureCalculator:
                 robot_map[robot.id] = robot
 
         for track in all_tracks:
-            # Get detecting robot IDs for this track
+            # Get detecting robot IDs for this track at current timestep
             detecting_robot_ids = []
             if track in fused_tracks:
                 # Fused track: extract robots that contributed to fusion
@@ -181,61 +273,63 @@ class TrustFeatureCalculator:
                 if hasattr(track, 'robot_id'):
                     detecting_robot_ids.append(track.robot_id)
 
-            # Calculate ReliableDetector for each detecting robot
-            reliable_detector_values = []
-            for rid in detecting_robot_ids:
-                if rid in robot_map:
-                    reliable_val = self._calculate_reliable_detector_for_robot(robot_map[rid])
-                    reliable_detector_values.append(reliable_val)
+            # Feature 0: detector_count - number of robots that detected this track
+            detector_count = len(detecting_robot_ids)
 
-            # Feature 0: DetectedByReliableRobot - at least 1 detecting robot has ReliableDetector=1
-            detected_by_reliable_pred = 0.0
-            if reliable_detector_values:
-                if max(reliable_detector_values) == 1.0:
-                    detected_by_reliable_pred = 1.0
+            # Feature 1: detector_ratio - detector_count / robots_with_fov
+            # Count robots whose FoV includes this track's position
+            robots_with_fov = 0
+            if robots:
+                for robot in robots:
+                    if self._track_in_robot_fov(robot, track):
+                        robots_with_fov += 1
 
-            # Feature 1: MultiRobotTrack(track) - track appears in fused_tracks
-            multi_robot_pred = 1.0 if track in fused_tracks else 0.0
-
-            # Feature 2: MajorityReliableDetectors - >50% of detecting robots have ReliableDetector=1
-            # IMPORTANT: Only meaningful for multi-detector tracks (>= 2 detectors)
-            # Single-detector tracks always get 0 (no consensus possible)
-            majority_reliable_pred = 0.0
-            if reliable_detector_values and len(reliable_detector_values) >= 2:
-                reliable_count = sum(reliable_detector_values)
-                total_count = len(reliable_detector_values)
-                if reliable_count / total_count > 0.5:
-                    majority_reliable_pred = 1.0
+            detector_ratio = detector_count / (robots_with_fov + epsilon)
 
             track_features.append([
-                detected_by_reliable_pred,  # Feature 0: DetectedByReliableRobot
-                multi_robot_pred,           # Feature 1: MultiRobotTrack (was Feature 2)
-                majority_reliable_pred,     # Feature 2: MajorityReliableDetectors (was Feature 3)
+                float(detector_count),   # Feature 0
+                float(detector_ratio),   # Feature 1
             ])
 
         return torch.tensor(track_features, dtype=torch.float)
 
-    def create_agent_comparison_edges(self, robots: List['Robot']) -> torch.Tensor:
+    def create_agent_codetection_edges(self, robots: List['Robot']) -> torch.Tensor:
         """
-        Create agent-to-agent comparison edges based on trust values
+        Create agent-to-agent co-detection edges based on shared object detections.
+
+        TRUST-FREE: Two robots are connected if they detected the same object
+        at the current timestep. This captures collaborative sensing relationships
+        without using trust values.
 
         Args:
             robots: List of Robot objects
 
         Returns:
-            Edge tensor [2, num_edges] for agent comparison edges
+            Edge tensor [2, num_edges] for co-detection edges (bidirectional)
         """
         source_indices = []
         target_indices = []
 
-        # Compare each pair of agents
-        for i, robot_i in enumerate(robots):
-            for j, robot_j in enumerate(robots):
-                if i != j:
-                    # Only create edge if robot_i is more trustworthy than robot_j
-                    if robot_i.trust_value > robot_j.trust_value:
-                        source_indices.append(i)
-                        target_indices.append(j)
+        # Build object detection map: object_id -> [robot indices that detected it]
+        object_detectors = {}
+        for idx, robot in enumerate(robots):
+            current_tracks = robot.get_current_timestep_tracks()
+            for track in current_tracks:
+                if hasattr(track, 'object_id'):
+                    obj_id = track.object_id
+                    if obj_id not in object_detectors:
+                        object_detectors[obj_id] = []
+                    object_detectors[obj_id].append(idx)
+
+        # Create bidirectional edges between robots that co-detected the same object
+        for obj_id, detector_indices in object_detectors.items():
+            if len(detector_indices) >= 2:  # At least 2 robots detected this object
+                # Create edges between all pairs of co-detectors
+                for i in range(len(detector_indices)):
+                    for j in range(len(detector_indices)):
+                        if i != j:
+                            source_indices.append(detector_indices[i])
+                            target_indices.append(detector_indices[j])
 
         if source_indices:
             return torch.tensor([source_indices, target_indices], dtype=torch.long)
@@ -263,11 +357,13 @@ class SupervisedTrustGNN(nn.Module):
     """
     Supervised GNN model for binary trust classification
 
-    NOTE: Reduced from 4 to 3 features after removing HighlyTrusted feature
-    to fix train-test distribution mismatch.
+    NEW DESIGN:
+    - Robot features: 6D continuous ratio-based features
+    - Track features: 2D continuous ratio-based features
+    - All features are trust-free and behavioral
     """
 
-    def __init__(self, agent_features: int = 3, track_features: int = 3, hidden_dim: int = 64):
+    def __init__(self, agent_features: int = 6, track_features: int = 2, hidden_dim: int = 64):
         super(SupervisedTrustGNN, self).__init__()
 
         self.hidden_dim = hidden_dim
@@ -283,7 +379,7 @@ class SupervisedTrustGNN(nn.Module):
             ('track', 'observed_and_in_fov_by', 'agent'),
             ('agent', 'in_fov_only', 'track'),
             ('track', 'in_fov_only_by', 'agent'),
-            ('agent', 'more_trustworthy_than', 'agent'),  # Agent comparison edges
+            ('agent', 'co_detection', 'agent'),  # TRUST-FREE: Co-detection edges (robots detecting same object)
         ]
 
         # Create GAT convolution dictionary for each edge type
@@ -455,8 +551,8 @@ class SupervisedTrustPredictor:
         """Load trained model from checkpoint or initialize fresh weights if unavailable"""
         # Always create the model so we can fall back to fresh weights when needed
         self.model = SupervisedTrustGNN(
-            agent_features=3,  # 3 binary predicates (removed HighlyTrusted)
-            track_features=3,  # 3 binary predicates (removed HighlyTrusted)
+            agent_features=6,  # 6D continuous ratio-based features (trust-free)
+            track_features=2,  # 2D continuous ratio-based features (trust-free)
             hidden_dim=64
         )
 
@@ -715,21 +811,14 @@ class EgoGraphBuilder:
         return fused_tracks, individual_tracks, track_fusion_map
 
     def _create_fused_track(self, tracks_to_fuse, all_robots):
-        """Create a fused track with proper trust inheritance"""
-        # Use highest trust robot's track as primary track
-        robot_trusts = {}
-        for robot in all_robots:
-            robot_trusts[robot.id] = robot.trust_value  # Use Robot.trust_value property
+        """
+        Create a fused track with proper trust inheritance.
 
-        # Find track from highest trust robot
-        best_track = None
-        best_robot_trust = -1
-        for robot_id, track in tracks_to_fuse:
-            if robot_trusts[robot_id] > best_robot_trust:
-                best_robot_trust = robot_trusts[robot_id]
-                best_track = track
-
-        primary_track = best_track
+        TRUST-FREE: Simply use the first track as primary instead of selecting
+        based on robot trust values. The fusion process itself provides validation.
+        """
+        # Use first track as primary (TRUST-FREE - arbitrary but consistent choice)
+        primary_track = tracks_to_fuse[0][1]
         trust_alpha = primary_track.trust_alpha
         trust_beta = primary_track.trust_beta
 
@@ -822,14 +911,29 @@ class EgoGraphBuilder:
                     in_fov_only_edges.append([robot_idx, track_idx])
                     in_fov_only_by_edges.append([track_idx, robot_idx])
 
-        # Create agent-to-agent comparison edges based on trust values
-        agent_comparison_edges = []
-        for i, robot_i in enumerate(robots):
-            for j, robot_j in enumerate(robots):
-                if i != j:
-                    # Only create edge if robot_i is more trustworthy than robot_j
-                    if robot_i.trust_value > robot_j.trust_value:
-                        agent_comparison_edges.append([i, j])
+        # Create agent-to-agent co-detection edges (TRUST-FREE)
+        # Two robots are connected if they detected the same object at current timestep
+        agent_codetection_edges = []
+
+        # Build object detection map: object_id -> [robot indices that detected it]
+        object_detectors = {}
+        for idx, robot in enumerate(robots):
+            current_tracks = robot.get_current_timestep_tracks()
+            for track in current_tracks:
+                if hasattr(track, 'object_id'):
+                    obj_id = track.object_id
+                    if obj_id not in object_detectors:
+                        object_detectors[obj_id] = []
+                    object_detectors[obj_id].append(idx)
+
+        # Create bidirectional edges between robots that co-detected the same object
+        for obj_id, detector_indices in object_detectors.items():
+            if len(detector_indices) >= 2:  # At least 2 robots detected this object
+                # Create edges between all pairs of co-detectors
+                for i in range(len(detector_indices)):
+                    for j in range(len(detector_indices)):
+                        if i != j:
+                            agent_codetection_edges.append([detector_indices[i], detector_indices[j]])
 
         # Convert to tensors and create proper edge structure
         edge_types = [
@@ -837,11 +941,11 @@ class EgoGraphBuilder:
             ('track', 'observed_and_in_fov_by', 'agent'),
             ('agent', 'in_fov_only', 'track'),
             ('track', 'in_fov_only_by', 'agent'),
-            ('agent', 'more_trustworthy_than', 'agent'),  # Agent comparison edges
+            ('agent', 'co_detection', 'agent'),  # TRUST-FREE: Co-detection edges
         ]
 
         edge_data = [in_fov_and_observed_edges, observed_and_in_fov_by_edges,
-                     in_fov_only_edges, in_fov_only_by_edges, agent_comparison_edges]
+                     in_fov_only_edges, in_fov_only_by_edges, agent_codetection_edges]
 
         graph_data.edge_index_dict = {}
         for edge_type, edges in zip(edge_types, edge_data):
