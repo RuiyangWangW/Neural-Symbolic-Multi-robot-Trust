@@ -841,10 +841,10 @@ def main():
                            shuffle=False, collate_fn=collate_batch,
                            num_workers=num_workers, pin_memory=pin_memory)
 
-    # Create model with updated feature dimensions
+    # Create model with updated feature dimensions (HighlyTrusted removed to fix train-test mismatch)
     model = SupervisedTrustGNN(
-        agent_features=4,  # 4 neural-symbolic predicates: HasFusedTracks, HighlyTrusted, HighConnectivity, ReliableDetector
-        track_features=4,  # 4 neural-symbolic predicates: DetectedByReliableRobot, HighlyTrusted, MultiRobotTrack, MajorityReliableDetectors
+        agent_features=3,  # 3 neural-symbolic predicates: HasFusedTracks, HighConnectivity, ReliableDetector
+        track_features=3,  # 3 neural-symbolic predicates: DetectedByReliableRobot, MultiRobotTrack, MajorityReliableDetectors
         hidden_dim=64
     )
 

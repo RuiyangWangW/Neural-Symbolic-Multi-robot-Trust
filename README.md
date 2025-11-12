@@ -4,12 +4,30 @@ A neural-symbolic framework for distributed trust management in multi-robot syst
 
 ## System Overview
 
-This system implements an end-to-end trust management framework for multi-robot collaborative scenarios:
+This system implements an end-to-end trust management framework for multi-robot collaborative scenarios with a two-stage learning pipeline:
 
-1. **Evidence Extraction** (Supervised GNN): Processes ego-centric heterogeneous graphs to extract trust evidence scores for robots and their detected tracks
-2. **Adaptive Trust Updates** (IQL Policy): Learns optimal step scales for updating Beta-distributed trust values based on environmental context
-3. **Trust Representation**: Each entity (robot/track) maintains trust as Beta distribution Beta(α, β) with natural exponential decay
-4. **Event-Based MDP**: Robots log state transitions when they detect tracks, enabling efficient learning from sparse but informative events
+### Stage 1: Supervised Learning (Evidence Extraction)
+**Heterogeneous GNN** trained on labeled ego-centric graphs to predict trustworthiness:
+- **Input**: Ego-centric graph with neural-symbolic binary predicates (3 features each for robots and tracks)
+- **Output**: Trust probability scores ∈ [0, 1] for robots and tracks
+- **Architecture**: 3-layer GAT with heterogeneous message passing and skip connections
+- **Training**: Binary cross-entropy on balanced 50/50 adversarial/legitimate samples
+
+### Stage 2: Reinforcement Learning (Adaptive Updates)
+**IQL Policy** that learns optimal trust update step scales:
+- **Input**: Robot state (6D features including GNN evidence score)
+- **Output**: Dual step scales (α_scale, β_scale) ∈ [0, 1]² for asymmetric trust updates
+- **Architecture**: Q-network, V-network, and Dual Beta policy network
+- **Training**: Implicit Q-Learning on offline event-based trajectories
+
+### Trust Representation
+Each entity (robot/track) maintains trust as **Beta distribution** Beta(α, β):
+- **Mean trust**: τ = α/(α+β) ∈ [0, 1]
+- **Confidence**: κ = α + β (higher = more certain)
+- **Decay**: Exponential forgetting with γ = 0.995 per timestep
+- **Updates**: Dual-action with separate step scales
+  - α += α_scale × evidence (learned for robots, fixed 0.5 for tracks)
+  - β += β_scale × (1 - evidence) (learned for robots, fixed 0.5 for tracks)
 
 ## Key Design Decisions
 
@@ -24,8 +42,8 @@ This system implements an end-to-end trust management framework for multi-robot 
 - **Track trust is simpler**: Binary classification (real/fake) works well with fixed step scale (0.5)
 
 **Implementation**:
-- Robots: 5D state features, learned step scales via IQL
-- Tracks: Fixed step scale of 0.5 for all trust updates
+- Robots: 6D state features, learned dual step scales (α_scale, β_scale) via IQL
+- Tracks: Fixed dual step scales (0.5, 0.5) for all trust updates
 
 ### 2. Event-Based State Transitions
 
@@ -50,14 +68,19 @@ This system implements an end-to-end trust management framework for multi-robot 
 - **Forgetting mechanism**: Exponential decay (γ=0.995) ensures old evidence fades
 - **Continuous evolution**: Trust decays between updates, captured by γ^Δt
 
-**Update Rule**:
+**Update Rule** (Dual-Action):
 ```
-α_new = α_old · γ^Δt + step_scale · evidence
-β_new = β_old · γ^Δt + step_scale · (1 - evidence)
+α_new = α_old · γ^Δt + α_scale · evidence
+β_new = β_old · γ^Δt + β_scale · (1 - evidence)
 τ = α / (α + β)  # Mean trust value
+
+Where:
+  α_scale: Step scale for positive evidence updates (learned by IQL policy)
+  β_scale: Step scale for negative evidence updates (learned by IQL policy)
+  This allows asymmetric update strategies (e.g., cautious with negative evidence)
 ```
 
-### 4. 5D State Features (Robots Only)
+### 4. 6D State Features (Robots Only)
 
 **State representation for each robot**:
 1. **evidence** (e): GNN trust score ∈ [0, 1]
@@ -65,60 +88,389 @@ This system implements an end-to-end trust management framework for multi-robot 
 3. **kappa** (κ): Trust mass = α + β (confidence indicator)
 4. **expected_visible**: Count of tracks in robot's FOV **with trust > 0.6** (potential collaborators)
 5. **trusted_count**: Count of **detected** tracks with trust > 0.6 (current observations)
+6. **proximal_count**: Count of robots within proximal range (validation opportunities)
 
 **Feature Consistency**:
 - Both `expected_visible` and `trusted_count` use the **same trust threshold (0.6)** filter
 - **expected_visible**: ALL tracks in FOV with high trust (broader context - what's available)
 - **trusted_count**: DETECTED tracks with high trust (narrower context - what's being used)
-- This makes the features interpretable: "X trustworthy tracks available, Y currently being observed"
+- **proximal_count**: Indicates collaborative sensing opportunities
+- This makes the features interpretable: "X trustworthy tracks available, Y currently being observed, Z robots nearby"
 
-**Why 5D (not 6D)**:
-- Removed `entity_type` feature (was always 1.0 for robots, redundant)
-- Simplified network architecture
-- Tracks not in MDP, so no need to distinguish entity types
+**Action Space**: Dual Beta distributions
+- **Action 1**: α_scale ∈ [0, 1] for positive evidence updates
+- **Action 2**: β_scale ∈ [0, 1] for negative evidence updates
+- Allows model to learn asymmetric update strategies (e.g., aggressive with positive evidence, cautious with negative)
+
+## Supervised Learning: Neural-Symbolic GNN
+
+### Overview
+
+The supervised GNN serves as the **evidence extractor** in the trust pipeline. It processes ego-centric heterogeneous graphs and outputs trust probability scores for all robots and tracks in the graph.
+
+**Key Design Philosophy**: Use **behavioral features only** (no trust values) to ensure train-test consistency during deployment.
+
+### Neural-Symbolic Features
+
+#### Robot Features (3 Binary Predicates)
+
+1. **HasFusedTracks** (Feature 0)
+   ```python
+   HasFusedTracks(robot) = 1 if robot has ≥1 trustworthy fused track, else 0
+   # Checks if robot's detections contributed to multi-robot fusion
+   # Only counts fused tracks with trust > 0.7
+   ```
+   - **Interpretation**: Robot collaborates successfully with others
+   - **Behavioral indicator**: Multi-robot validation of detections
+
+2. **HighConnectivity** (Feature 1)
+   ```python
+   HighConnectivity(robot) = 1 if robot observes ≥3 trustworthy tracks, else 0
+   # Only counts tracks with trust > 0.7
+   ```
+   - **Interpretation**: Robot is well-connected in the observation network
+   - **Behavioral indicator**: Active participation in collaborative sensing
+
+3. **ReliableDetector** (Feature 2)
+   ```python
+   ReliableDetector(robot) = 1 if avg(robot's current track trusts) > 0.6, else 0
+   # Uses current timestep tracks only
+   ```
+   - **Interpretation**: Robot produces high-quality detections
+   - **Behavioral indicator**: Detection accuracy over time
+
+#### Track Features (3 Binary Predicates)
+
+1. **DetectedByReliableRobot** (Feature 0)
+   ```python
+   DetectedByReliableRobot(track) = 1 if ≥1 detecting robot has ReliableDetector=1, else 0
+   # For fused tracks: checks all contributing robots
+   # For individual tracks: checks the single detector
+   ```
+   - **Interpretation**: Track has validation from a reliable source
+   - **Behavioral indicator**: Quality of detecting robots
+
+2. **MultiRobotTrack** (Feature 1)
+   ```python
+   MultiRobotTrack(track) = 1 if track is fused (detected by ≥2 robots), else 0
+   ```
+   - **Interpretation**: Multiple robots independently detected this object
+   - **Behavioral indicator**: Cross-validation through fusion
+
+3. **MajorityReliableDetectors** (Feature 2)
+   ```python
+   MajorityReliableDetectors(track) = 1 if >50% of detecting robots have ReliableDetector=1, else 0
+   # Only meaningful for fused tracks (≥2 detectors)
+   # Single-detector tracks get 0 (no consensus possible)
+   ```
+   - **Interpretation**: Consensus among reliable detectors
+   - **Behavioral indicator**: Strong multi-source validation
+
+**Why We Removed HighlyTrusted Feature**:
+
+❌ **Original Design** (4 features): Included `HighlyTrusted(entity) = 1 if trust > 0.7`
+
+**Problem**: Train-test distribution mismatch
+- **Training**: Robots/tracks have ground-truth trust values (0.7-1.0 for legitimate, 0.0-0.3 for adversarial)
+  - Model learns: `HighlyTrusted=1` → legitimate, `HighlyTrusted=0` → adversarial
+  - Achieves ~97% accuracy (feature leaks the answer!)
+- **Deployment**: All robots/tracks start with trust ≈ 0.5 (uninformed prior)
+  - All entities have `HighlyTrusted=0` → Model predicts all as adversarial ❌
+  - Massive false positive rate (legitimate robots incorrectly flagged)
+
+✅ **Current Design** (3 features): Only behavioral features
+- **Training**: Model learns from fusion patterns, connectivity, detection quality
+  - Achieves ~85-90% accuracy (lower but more robust)
+- **Deployment**: Same behavioral features available regardless of trust initialization
+  - Model generalizes correctly ✅
+
+### GNN Architecture
+
+**Network Type**: Heterogeneous Graph Attention Network (GAT)
+
+**Node Types**:
+- `agent`: Robots in ego-centric graph
+- `track`: Tracks detected by robots
+
+**Edge Types**:
+1. `('agent', 'in_fov_and_observed', 'track')`: Robot detects track
+2. `('track', 'observed_and_in_fov_by', 'agent')`: Reverse of above
+3. `('agent', 'in_fov_only', 'track')`: Track in robot's FOV but not detected
+4. `('track', 'in_fov_only_by', 'agent')`: Reverse of above
+5. `('agent', 'more_trustworthy_than', 'agent')`: Robot comparison edges (based on trust)
+
+**Architecture Details**:
+```python
+Input: x_agent ∈ R^(N_agents × 3), x_track ∈ R^(N_tracks × 3)
+
+# Layer 1: Embedding
+h_agent^(0) = Linear(3 → 64)(x_agent)
+h_track^(0) = Linear(3 → 64)(x_track)
+
+# Layers 1-3: Heterogeneous GAT with skip connections
+for layer in [1, 2, 3]:
+    h^(layer) = GAT(h^(layer-1), edges) + h^(layer-2)  # Skip connection
+    h^(layer) = ReLU(BatchNorm(h^(layer)))
+
+# Classification heads (separate for agents and tracks)
+# Agent classifier:
+agent_trust = Sigmoid(Linear(64 → 16 → 1)(h_agent^(3)))
+
+# Track classifier:
+track_trust = Sigmoid(Linear(64 → 16 → 1)(h_track^(3)))
+
+Output: p_agent ∈ [0,1]^(N_agents), p_track ∈ [0,1]^(N_tracks)
+```
+
+**Key Components**:
+- **GAT Attention**: 4 heads, concat=False (average), dropout=0.1
+- **Skip Connections**: Stabilize deep network training
+- **BatchNorm**: Normalize activations between layers
+- **Dropout**: 0.1 in GAT, 0.2/0.1 in classifiers (regularization)
+- **LayerNorm**: In classifier MLPs for stable gradients
+
+**Model Size**: ~91,000 parameters
+
+### Training Procedure
+
+**Dataset Generation**:
+```bash
+python generate_supervised_data.py \
+  --episodes 200 \
+  --output supervised_trust_dataset.pkl
+```
+
+**Process**:
+1. Run 200 diverse simulation episodes (varied robot density, adversarial ratio, FP/FN rates)
+2. Assign ground-truth trust with 20% noise:
+   - 80%: Perfect assignment (legitimate: 0.7-1.0, adversarial: 0.0-0.3)
+   - 20%: Random noise (0.0-1.0 regardless of ground truth)
+3. Build ego-centric graph for each robot at each timestep
+4. Extract neural-symbolic features (3 per robot, 3 per track)
+5. Generate binary labels (1=legitimate/ground-truth, 0=adversarial/false-positive)
+6. Balance dataset: 50% adversarial samples, 50% legitimate samples
+
+**Typical Dataset**: ~140,000 samples from 200 episodes
+
+**Model Training**:
+```bash
+python train_supervised_trust.py \
+  --data supervised_trust_dataset.pkl \
+  --epochs 100 \
+  --batch-size 256 \
+  --force-cpu \
+  --output supervised_trust_model.pth
+```
+
+**Training Configuration**:
+- **Loss**: Binary Cross-Entropy (BCE) with mean reduction
+  ```python
+  # Loss per node type
+  agent_loss = BCE(predictions['agent'], agent_labels) / N_agents
+  track_loss = BCE(predictions['track'], track_labels) / N_tracks
+
+  # Combined loss (average across node types)
+  total_loss = (agent_loss + track_loss) / 2
+  ```
+- **Normalization**: Each sample contributes equally regardless of graph size
+- **Optimizer**: Adam, lr=0.001
+- **Batch size**: 256 samples
+- **Early stopping**: Patience 20 epochs on validation loss
+- **Train/Val split**: 80/20
+
+**Expected Performance**:
+```
+Training (100 epochs):
+  Agent: ~85-90% accuracy, ~87-92% F1
+  Track: ~85-90% accuracy, ~87-92% F1
+
+Validation:
+  Agent: ~85-90% accuracy, ~87-92% F1
+  Track: ~85-90% accuracy, ~87-92% F1
+```
+
+**Note**: Accuracy is lower than with HighlyTrusted feature (~97%), but the model **generalizes correctly** to deployment scenarios.
+
+### Ego-Centric Graph Construction
+
+**For each robot (ego)**:
+```python
+# 1. Find proximal robots (within 50.0 units)
+proximal_robots = [r for r in all_robots
+                   if distance(ego, r) <= proximal_range]
+
+# 2. Collect all tracks from proximal robots
+proximal_tracks = []
+for robot in proximal_robots:
+    proximal_tracks.extend(robot.get_all_tracks())
+
+# 3. Perform track fusion (merge tracks of same object by different robots)
+fused_tracks = fusion_algorithm(proximal_tracks)
+
+# 4. Build heterogeneous graph
+graph = {
+    'agents': proximal_robots,  # Ego + nearby robots
+    'tracks': fused_tracks,
+    'edges': {
+        'in_fov_and_observed': [...],
+        'in_fov_only': [...],
+        'more_trustworthy_than': [...]
+    }
+}
+
+# 5. Extract features for all nodes
+agent_features = calculate_agent_features(proximal_robots, fused_tracks)
+track_features = calculate_track_features(fused_tracks, proximal_robots)
+```
+
+**Key Properties**:
+- **Ego-centric**: Each robot has its own view of the world
+- **Local**: Only includes robots within proximal range (scalable)
+- **Heterogeneous**: Two node types with different features
+- **Relational**: Captures observation relationships and robot comparisons
+
+### Runtime Inference
+
+**During deployment** (in `rl_trust_system.py`):
+```python
+for timestep in simulation:
+    for ego_robot in all_robots:
+        # 1. Build ego graph
+        graph = build_ego_graph(ego_robot, all_robots)
+
+        # 2. Extract features (3 per robot, 3 per track)
+        x_dict = {
+            'agent': agent_features,  # (N_agents, 3)
+            'track': track_features   # (N_tracks, 3)
+        }
+
+        # 3. Run GNN inference
+        predictions = supervised_gnn(x_dict, edge_index_dict)
+        #   predictions['agent']: (N_agents,) probabilities
+        #   predictions['track']: (N_tracks,) probabilities
+
+        # 4. Use evidence scores in RL policy
+        ego_evidence = predictions['agent'][0]  # Ego robot's score
+        step_scale = rl_policy.predict(ego_robot, ego_evidence)
+
+        # 5. Update trust
+        ego_robot.alpha += step_scale * ego_evidence
+        ego_robot.beta += step_scale * (1 - ego_evidence)
+```
+
+**Inference Time**: ~5-10ms per ego graph on CPU (fast enough for real-time)
 
 ## Technical Architecture
 
 ### Pipeline Overview
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     TRAINING PIPELINE                         │
-└──────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│                        TRAINING PIPELINE                           │
+└────────────────────────────────────────────────────────────────────┘
+
+STAGE 1: SUPERVISED LEARNING (Evidence Extraction)
+─────────────────────────────────────────────────
 1. Generate Supervised Data
-   └─> robot-track pairs with ground truth labels
+   Input:  200 simulation episodes
+   Output: ~140K ego-graph samples with binary labels
+   └─> Robot features: HasFusedTracks, HighConnectivity, ReliableDetector (3D)
+   └─> Track features: DetectedByReliable, MultiRobot, MajorityReliable (3D)
+   └─> Labels: 1=legitimate/ground-truth, 0=adversarial/false-positive
+   └─> Balanced: 50% adversarial, 50% legitimate
 
 2. Train Supervised GNN
-   └─> Evidence extractor: graph → trust scores
+   Input:  supervised_trust_dataset.pkl (~140K samples)
+   Output: supervised_trust_model.pth (~91K parameters)
+   └─> Architecture: 3-layer heterogeneous GAT
+   └─> Training: BCE loss, Adam optimizer, 100 epochs
+   └─> Performance: ~85-90% accuracy on agents and tracks
 
+STAGE 2: REINFORCEMENT LEARNING (Adaptive Trust Updates)
+─────────────────────────────────────────────────────────
 3. Generate Offline RL Dataset (Event-Based)
-   └─> Robot trajectories: (state, action, reward, next_state, Δt)
+   Input:  100 simulation episodes + trained supervised GNN
+   Output: ~200K robot event transitions
+   └─> Features: (evidence, tau, kappa, expected_visible, trusted_count, proximal_count) (6D)
+   └─> Actions: (α_scale, β_scale) ∈ [0,1]² (dual Beta distributions for asymmetric updates)
+   └─> Rewards: calibration improvement (scaled 100×)
+   └─> Event-based: Log only when robots detect tracks (~82 events/robot)
 
 4. Train IQL Policy
-   └─> Learn optimal step scales for trust updates
+   Input:  offline_dataset_balanced.npz (~200K transitions)
+   Output: iql_final.pth (Q, V, policy networks)
+   └─> Architecture: Q-critic, V-network, Beta policy
+   └─> Training: IQL with expectile regression (100K updates)
+   └─> Performance: FQE ~0.65-0.75
 
 5. Deploy & Evaluate
-   └─> Compare: Paper baseline vs RL policy
+   └─> Compare: Paper baseline vs Supervised+Fixed vs RL policy
+   └─> Metrics: Trust accuracy, convergence speed, AUC
 
-┌──────────────────────────────────────────────────────────────┐
-│                   RUNTIME ARCHITECTURE                        │
-└──────────────────────────────────────────────────────────────┘
-For each timestep:
+┌────────────────────────────────────────────────────────────────────┐
+│                      RUNTIME ARCHITECTURE                          │
+└────────────────────────────────────────────────────────────────────┘
+
+For each timestep t:
+  Apply exponential decay: α, β *= γ^1
+
   For each robot (ego):
-    1. Build ego-centric graph (robot + visible peers + tracks)
-    2. GNN extracts evidence scores
-    3. IQL policy predicts step scale for robot
-    4. Update robot trust: α/β += step_scale * evidence
-    5. Tracks updated with FIXED step scale = 0.5
-    6. Apply exponential decay: α/β *= γ
+    current_tracks = robot.get_current_timestep_tracks()
+
+    if not current_tracks:
+      continue  # Skip if no detections
+
+    # STAGE 1: Evidence Extraction (Supervised GNN)
+    ┌─────────────────────────────────────────────────┐
+    │ 1. Build ego-centric heterogeneous graph       │
+    │    - Nodes: proximal robots + their tracks     │
+    │    - Features: 3D binary predicates            │
+    │    - Edges: observation + comparison relations │
+    ├─────────────────────────────────────────────────┤
+    │ 2. Run supervised GNN forward pass             │
+    │    agent_probs, track_probs = GNN(graph)       │
+    │    ego_evidence = agent_probs[ego_index]       │
+    └─────────────────────────────────────────────────┘
+
+    # STAGE 2: Adaptive Update (IQL Dual-Action Policy)
+    ┌─────────────────────────────────────────────────┐
+    │ 3. Extract robot state features (6D)           │
+    │    state = [evidence, tau, kappa,              │
+    │             expected_visible, trusted_count,   │
+    │             proximal_count]                    │
+    ├─────────────────────────────────────────────────┤
+    │ 4. Predict dual step scales via IQL policy     │
+    │    α_scale, β_scale = IQL_policy(state)        │
+    │    # Two independent Beta distributions        │
+    │    # Both outputs ∈ [0,1]                      │
+    └─────────────────────────────────────────────────┘
+
+    # Trust Update (Dual-Action)
+    ┌─────────────────────────────────────────────────┐
+    │ 5. Update robot's trust distribution           │
+    │    alpha += α_scale × evidence                 │
+    │    beta  += β_scale × (1 - evidence)           │
+    │    # Asymmetric updates: different rates       │
+    │    # for positive vs negative evidence         │
+    │                                                 │
+    │ 6. Update tracks with FIXED dual step scales   │
+    │    For each track in current_tracks:           │
+    │      track.alpha += 0.5 × track_evidence       │
+    │      track.beta  += 0.5 × (1 - track_evidence) │
+    └─────────────────────────────────────────────────┘
+
+Result: Trust values τ = α/(α+β) for all robots and tracks
 ```
 
 ### IQL Training Architecture
 
 **Networks**:
-- **Q-Critic**: Estimates Q(s,a) for state-action pairs
+- **Q-Critic**: Estimates Q(s,a) for state-action pairs (action_dim=2 for dual actions)
 - **V-Network**: Estimates state value V(s) via expectile regression
-- **Beta Policy**: Outputs step scales ∈ [0,1] using Beta distribution
+- **Dual Beta Policy**: Outputs TWO independent step scales (α_scale, β_scale) ∈ [0,1]² using two Beta distributions
+  - Shared backbone (2-layer MLP with 128 hidden units)
+  - Separate heads for each action's Beta parameters (4 heads total)
+  - Allows learning asymmetric update strategies
 
 **Loss Functions**:
 1. Q-loss: `MSE(Q(s,a), r + γ^Δt · V_target(s'))`
@@ -212,18 +564,18 @@ python compare_trust_methods.py
 **Contents**:
 ```python
 {
-  'states': (N, 5) float32,           # Robot state features
-  'actions': (N,) float32,            # Step scales [0,1]
+  'states': (N, 6) float32,           # Robot state features (6D)
+  'actions': (N, 2) float32,          # Dual step scales [α_scale, β_scale] ∈ [0,1]²
   'rewards': (N,) float32,            # Calibration improvement
-  'next_states': (N, 5) float32,      # Next state features
+  'next_states': (N, 6) float32,      # Next state features (6D)
   'dones': (N,) float32,              # 1=terminal, 0=continue
   'delta_prevs': (N,) int32,          # Time since last event
   'delta_nexts': (N,) int32,          # Time to next event
   'trajectory_starts': (T,) int64,    # Start index per trajectory
   'trajectory_lengths': (T,) int64,   # Length per trajectory
   'gamma': 0.995,                     # Decay factor
-  'feature_means': (5,) float32,      # For normalization
-  'feature_stds': (5,) float32,       # For normalization
+  'feature_means': (6,) float32,      # For normalization
+  'feature_stds': (6,) float32,       # For normalization
 }
 ```
 
@@ -238,9 +590,11 @@ Terminal state proportion: ~1.2% (1/82)
 
 ### Feature Normalization
 
-**Critical for IQL inference**: Features [1-4] are z-score normalized during training:
+**Critical for IQL inference**: Features [1-5] are z-score normalized during training:
 ```python
 normalized[i] = (features[i] - mean[i]) / (std[i] + 1e-8)
+# Normalizes: tau, kappa, expected_visible, trusted_count, proximal_count
+# Keeps evidence [0] unchanged (already in [0,1] from GNN)
 ```
 
 Normalization parameters saved in dataset and checkpoint, automatically applied during:
@@ -269,10 +623,10 @@ for step_idx in range(100):  # Episode length
         # Robot has detections → compute evidence and log event
         evidence_scores = gnn.predict(robot, all_robots)
         robot_evidence = evidence_scores.agent_scores[robot.id]
-        step_scale = policy.predict(robot_features)
+        α_scale, β_scale = policy.predict(robot_features)  # Dual actions
 
         # Log transition: (state, action, reward, next_state, delta_t)
-        log_robot_event(robot, robot_evidence, step_scale, ...)
+        log_robot_event(robot, robot_evidence, (α_scale, β_scale), ...)
 ```
 
 **Key insight**: Each robot can log 0-100 events per episode depending on detection frequency. Active robots (many detections) → long trajectories.
@@ -281,13 +635,13 @@ for step_idx in range(100):  # Episode length
 
 **Runtime behavior**:
 ```python
-# Tracks not in MDP, use fixed step scale
+# Tracks not in MDP, use fixed dual step scales
 for track in robot.get_current_timestep_tracks():
     evidence = gnn_scores.track_scores[track.track_id]
-    step_scale = 0.5  # FIXED, not learned
+    α_scale, β_scale = 0.5, 0.5  # FIXED, not learned
 
-    track.alpha += step_scale * evidence
-    track.beta += step_scale * (1 - evidence)
+    track.alpha += α_scale * evidence
+    track.beta += β_scale * (1 - evidence)
 ```
 
 ### Trust Decay
@@ -345,10 +699,22 @@ trusted_count = sum(1 for robot_id in detecting_robots
 - `train_iql_trust.py` - IQL training with event-based variable discounting ⭐
 - `iql_networks.py` - Q, V, Beta policy networks
 
-**Supervised Learning**:
-- `generate_supervised_data.py` - Generate GNN training data
+**Supervised Learning** (Evidence Extraction):
+- `generate_supervised_data.py` - Generate GNN training data with ground truth labels
+  - Builds ego-centric graphs for each robot at each timestep
+  - Extracts 3D neural-symbolic features (binary predicates)
+  - Balances adversarial/legitimate samples (50/50)
+  - Adds 20% label noise to prevent overfitting
 - `train_supervised_trust.py` - Train supervised GNN
+  - Binary classification with BCE loss
+  - Trains on ~140K samples from 200 episodes
+  - Early stopping with validation monitoring
+  - Saves best model checkpoint
 - `supervised_trust_gnn.py` - Heterogeneous GNN architecture
+  - `TrustFeatureCalculator`: Computes 3D binary features for robots and tracks
+  - `EgoGraphBuilder`: Constructs local heterogeneous graphs
+  - `SupervisedTrustGNN`: 3-layer GAT with skip connections (~91K params)
+  - `SupervisedTrustPredictor`: Inference wrapper for deployment
 
 **Environment & Simulation**:
 - `simulation_environment.py` - Multi-robot simulation world
