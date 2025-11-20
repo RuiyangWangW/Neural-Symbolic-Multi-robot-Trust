@@ -158,10 +158,15 @@ class TrustFeatureCalculator:
                             if hasattr(track, 'object_id') and track.object_id in observed_objects:
                                 fused_count += 1
 
-            # Feature 2: expected_count - from all objects detected by all robots in ego graph,
-            # how many are within this robot's FoV
+            # Feature 2: expected_count - from objects detected by OTHER robots in ego graph,
+            # how many are within this robot's FoV (collaborative visibility)
+            # IMPORTANT: Exclude objects that ONLY this robot detected (to avoid double-counting)
             expected_count = 0
             for obj_id in object_detectors.keys():
+                # Skip objects that only this robot detected (not collaborative)
+                if obj_id in observed_objects and len(object_detectors[obj_id]) == 1:
+                    continue  # Only this robot detected it, not in expected set
+
                 # Find any track for this object to check position
                 track_for_object = None
                 for track in all_tracks:
@@ -175,11 +180,13 @@ class TrustFeatureCalculator:
             # Feature 3: partner_count - number of robots in ego graph that has fused tracks with this robot
             partner_count = len(fusion_partners.get(robot.id, set()))
 
-            # Feature 4: detection_ratio = observed_count / expected_count
-            detection_ratio = observed_count / (expected_count + epsilon)
+            # Feature 4: detection_ratio = observed_count / (1 + expected_count)
+            # Using 1+expected_count to avoid extreme values for isolated robots
+            detection_ratio = observed_count / (1 + expected_count)
 
-            # Feature 5: validator_ratio = partner_count / (robots with detections in this robot's FoV)
+            # Feature 5: validator_ratio = partner_count / (1 + robots with detections in this robot's FoV)
             # Count robots that detected objects within this robot's FoV
+            # Using 1+robots_in_fov to avoid extreme values for isolated robots
             robots_in_fov = 0
             for other_idx, other_robot in enumerate(robots):
                 if other_idx == robot_idx:
@@ -191,7 +198,7 @@ class TrustFeatureCalculator:
                         robots_in_fov += 1
                         break  # Count each robot only once
 
-            validator_ratio = partner_count / (robots_in_fov + epsilon)
+            validator_ratio = partner_count / (1 + robots_in_fov)
 
             agent_features.append([
                 float(observed_count),    # Feature 0

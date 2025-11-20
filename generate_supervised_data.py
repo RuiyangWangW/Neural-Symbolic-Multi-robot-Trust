@@ -351,12 +351,15 @@ class SupervisedDataGenerator:
 
         return agent_labels, track_labels
 
-    def generate_episode_data(self, episode_idx: int = 0) -> Tuple[List[SupervisedDataSample], Dict]:
+    def generate_episode_data(self, episode_idx: int = 0, step_interval: int = 10,
+                             ego_sample_ratio: float = 0.2) -> Tuple[List[SupervisedDataSample], Dict]:
         """
         Generate supervised data for one episode using RL trust algorithm
 
         Args:
             episode_idx: Episode index for tracking
+            step_interval: Sample ego graphs every N steps (default: 10)
+            ego_sample_ratio: Proportion of ego graphs to sample at each timestep (default: 0.2)
 
         Returns:
             Tuple of (list of data samples for the episode, episode parameters)
@@ -366,9 +369,18 @@ class SupervisedDataGenerator:
 
         print(f"Generating data for episode {episode_idx}...")
         print(f"  Parameters: {episode_params}")
+        print(f"  Sampling: every {step_interval} steps, {ego_sample_ratio*100:.0f}% of ego graphs per step")
 
         # Create simulation environment with sampled parameters
         self._create_simulation_environment(episode_params)
+
+        # Log initial randomized state for verification
+        if len(self.sim_env.robots) > 0:
+            robot0_pos = self.sim_env.robots[0].start_position[:2]
+            robot0_goal = self.sim_env.robots[0].goal_position[:2]
+            adv_ids = [r.id for r in self.sim_env.robots if r.is_adversarial]
+            print(f"  Randomized: Robot0 start=({robot0_pos[0]:.1f}, {robot0_pos[1]:.1f}), " +
+                  f"goal=({robot0_goal[0]:.1f}, {robot0_goal[1]:.1f}), adversarial={adv_ids}")
 
         episode_data = []
 
@@ -379,13 +391,21 @@ class SupervisedDataGenerator:
                 print(f"Warning: RL trust step failed at step {step}: {e}")
                 break
 
+            # Only sample ego graphs at specified intervals
+            if step % step_interval != 0:
+                continue
+
             robots = self.sim_env.robots
             if not robots:
                 print(f"Warning: No robots at step {step}")
                 continue
 
-            # Generate ego graphs for each robot (same as RL training loop)
-            for ego_robot in robots:
+            # Sample a subset of robots for ego graphs
+            num_robots_to_sample = max(1, int(len(robots) * ego_sample_ratio))
+            sampled_robots = random.sample(robots, num_robots_to_sample)
+
+            # Generate ego graphs for sampled robots
+            for ego_robot in sampled_robots:
                 try:
                     # Build ego-graph for this robot
                     ego_graph = self.ego_graph_builder.build_ego_graph(ego_robot, robots)
@@ -419,7 +439,9 @@ class SupervisedDataGenerator:
     def generate_dataset(self,
                         num_episodes: int = 10,
                         save_path: str = "supervised_trust_dataset.pkl",
-                        log_path: str = None) -> Tuple[List[SupervisedDataSample], List[Dict]]:
+                        log_path: str = None,
+                        step_interval: int = 10,
+                        ego_sample_ratio: float = 0.2) -> Tuple[List[SupervisedDataSample], List[Dict]]:
         """
         Generate complete dataset with multiple episodes using diverse parameters
 
@@ -427,6 +449,8 @@ class SupervisedDataGenerator:
             num_episodes: Number of episodes to generate
             save_path: Path to save the dataset
             log_path: Optional path to save generation log (default: save_path.replace('.pkl', '.log'))
+            step_interval: Sample ego graphs every N steps (default: 10)
+            ego_sample_ratio: Proportion of ego graphs to sample at each timestep (default: 0.2)
 
         Returns:
             Tuple of (list of all data samples, list of episode parameters)
@@ -469,6 +493,10 @@ class SupervisedDataGenerator:
         log_print(f"   - World size (square): {self.world_size[0]} x {self.world_size[1]}")
         log_print(f"   - Proximal range (fixed): {self.proximal_range}")
         log_print(f"⏱️  Max steps per episode: {self.max_steps_per_episode}")
+        log_print(f"📊 Sampling strategy:")
+        log_print(f"   - Step interval: every {step_interval} steps")
+        log_print(f"   - Ego sample ratio: {ego_sample_ratio*100:.0f}% of robots per sampled step")
+        log_print(f"   - Expected samples per episode: ~{(self.max_steps_per_episode // step_interval) * ego_sample_ratio * 5:.0f} (assuming ~5 robots)")
 
         log_print(f"🧠 Using ground truth trust assignment:")
         log_print(f"   - Legitimate robots/tracks: trust ∈ [0.7, 1.0]")
@@ -481,7 +509,9 @@ class SupervisedDataGenerator:
 
         for episode in range(num_episodes):
             try:
-                episode_data, episode_params = self.generate_episode_data(episode)
+                episode_data, episode_params = self.generate_episode_data(
+                    episode, step_interval=step_interval, ego_sample_ratio=ego_sample_ratio
+                )
                 all_data.extend(episode_data)
                 all_episode_params.append(episode_params)
 
@@ -558,9 +588,9 @@ class SupervisedDataGenerator:
         agent_samples = sum(1 for sample in all_data if sample.agent_labels.shape[0] > 0)
         track_samples = sum(1 for sample in all_data if sample.track_labels.shape[0] > 0)
 
-        # Check for agent comparison edges
-        comparison_edge_samples = sum(1 for sample in all_data
-                                    if ('agent', 'more_trustworthy_than', 'agent') in sample.edge_index_dict)
+        # Check for agent co-detection edges
+        codetection_edge_samples = sum(1 for sample in all_data
+                                    if ('agent', 'co_detection', 'agent') in sample.edge_index_dict)
 
         if all_data:
             avg_agents_per_sample = np.mean([sample.agent_labels.shape[0] for sample in all_data])
@@ -640,7 +670,7 @@ class SupervisedDataGenerator:
         log_print(f"\n📊 Dataset Statistics:")
         log_print(f"   - Samples with agents: {agent_samples}")
         log_print(f"   - Samples with tracks: {track_samples}")
-        log_print(f"   - Samples with agent comparison edges: {comparison_edge_samples}")
+        log_print(f"   - Samples with agent co-detection edges: {codetection_edge_samples}")
         log_print(f"   - Avg agents per sample: {avg_agents_per_sample:.1f}")
         log_print(f"   - Avg tracks per sample: {avg_tracks_per_sample:.1f}")
         log_print(f"   - Agent feature dimensions: {sample_agent_features} (alpha/beta removed)")
@@ -672,7 +702,7 @@ class SupervisedDataGenerator:
                 'total_samples': len(all_data),
                 'agent_samples': agent_samples,
                 'track_samples': track_samples,
-                'comparison_edge_samples': comparison_edge_samples,
+                'codetection_edge_samples': codetection_edge_samples,
                 'avg_agents_per_sample': avg_agents_per_sample,
                 'avg_tracks_per_sample': avg_tracks_per_sample,
                 'parameter_diversity': param_stats if all_episode_params else {}
@@ -708,8 +738,8 @@ def main():
             return (val, val)
 
     parser = argparse.ArgumentParser(description='Generate supervised trust learning dataset with diverse parameters')
-    parser.add_argument('--episodes', type=int, default=200,
-                       help='Number of episodes to generate (default: 200)')
+    parser.add_argument('--episodes', type=int, default=50000,
+                       help='Number of episodes to generate (default: 50000)')
     parser.add_argument('--robot-density', type=str, default='0.0005,0.0020',
                        help='Robot density range in robots per square unit (default: 0.0005,0.0020)')
     parser.add_argument('--target-density-multiplier', type=str, default='2.0',
@@ -726,6 +756,10 @@ def main():
                        help='Proximal sensing range: fixed value (default: 50.0)')
     parser.add_argument('--steps', type=int, default=100,
                        help='Max steps per episode (default: 100)')
+    parser.add_argument('--step-interval', type=int, default=10,
+                       help='Sample ego graphs every N steps to reduce duplicates (default: 10)')
+    parser.add_argument('--ego-sample-ratio', type=float, default=0.2,
+                       help='Proportion of ego graphs to sample at each timestep (default: 0.2 = 20%%)')
     parser.add_argument('--output', type=str, default='supervised_trust_dataset.pkl',
                        help='Output file path (default: supervised_trust_dataset.pkl)')
     args = parser.parse_args()
@@ -766,7 +800,9 @@ def main():
     # Generate dataset
     dataset, episode_params = generator.generate_dataset(
         num_episodes=args.episodes,
-        save_path=args.output
+        save_path=args.output,
+        step_interval=args.step_interval,
+        ego_sample_ratio=args.ego_sample_ratio
     )
 
     print(f"\n🎯 Dataset generation complete!")
@@ -775,7 +811,7 @@ def main():
     print(f"   - Legitimate robots/tracks: trust ∈ [0.7, 1.0]")
     print(f"   - Adversarial robots/tracks: trust ∈ [0.0, 0.3]")
     print(f"   - Confidence: Higher when trust is closer to 0 or 1")
-    print(f"🔗 Agent comparison edges included")
+    print(f"🔗 Agent co-detection edges included (robots detecting same objects)")
     print(f"📉 Alpha/beta features removed from node features")
     print(f"🎲 Parameter diversity across episodes for more robust training")
 
