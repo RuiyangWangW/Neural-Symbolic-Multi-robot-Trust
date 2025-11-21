@@ -211,30 +211,6 @@ class TrustFeatureCalculator:
 
         return torch.tensor(agent_features, dtype=torch.float)
 
-    def _calculate_active_detector_for_robot(self, robot: 'Robot', all_tracks: List['Track']) -> float:
-        """
-        TRUST-FREE helper method to calculate ActiveDetector predicate for a robot.
-        Measures behavioral activity rather than trust values.
-
-        Args:
-            robot: Robot object
-            all_tracks: List of all tracks
-
-        Returns:
-            1.0 if robot is active (detects >= 2 tracks OR participates in >= 1 fusion), else 0.0
-        """
-        current_tracks = robot.get_current_timestep_tracks()
-        detection_count = len(current_tracks)
-
-        # Check fusion participation
-        fused_count = sum(1 for track in all_tracks
-                        if hasattr(track, 'track_id') and 'fused_' in track.track_id
-                        and any(part.isdigit() and int(part) == robot.id
-                              for part in track.track_id.split('_')[1:-1]))
-
-        # Active if: detects >= 2 tracks OR participates in >= 1 fusion
-        return 1.0 if (detection_count >= 2 or fused_count >= 1) else 0.0
-
     def calculate_track_features(self, all_tracks: List['Track'], fused_tracks: List['Track'], robots: List['Robot'] = None) -> torch.Tensor:
         """
         Calculate TRUST-FREE continuous features for track nodes.
@@ -370,7 +346,7 @@ class SupervisedTrustGNN(nn.Module):
     - All features are trust-free and behavioral
     """
 
-    def __init__(self, agent_features: int = 6, track_features: int = 2, hidden_dim: int = 64):
+    def __init__(self, agent_features: int = 6, track_features: int = 2, hidden_dim: int = 128):
         super(SupervisedTrustGNN, self).__init__()
 
         self.hidden_dim = hidden_dim
@@ -560,7 +536,7 @@ class SupervisedTrustPredictor:
         self.model = SupervisedTrustGNN(
             agent_features=6,  # 6D continuous ratio-based features (trust-free)
             track_features=2,  # 2D continuous ratio-based features (trust-free)
-            hidden_dim=64
+            hidden_dim=128
         )
 
         resolved_path = Path(model_path) if model_path else None

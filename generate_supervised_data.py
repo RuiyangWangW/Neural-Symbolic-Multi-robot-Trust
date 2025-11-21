@@ -738,8 +738,8 @@ def main():
             return (val, val)
 
     parser = argparse.ArgumentParser(description='Generate supervised trust learning dataset with diverse parameters')
-    parser.add_argument('--episodes', type=int, default=50000,
-                       help='Number of episodes to generate (default: 50000)')
+    parser.add_argument('--episodes', type=int, default=2000,
+                       help='Number of episodes to generate (default: 2000)')
     parser.add_argument('--robot-density', type=str, default='0.0005,0.0020',
                        help='Robot density range in robots per square unit (default: 0.0005,0.0020)')
     parser.add_argument('--target-density-multiplier', type=str, default='2.0',

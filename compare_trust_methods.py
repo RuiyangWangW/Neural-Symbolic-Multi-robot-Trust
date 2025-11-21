@@ -136,15 +136,6 @@ class TrustMethodComparison:
             mu_kappa=2.0,
             sigma_kappa=1.0,
             delta_tau_max=0.1,
-            # Robot cross-validation
-            low_validation_penalty=0.05,
-            unique_detection_penalty=0.08,
-            agreement_bonus=0.03,
-            disagreement_penalty=0.05,
-            # Track cross-validation
-            validation_bonus=0.03,
-            isolation_penalty=0.1,
-            beta_penalty=0.05,
             trust_threshold=0.6
         )
 
