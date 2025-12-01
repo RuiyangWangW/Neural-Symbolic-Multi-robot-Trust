@@ -175,7 +175,7 @@ class SupervisedTrustTrainer:
 
             # Transfer feature dictionaries with validation
             x_dict = {}
-            for k, v in sample['x_dict'].items():
+            for k, v in sample.x_dict.items():
                 if v.numel() > 0:  # Check for non-empty tensors
                     x_dict[k] = v.to(self.device, non_blocking=use_non_blocking)
                 else:
@@ -184,7 +184,7 @@ class SupervisedTrustTrainer:
 
             # Transfer edge indices with validation
             edge_index_dict = {}
-            for k, v in sample['edge_index_dict'].items():
+            for k, v in sample.edge_index_dict.items():
                 if v.numel() > 0:  # Check for non-empty tensors
                     edge_index_dict[k] = v.to(self.device, non_blocking=use_non_blocking)
                 else:
@@ -192,17 +192,17 @@ class SupervisedTrustTrainer:
                     edge_index_dict[k] = v.to(self.device, non_blocking=False)
 
             # Transfer labels with validation
-            agent_labels = sample['agent_labels'].to(self.device, non_blocking=use_non_blocking) if sample['agent_labels'].numel() > 0 else sample['agent_labels'].to(self.device, non_blocking=False)
-            track_labels = sample['track_labels'].to(self.device, non_blocking=use_non_blocking) if sample['track_labels'].numel() > 0 else sample['track_labels'].to(self.device, non_blocking=False)
+            agent_labels = sample.agent_labels.to(self.device, non_blocking=use_non_blocking) if sample.agent_labels.numel() > 0 else sample.agent_labels.to(self.device, non_blocking=False)
+            track_labels = sample.track_labels.to(self.device, non_blocking=use_non_blocking) if sample.track_labels.numel() > 0 else sample.track_labels.to(self.device, non_blocking=False)
 
             return x_dict, edge_index_dict, agent_labels, track_labels
 
         except Exception as e:
             # Fallback to synchronous transfer for problematic samples
-            x_dict = {k: v.to(self.device, non_blocking=False) for k, v in sample['x_dict'].items()}
-            edge_index_dict = {k: v.to(self.device, non_blocking=False) for k, v in sample['edge_index_dict'].items()}
-            agent_labels = sample['agent_labels'].to(self.device, non_blocking=False)
-            track_labels = sample['track_labels'].to(self.device, non_blocking=False)
+            x_dict = {k: v.to(self.device, non_blocking=False) for k, v in sample.x_dict.items()}
+            edge_index_dict = {k: v.to(self.device, non_blocking=False) for k, v in sample.edge_index_dict.items()}
+            agent_labels = sample.agent_labels.to(self.device, non_blocking=False)
+            track_labels = sample.track_labels.to(self.device, non_blocking=False)
 
             if self.device.type == 'mps':
                 print(f"MPS transfer fallback used for sample due to: {e}")
@@ -363,8 +363,12 @@ class SupervisedTrustTrainer:
         if agent_labels.numel() == 0 and track_labels.numel() == 0:
             return 0.0, {}
 
-        # Forward pass
-        predictions = self.model(x_dict, edge_index_dict)
+        # Extract graph size (no features needed)
+        num_agents = x_dict['agent'].shape[0] if 'agent' in x_dict else 0
+        num_tracks = x_dict['track'].shape[0] if 'track' in x_dict else 0
+
+        # Forward pass (structure-only)
+        predictions = self.model(num_agents, num_tracks, edge_index_dict, device=self.device)
 
         # Compute loss
         loss = self._compute_loss(predictions, agent_labels, track_labels)
@@ -394,8 +398,12 @@ class SupervisedTrustTrainer:
         agent_labels = batch_data['agent_labels'].to(self.device)
         track_labels = batch_data['track_labels'].to(self.device)
 
-        # Forward pass - PyG handles the batching automatically
-        predictions = self.model(hetero_batch.x_dict, hetero_batch.edge_index_dict)
+        # Extract graph size (no features needed)
+        num_agents = hetero_batch.x_dict['agent'].shape[0] if 'agent' in hetero_batch.x_dict else 0
+        num_tracks = hetero_batch.x_dict['track'].shape[0] if 'track' in hetero_batch.x_dict else 0
+
+        # Forward pass - PyG handles the batching automatically (structure-only)
+        predictions = self.model(num_agents, num_tracks, hetero_batch.edge_index_dict, device=self.device)
 
         # Compute loss - PyG concatenated everything, so labels should align
         loss = self._compute_loss(predictions, agent_labels, track_labels)
@@ -841,12 +849,8 @@ def main():
                            shuffle=False, collate_fn=collate_batch,
                            num_workers=num_workers, pin_memory=pin_memory)
 
-    # Create model with NEW DESIGN: continuous ratio-based features (trust-free)
-    model = SupervisedTrustGNN(
-        agent_features=6,  # 6D continuous: observed_count, fused_count, expected_count, partner_count, detection_ratio, validator_ratio
-        track_features=2,  # 2D continuous: detector_count, detector_ratio
-        hidden_dim=64
-    )
+    # Create model with structure-only learning (no input features)
+    model = SupervisedTrustGNN(hidden_dim=128)
 
     print(f"🧠 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"👷 DataLoader workers: {num_workers}")

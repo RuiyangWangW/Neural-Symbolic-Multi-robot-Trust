@@ -18,7 +18,7 @@ from pathlib import Path
 
 # Import existing simulation components
 from simulation_environment import SimulationEnvironment
-from supervised_trust_gnn import TrustFeatureCalculator, EgoGraphBuilder
+from supervised_trust_gnn import EgoGraphBuilder
 
 
 @dataclass
@@ -84,9 +84,6 @@ class SupervisedDataGenerator:
 
         # Initialize simulation environment (will be recreated for each episode with sampled parameters)
         self.sim_env = None
-
-        # Initialize enhanced feature calculator for proper neural symbolic features
-        self.feature_calculator = TrustFeatureCalculator()
 
         # Initialize ego graph builder (will be updated for each episode)
         self.ego_graph_builder = None
