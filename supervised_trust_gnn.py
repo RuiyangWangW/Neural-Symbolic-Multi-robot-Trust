@@ -30,10 +30,11 @@ class SupervisedTrustGNN(nn.Module):
     """
     Supervised GNN model for binary trust classification
 
-    SIMPLIFIED DESIGN:
+    PURE STRUCTURE-ONLY DESIGN:
     - No node features - learns purely from graph structure
-    - Uses learnable node type embeddings (one for agents, one for tracks)
-    - Structure-only learning
+    - No type embeddings - all nodes start with zero features
+    - Information flows entirely through edge structure and message passing
+    - Edge types: 6 heterogeneous relations define the graph topology
     """
 
     def __init__(self, hidden_dim: int = 128):
@@ -41,10 +42,8 @@ class SupervisedTrustGNN(nn.Module):
 
         self.hidden_dim = hidden_dim
 
-        # Learnable node type embeddings (no input features)
-        # Each node gets initialized with a shared type-specific embedding
-        self.agent_type_embedding = nn.Parameter(torch.randn(1, hidden_dim))
-        self.track_type_embedding = nn.Parameter(torch.randn(1, hidden_dim))
+        # Pure structure-only learning: NO node features, NO type embeddings
+        # All nodes start with zero features - only edges provide information
 
         # Graph convolution layers using heterogeneous GAT
         edge_types = [
@@ -130,15 +129,15 @@ class SupervisedTrustGNN(nn.Module):
         # Check if we have any tracks
         has_tracks = num_tracks > 0
 
-        # Initialize all nodes with learnable type embeddings
-        # Agent nodes: all get the same initial embedding (will be differentiated by graph structure)
-        agent_embeddings = self.agent_type_embedding.expand(num_agents, -1)
+        # Pure structure-only: Initialize ALL nodes with ZEROS
+        # No initial features - all information comes from graph structure and message passing
+        agent_embeddings = torch.zeros(num_agents, self.hidden_dim, device=device)
 
         x_dict = {'agent': agent_embeddings}
 
-        # Track nodes: all get the same initial embedding
+        # Track nodes: also initialized with zeros
         if has_tracks:
-            track_embeddings = self.track_type_embedding.expand(num_tracks, -1)
+            track_embeddings = torch.zeros(num_tracks, self.hidden_dim, device=device)
             x_dict['track'] = track_embeddings
         else:
             # Create empty track tensor with correct dimensions
