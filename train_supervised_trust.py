@@ -857,7 +857,9 @@ def main():
 
     # Optimize DataLoader settings based on device
     pin_memory = 'cuda' in device
-    num_workers = args.num_workers if args.num_workers > 0 else (2 if 'cuda' in device else (0 if device == 'mps' else 0))
+    # Use num_workers=0 to avoid "too many open files" error with shared memory
+    # User can override with --num-workers if they've increased system limits
+    num_workers = args.num_workers if args.num_workers >= 0 else 0
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
                              shuffle=True, collate_fn=collate_batch,
