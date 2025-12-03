@@ -115,11 +115,16 @@ def collate_batch_pyg(batch: List[Dict]) -> Dict:
     # Compute offsets for meaningful track indices
     track_batch = batched_data['track'].batch  # Which graph each track belongs to
     meaningful_track_indices_batched = []
+    meaningful_track_indices_per_graph_batched = []  # Per-graph organization
     track_offset = 0
     for i, sample in enumerate(batch):
         # Offset the meaningful track indices for this graph
+        graph_meaningful_indices = []
         for idx in meaningful_track_indices_per_graph[i]:
-            meaningful_track_indices_batched.append(track_offset + idx)
+            global_idx = track_offset + idx
+            meaningful_track_indices_batched.append(global_idx)
+            graph_meaningful_indices.append(global_idx)
+        meaningful_track_indices_per_graph_batched.append(graph_meaningful_indices)
         track_offset += sample['num_tracks']
 
     # Stack all labels
@@ -132,7 +137,8 @@ def collate_batch_pyg(batch: List[Dict]) -> Dict:
         'batched_data': batched_data,
         'ego_robot_indices': ego_robot_indices,  # List of ego indices in batched graph
         'ego_cross_validation_flags': ego_cross_validation_flags,  # Per-graph flags
-        'meaningful_track_indices': meaningful_track_indices_batched,  # Global indices
+        'meaningful_track_indices': meaningful_track_indices_batched,  # Global indices (all)
+        'meaningful_track_indices_per_graph': meaningful_track_indices_per_graph_batched,  # Per-graph lists
         'agent_labels': agent_labels_batched,  # [total_agents, 1]
         'track_labels': track_labels_batched,  # [total_tracks, 1]
         'agent_batch': agent_batch,  # Which graph each agent belongs to
@@ -511,7 +517,7 @@ class SupervisedTrustTrainer:
         batched_graph = batch_data['batched_data']
         ego_robot_indices = batch_data['ego_robot_indices']
         ego_cross_validation_flags = batch_data['ego_cross_validation_flags']
-        meaningful_track_indices = batch_data['meaningful_track_indices']
+        meaningful_track_indices_per_graph = batch_data['meaningful_track_indices_per_graph']
         agent_labels = batch_data['agent_labels']
         track_labels = batch_data['track_labels']
         batch_size = batch_data['batch_size']
@@ -539,16 +545,21 @@ class SupervisedTrustTrainer:
             track_labels,
             ego_robot_indices,
             ego_cross_validation_flags,
-            meaningful_track_indices
+            meaningful_track_indices_per_graph
         )
 
         # Compute metrics (simplified for batched processing)
+        # Flatten meaningful track indices for metrics
+        all_meaningful_indices = []
+        for graph_indices in meaningful_track_indices_per_graph:
+            all_meaningful_indices.extend(graph_indices)
+
         metrics = self._compute_batched_metrics(
             predictions,
             agent_labels,
             track_labels,
             ego_robot_indices,
-            meaningful_track_indices
+            all_meaningful_indices
         )
 
         return loss, metrics
@@ -556,9 +567,12 @@ class SupervisedTrustTrainer:
     def _compute_batched_loss(self, predictions: Dict, agent_labels: torch.Tensor,
                               track_labels: torch.Tensor, ego_robot_indices: List[int],
                               ego_cross_validation_flags: List[bool],
-                              meaningful_track_indices: List[int]) -> torch.Tensor:
+                              meaningful_track_indices_per_graph: List[List[int]]) -> torch.Tensor:
         """
         Compute loss for batched predictions with cross-validation constraints.
+
+        IMPORTANT: This must match individual processing, which sums losses across samples.
+        We compute loss per-graph and sum them (not average).
 
         Args:
             predictions: Model predictions dict
@@ -566,53 +580,46 @@ class SupervisedTrustTrainer:
             track_labels: All track labels [total_tracks, 1]
             ego_robot_indices: Indices of ego robots in batched graph
             ego_cross_validation_flags: Per-graph cross-validation flags
-            meaningful_track_indices: Global indices of meaningful tracks
+            meaningful_track_indices_per_graph: List of lists, per-graph meaningful track indices
 
         Returns:
-            Total loss across all graphs
+            Total loss across all graphs (sum, not mean)
         """
         import torch
 
-        loss = 0.0
-        loss_components = 0
+        total_loss = 0.0
+        num_samples = len(ego_robot_indices)
 
-        # Agent loss: Only ego robots with cross-validation
-        if 'agent' in predictions and agent_labels.shape[0] > 0:
-            agent_preds = predictions['agent']  # [total_agents, 1]
+        # Process each graph individually to match individual processing behavior
+        for graph_idx in range(num_samples):
+            graph_loss = 0.0
+            loss_components = 0
 
-            # Filter to ego robots with cross-validation
-            valid_ego_indices = [
-                idx for idx, has_cv in zip(ego_robot_indices, ego_cross_validation_flags)
-                if has_cv
-            ]
-
-            if len(valid_ego_indices) > 0:
-                ego_indices_tensor = torch.tensor(valid_ego_indices, dtype=torch.long, device=self.device)
-                ego_preds = agent_preds[ego_indices_tensor]
-                ego_labels = agent_labels[ego_indices_tensor]
-
-                agent_loss = self.criterion(ego_preds, ego_labels)
-                loss += agent_loss
+            # Agent loss: Only ego robot if it has cross-validation
+            if ego_cross_validation_flags[graph_idx] and 'agent' in predictions:
+                ego_idx = ego_robot_indices[graph_idx]
+                ego_pred = predictions['agent'][ego_idx:ego_idx+1]
+                ego_label = agent_labels[ego_idx:ego_idx+1]
+                agent_loss = self.criterion(ego_pred, ego_label)
+                graph_loss += agent_loss
                 loss_components += 1
 
-        # Track loss: Only meaningful tracks
-        if 'track' in predictions and track_labels.shape[0] > 0 and len(meaningful_track_indices) > 0:
-            track_preds = predictions['track']  # [total_tracks, 1]
+            # Track loss: Only meaningful tracks for this graph
+            graph_meaningful_indices = meaningful_track_indices_per_graph[graph_idx]
+            if len(graph_meaningful_indices) > 0 and 'track' in predictions:
+                track_preds = predictions['track']
+                indices_tensor = torch.tensor(graph_meaningful_indices, dtype=torch.long, device=self.device)
+                meaningful_preds = track_preds[indices_tensor]
+                meaningful_labels = track_labels[indices_tensor]
+                track_loss = self.criterion(meaningful_preds, meaningful_labels)
+                graph_loss += track_loss
+                loss_components += 1
 
-            # Filter to meaningful tracks
-            meaningful_indices_tensor = torch.tensor(meaningful_track_indices, dtype=torch.long, device=self.device)
-            meaningful_preds = track_preds[meaningful_indices_tensor]
-            meaningful_labels = track_labels[meaningful_indices_tensor]
+            # Scale this graph's loss
+            if loss_components > 0:
+                total_loss += graph_loss * 100.0
 
-            track_loss = self.criterion(meaningful_preds, meaningful_labels)
-            loss += track_loss
-            loss_components += 1
-
-        # Scale loss (multiply by 100 to match individual processing)
-        if loss_components > 0:
-            loss = loss * 100.0
-
-        return loss
+        return total_loss
 
     def _compute_batched_metrics(self, predictions: Dict, agent_labels: torch.Tensor,
                                   track_labels: torch.Tensor, ego_robot_indices: List[int],
@@ -1055,8 +1062,8 @@ def main():
                        help='Early stopping patience - epochs without improvement (default: 100)')
     parser.add_argument('--output', type=str, default='supervised_trust_model.pth',
                        help='Output model path')
-    parser.add_argument('--use-pyg-batch', action='store_true',
-                       help='Use PyTorch Geometric batching for ~2-3x speedup (recommended for GPU)')
+    parser.add_argument('--no-pyg-batch', action='store_true',
+                       help='Disable PyTorch Geometric batching (use individual processing instead)')
 
     args = parser.parse_args()
 
@@ -1110,13 +1117,13 @@ def main():
     # User can override with --num-workers if they've increased system limits
     num_workers = args.num_workers if args.num_workers >= 0 else 0
 
-    # Select collate function based on batching mode
-    if args.use_pyg_batch:
-        collate_fn = collate_batch_pyg
-        batching_mode = "PyG Batching (GPU-optimized)"
-    else:
+    # Select collate function based on batching mode (PyG batching is default)
+    if args.no_pyg_batch:
         collate_fn = collate_batch_individual
         batching_mode = "Individual Processing"
+    else:
+        collate_fn = collate_batch_pyg
+        batching_mode = "PyG Batching (GPU-optimized)"
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
                              shuffle=True, collate_fn=collate_fn,
