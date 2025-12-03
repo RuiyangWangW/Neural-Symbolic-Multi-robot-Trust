@@ -42,10 +42,13 @@ class SupervisedTrustDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         return {
-            'x_dict': sample.x_dict,
+            'num_agents': sample.num_agents,
+            'num_tracks': sample.num_tracks,
             'edge_index_dict': sample.edge_index_dict,
             'agent_labels': sample.agent_labels,
             'track_labels': sample.track_labels,
+            'ego_has_cross_validation': sample.ego_has_cross_validation,
+            'meaningful_track_indices': sample.meaningful_track_indices,
             'timestep': sample.timestep,
             'episode': sample.episode,
             'ego_robot_id': sample.ego_robot_id
@@ -54,60 +57,25 @@ class SupervisedTrustDataset(Dataset):
 
 def collate_batch(batch: List[Dict]) -> Dict:
     """
-    Optimized collate function using PyTorch Geometric's native batching
+    Collate function for ego-graph samples (individual processing required)
+
+    Note: SupervisedTrustGNN requires per-ego-graph processing because it extracts
+    subgraphs around the ego robot. PyG batching across different ego graphs is not
+    supported. We use individual sample processing for correctness.
 
     Args:
         batch: List of sample dictionaries
 
     Returns:
-        Dictionary with PyG batched data
+        Dictionary with individual samples for processing
     """
-    # Pre-allocate lists for better performance
-    hetero_data_list = []
-    all_agent_labels = []
-    all_track_labels = []
-
-    # Process batch more efficiently
-    for sample in batch:
-        # Create HeteroData object with pre-defined node and edge types
-        hetero_data = HeteroData()
-
-        # Add node features directly without iteration
-        hetero_data['agent'].x = sample['x_dict']['agent']
-        hetero_data['track'].x = sample['x_dict']['track']
-
-        # Add edge indices directly - use correct edge types from supervised_trust_gnn.py
-        for edge_type, edge_index in sample['edge_index_dict'].items():
-            hetero_data[edge_type].edge_index = edge_index
-
-        hetero_data_list.append(hetero_data)
-        all_agent_labels.append(sample['agent_labels'])
-        all_track_labels.append(sample['track_labels'])
-
-    # Use PyG's optimized native batching
-    try:
-        batched_hetero = HeteroBatch.from_data_list(hetero_data_list)
-
-        # Concatenate labels efficiently
-        batched_agent_labels = torch.cat(all_agent_labels, dim=0)
-        batched_track_labels = torch.cat(all_track_labels, dim=0)
-
-        return {
-            'hetero_batch': batched_hetero,
-            'agent_labels': batched_agent_labels,
-            'track_labels': batched_track_labels,
-            'batch_size': len(batch),
-            'use_pyg_batch': True
-        }
-
-    except Exception as e:
-        # Fallback to individual processing if batching fails
-        print(f"PyG batching failed: {e}, using individual processing")
-        return {
-            'samples': batch,
-            'batch_size': len(batch),
-            'use_individual': True
-        }
+    # SupervisedTrustGNN processes each ego graph individually
+    # Batching across ego graphs is not supported (each has different ego_idx)
+    return {
+        'samples': batch,
+        'batch_size': len(batch),
+        'use_individual': True
+    }
 
 class SupervisedTrustTrainer:
     """
@@ -158,7 +126,7 @@ class SupervisedTrustTrainer:
                 pass  # Fallback method not available in this PyTorch version
             print("🍎 MPS optimizations enabled")
 
-    def _transfer_to_device(self, sample: Dict, non_blocking: bool = True) -> Tuple[Dict, Dict, torch.Tensor, torch.Tensor]:
+    def _transfer_to_device(self, sample: Dict, non_blocking: bool = True) -> Tuple:
         """
         Efficiently transfer sample data to device with MPS error handling
 
@@ -167,24 +135,20 @@ class SupervisedTrustTrainer:
             non_blocking: Whether to use non-blocking transfer (for MPS/CUDA)
 
         Returns:
-            Tuple of (x_dict, edge_index_dict, agent_labels, track_labels)
+            Tuple of (num_agents, num_tracks, edge_index_dict, agent_labels, track_labels,
+                     ego_has_cross_validation, meaningful_track_indices)
         """
         try:
             # For MPS, disable non_blocking transfers to avoid placeholder tensor issues
             use_non_blocking = non_blocking and (self.device.type != 'mps')
 
-            # Transfer feature dictionaries with validation
-            x_dict = {}
-            for k, v in sample.x_dict.items():
-                if v.numel() > 0:  # Check for non-empty tensors
-                    x_dict[k] = v.to(self.device, non_blocking=use_non_blocking)
-                else:
-                    # Handle empty tensors for MPS compatibility
-                    x_dict[k] = v.to(self.device, non_blocking=False)
+            # Get node counts (no features needed for structure-only learning)
+            num_agents = sample['num_agents']
+            num_tracks = sample['num_tracks']
 
             # Transfer edge indices with validation
             edge_index_dict = {}
-            for k, v in sample.edge_index_dict.items():
+            for k, v in sample['edge_index_dict'].items():
                 if v.numel() > 0:  # Check for non-empty tensors
                     edge_index_dict[k] = v.to(self.device, non_blocking=use_non_blocking)
                 else:
@@ -192,39 +156,77 @@ class SupervisedTrustTrainer:
                     edge_index_dict[k] = v.to(self.device, non_blocking=False)
 
             # Transfer labels with validation
-            agent_labels = sample.agent_labels.to(self.device, non_blocking=use_non_blocking) if sample.agent_labels.numel() > 0 else sample.agent_labels.to(self.device, non_blocking=False)
-            track_labels = sample.track_labels.to(self.device, non_blocking=use_non_blocking) if sample.track_labels.numel() > 0 else sample.track_labels.to(self.device, non_blocking=False)
+            agent_labels = sample['agent_labels'].to(self.device, non_blocking=use_non_blocking) if sample['agent_labels'].numel() > 0 else sample['agent_labels'].to(self.device, non_blocking=False)
+            track_labels = sample['track_labels'].to(self.device, non_blocking=use_non_blocking) if sample['track_labels'].numel() > 0 else sample['track_labels'].to(self.device, non_blocking=False)
 
-            return x_dict, edge_index_dict, agent_labels, track_labels
+            # Cross-validation fields
+            ego_has_cross_validation = sample['ego_has_cross_validation']
+            meaningful_track_indices = sample['meaningful_track_indices']  # Keep as list
+
+            return num_agents, num_tracks, edge_index_dict, agent_labels, track_labels, ego_has_cross_validation, meaningful_track_indices
 
         except Exception as e:
             # Fallback to synchronous transfer for problematic samples
-            x_dict = {k: v.to(self.device, non_blocking=False) for k, v in sample.x_dict.items()}
-            edge_index_dict = {k: v.to(self.device, non_blocking=False) for k, v in sample.edge_index_dict.items()}
-            agent_labels = sample.agent_labels.to(self.device, non_blocking=False)
-            track_labels = sample.track_labels.to(self.device, non_blocking=False)
+            num_agents = sample['num_agents']
+            num_tracks = sample['num_tracks']
+            edge_index_dict = {k: v.to(self.device, non_blocking=False) for k, v in sample['edge_index_dict'].items()}
+            agent_labels = sample['agent_labels'].to(self.device, non_blocking=False)
+            track_labels = sample['track_labels'].to(self.device, non_blocking=False)
+            ego_has_cross_validation = sample['ego_has_cross_validation']
+            meaningful_track_indices = sample['meaningful_track_indices']
 
             if self.device.type == 'mps':
                 print(f"MPS transfer fallback used for sample due to: {e}")
 
-            return x_dict, edge_index_dict, agent_labels, track_labels
+            return num_agents, num_tracks, edge_index_dict, agent_labels, track_labels, ego_has_cross_validation, meaningful_track_indices
 
-    def _compute_loss(self, predictions: Dict, agent_labels: torch.Tensor, track_labels: torch.Tensor) -> torch.Tensor:
+    def _compute_loss(self, predictions: Dict, agent_labels: torch.Tensor, track_labels: torch.Tensor,
+                     ego_has_cross_validation: bool, meaningful_track_indices: List[int]) -> torch.Tensor:
         """
-        Compute loss for predictions
+        Compute loss for predictions with cross-validation constraints
+
+        Args:
+            predictions: Model predictions dict
+            agent_labels: Ground truth labels for all agents
+            track_labels: Ground truth labels for all tracks
+            ego_has_cross_validation: Whether ego robot has cross-validation
+            meaningful_track_indices: Indices of tracks that are meaningful for loss computation
+
+        Note: We only compute loss for:
+        - Ego robot (index 0) if ego_has_cross_validation is True
+        - Tracks in meaningful_track_indices (ego-detected with edges to >=2 robots)
         """
         loss = 0.0
         loss_components = 0
 
-        if 'agent' in predictions and agent_labels.shape[0] > 0:
-            agent_loss = self.criterion(predictions['agent'], agent_labels)
-            loss += agent_loss 
+        # Agent loss (ego robot only - index 0, only if has cross-validation)
+        if ego_has_cross_validation and 'agent' in predictions and agent_labels.shape[0] > 0:
+            # predictions['agent'] is a tensor [num_agents, 1]
+            agent_preds = predictions['agent']
+            agent_loss = self.criterion(agent_preds[0:1], agent_labels[0:1])
+            loss += agent_loss
             loss_components += 1
 
-        if 'track' in predictions and track_labels.shape[0] > 0:
-            track_loss = self.criterion(predictions['track'], track_labels)
-            loss += track_loss 
-            loss_components += 1
+        # Track loss (only for meaningful tracks)
+        if 'track' in predictions and len(meaningful_track_indices) > 0:
+            # predictions['track'] is a tensor [num_tracks, 1]
+            track_preds = predictions['track']
+
+            if track_preds.shape[0] > 0:
+                # Convert list to tensor for indexing
+                import torch
+                meaningful_indices_tensor = torch.tensor(meaningful_track_indices, dtype=torch.long)
+
+                # Select only labels for meaningful tracks
+                selected_track_labels = track_labels[meaningful_indices_tensor]
+
+                # Model predicts ALL tracks, so we need to select only meaningful ones
+                if track_preds.shape[0] >= len(meaningful_track_indices):
+                    # Select predictions for meaningful tracks
+                    selected_track_preds = track_preds[meaningful_indices_tensor]
+                    track_loss = self.criterion(selected_track_preds, selected_track_labels)
+                    loss += track_loss
+                    loss_components += 1
 
         if loss_components > 0:
             return loss * 100
@@ -235,7 +237,7 @@ class SupervisedTrustTrainer:
         Compute evaluation metrics
 
         Args:
-            predictions: Model predictions dict
+            predictions: Model predictions dict (includes 'track_indices' for track predictions)
             labels: Ground truth labels dict
 
         Returns:
@@ -244,9 +246,26 @@ class SupervisedTrustTrainer:
         metrics = {}
 
         for node_type in predictions:
+            # Skip metadata keys
+            if node_type == 'track_indices':
+                continue
+
             if node_type in labels and labels[node_type].shape[0] > 0:
-                y_true = labels[node_type].detach().cpu().numpy().flatten()
-                y_prob = predictions[node_type].detach().cpu().numpy().flatten()
+                # For agents: use ego robot ONLY (index 0)
+                if node_type == 'agent':
+                    y_true = labels[node_type][0:1].detach().cpu().numpy().flatten()
+                    y_prob = predictions[node_type][0:1].detach().cpu().numpy().flatten()  # FIXED: Only ego
+
+                # For tracks: match predictions and labels
+                elif node_type == 'track':
+                    # predictions[node_type] is ALL tracks, need to match with labels
+                    y_true = labels[node_type].detach().cpu().numpy().flatten()
+                    y_prob = predictions[node_type].detach().cpu().numpy().flatten()
+
+                else:
+                    y_true = labels[node_type].detach().cpu().numpy().flatten()
+                    y_prob = predictions[node_type].detach().cpu().numpy().flatten()
+
                 y_pred = (y_prob > 0.5).astype(float)
 
                 # Compute metrics only if we have both classes
@@ -348,7 +367,7 @@ class SupervisedTrustTrainer:
 
     def _process_sample(self, sample: Dict) -> Tuple[float, Dict]:
         """
-        Process a single sample
+        Process a single sample with cross-validation constraints
 
         Args:
             sample: Single data sample
@@ -357,21 +376,29 @@ class SupervisedTrustTrainer:
             Tuple of (loss, metrics)
         """
         # Move data to device
-        x_dict, edge_index_dict, agent_labels, track_labels = self._transfer_to_device(sample)
+        num_agents, num_tracks, edge_index_dict, agent_labels, track_labels, ego_has_cross_validation, meaningful_track_indices = self._transfer_to_device(sample)
+
+        # Skip samples without cross-validation (should already be filtered in dataset)
+        if not ego_has_cross_validation:
+            return 0.0, {}
 
         # Skip samples with empty data
         if agent_labels.numel() == 0 and track_labels.numel() == 0:
             return 0.0, {}
 
-        # Extract graph size (no features needed)
-        num_agents = x_dict['agent'].shape[0] if 'agent' in x_dict else 0
-        num_tracks = x_dict['track'].shape[0] if 'track' in x_dict else 0
+        # Skip if no meaningful tracks
+        if len(meaningful_track_indices) == 0:
+            return 0.0, {}
 
-        # Forward pass (structure-only)
+        # Forward pass (no HeteroData needed - model creates embeddings from scratch)
         predictions = self.model(num_agents, num_tracks, edge_index_dict, device=self.device)
 
-        # Compute loss
-        loss = self._compute_loss(predictions, agent_labels, track_labels)
+        # Skip if ego robot is isolated (predictions will be None)
+        if predictions is None:
+            return 0.0, {}
+
+        # Compute loss with cross-validation constraints
+        loss = self._compute_loss(predictions, agent_labels, track_labels, ego_has_cross_validation, meaningful_track_indices)
         if loss is None:
             return 0.0, {}
 
@@ -387,34 +414,22 @@ class SupervisedTrustTrainer:
         """
         Process a PyTorch Geometric batched HeteroData
 
+        Note: This method is not used because SupervisedTrustGNN requires per-ego-graph
+        processing. Each ego graph has a different ego robot (ego_idx), and the model
+        extracts subgraphs around that specific ego node. PyG batching across different
+        ego graphs is not supported.
+
         Args:
             batch_data: PyG batched data
 
         Returns:
             Tuple of (loss, metrics)
         """
-        # Move data to device
-        hetero_batch = batch_data['hetero_batch'].to(self.device)
-        agent_labels = batch_data['agent_labels'].to(self.device)
-        track_labels = batch_data['track_labels'].to(self.device)
-
-        # Extract graph size (no features needed)
-        num_agents = hetero_batch.x_dict['agent'].shape[0] if 'agent' in hetero_batch.x_dict else 0
-        num_tracks = hetero_batch.x_dict['track'].shape[0] if 'track' in hetero_batch.x_dict else 0
-
-        # Forward pass - PyG handles the batching automatically (structure-only)
-        predictions = self.model(num_agents, num_tracks, hetero_batch.edge_index_dict, device=self.device)
-
-        # Compute loss - PyG concatenated everything, so labels should align
-        loss = self._compute_loss(predictions, agent_labels, track_labels)
-        if loss is None:
-            return 0.0, {}
-
-        # Compute metrics
-        labels_dict = {'agent': agent_labels, 'track': track_labels}
-        metrics = self._compute_metrics(predictions, labels_dict)
-
-        return loss, metrics
+        # This should never be called with the current collate_batch implementation
+        raise NotImplementedError(
+            "PyG batching is not supported for SupervisedTrustGNN. "
+            "Each ego graph must be processed individually with its own ego_idx."
+        )
 
     def train_epoch(self, dataloader: DataLoader) -> Tuple[float, Dict]:
         """
@@ -454,8 +469,10 @@ class SupervisedTrustTrainer:
                             all_metrics.append(metrics)
 
                 else:
-                    # Process samples individually (fallback or single sample)
+                    # Process samples individually with gradient accumulation
                     samples = batch_data['samples']
+                    batch_loss = 0.0
+                    batch_samples = 0
 
                     for sample in samples:
                         try:
@@ -463,13 +480,11 @@ class SupervisedTrustTrainer:
                             loss, metrics = self._process_sample(sample)
 
                             if loss > 0:
-                                # Backward pass
+                                # Accumulate gradients (don't step yet!)
                                 loss.backward()
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                                self.optimizer.step()
 
-                                total_loss += loss.item()
-                                num_samples += 1
+                                batch_loss += loss.item()
+                                batch_samples += 1
 
                                 if metrics:
                                     all_metrics.append(metrics)
@@ -477,6 +492,14 @@ class SupervisedTrustTrainer:
                         except Exception as e:
                             print(f"Error processing individual sample: {e}")
                             continue
+
+                    # Update weights once per batch (after accumulating all gradients)
+                    if batch_samples > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        self.optimizer.step()
+
+                        total_loss += batch_loss
+                        num_samples += batch_samples
 
             except Exception as e:
                 print(f"Error processing batch: {e}")
@@ -771,8 +794,8 @@ def main():
                        help='Path to dataset file')
     parser.add_argument('--epochs', type=int, default=1000,
                        help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=256,
-                       help='Batch size for training (supports both batched and individual processing)')
+    parser.add_argument('--batch-size', type=int, default=32,
+                       help='Number of samples per DataLoader batch (processed individually per ego-graph)')
     parser.add_argument('--lr', type=float, default=1e-3,
                        help='Learning rate')
     parser.add_argument('--device', type=str, default='auto',
@@ -801,12 +824,6 @@ def main():
             print(f"🚀 Apple Silicon MPS detected")
             print(f"💡 If you encounter MPS issues, use --force-cpu")
 
-
-            # Increase batch size for better MPS utilization
-            if args.batch_size <= 128:
-                original_batch_size = args.batch_size
-                args.batch_size = 256  # Even larger batch size for MPS
-                print(f"💡 Auto-increasing batch size from {original_batch_size} to {args.batch_size} for MPS")
 
             # Enable MPS memory optimizations
             try:
@@ -849,7 +866,7 @@ def main():
                            shuffle=False, collate_fn=collate_batch,
                            num_workers=num_workers, pin_memory=pin_memory)
 
-    # Create model with structure-only learning (no input features)
+    # Create supervised model with structure-only learning (no input features)
     model = SupervisedTrustGNN(hidden_dim=128)
 
     print(f"🧠 Model parameters: {sum(p.numel() for p in model.parameters()):,}")

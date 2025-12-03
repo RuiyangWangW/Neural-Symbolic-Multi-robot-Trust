@@ -182,10 +182,94 @@ class SimulationEnvironment:
         for i in range(self.num_targets):
             obj = self._create_ground_truth_object(self.time)
             self.ground_truth_objects.append(obj)
-        
+
+        # Initialize false positive objects (fixed at initialization)
+        # Number of FP objects = adversarial_ratio * number of ground truth objects
+        num_fp_objects = int(self.adversarial_ratio * len(self.ground_truth_objects))
+        for i in range(num_fp_objects):
+            fp_obj = self._create_fp_object(self.time)
+            self.shared_fp_objects.append(fp_obj)
+
         # Initialize trust algorithm
         print(f"Simulation initialized with {len(self.robots)} robots and {len(self.ground_truth_objects)} objects")
+        print(f"  - Ground truth objects: {len(self.ground_truth_objects)}")
+        print(f"  - False positive objects: {len(self.shared_fp_objects)} (adversarial_ratio={self.adversarial_ratio:.2f})")
     
+    def _create_fp_object(self, spawn_time: float) -> GroundTruthObject:
+        """Create a false positive object (identical to ground truth object but with separate ID)"""
+        obj_id = self.next_shared_fp_id
+        self.next_shared_fp_id += 1
+
+        # Random position
+        position = np.array([
+            random.uniform(5, self.world_size[0] - 5),
+            random.uniform(5, self.world_size[1] - 5),
+            0.0  # Ground level
+        ])
+
+        # Choose movement pattern
+        movement_patterns = ['linear', 'random_walk', 'circular', 'stationary']
+        movement_pattern = random.choice(movement_patterns)
+
+        # Set initial velocity based on movement pattern
+        base_speed = random.uniform(0.5, 2.5)
+
+        if movement_pattern == 'linear':
+            # Random direction, constant velocity
+            angle = random.uniform(0, 2*np.pi)
+            velocity = np.array([
+                base_speed * np.cos(angle),
+                base_speed * np.sin(angle),
+                0.0
+            ])
+        elif movement_pattern == 'circular':
+            # Set up circular motion parameters
+            potential_centers = [
+                (self.world_size[0] * 0.2, self.world_size[1] * 0.2),
+                (self.world_size[0] * 0.8, self.world_size[1] * 0.2),
+                (self.world_size[0] * 0.2, self.world_size[1] * 0.8),
+                (self.world_size[0] * 0.8, self.world_size[1] * 0.8),
+            ]
+            center_x, center_y = random.choice(potential_centers)
+            circular_center = np.array([center_x, center_y, 0.0])
+            circular_radius = random.uniform(5, 12)
+
+            # Set initial position on the circle
+            angle = random.uniform(0, 2 * np.pi)
+            position = circular_center + circular_radius * np.array([
+                np.cos(angle), np.sin(angle), 0.0
+            ])
+
+            velocity = np.array([base_speed, 0.0, 0.0])
+        else:  # random_walk or stationary
+            velocity = np.array([0.0, 0.0, 0.0])
+
+        # Object type
+        object_types = ['vehicle', 'person', 'animal']
+        object_type = random.choice(object_types)
+
+        # FP objects are permanent (no expiration)
+        lifespan = -1
+
+        # Prepare circular motion parameters if needed
+        circular_center_param = circular_center if movement_pattern == 'circular' else None
+        circular_radius_param = circular_radius if movement_pattern == 'circular' else 0.0
+
+        return GroundTruthObject(
+            id=obj_id,
+            position=position,
+            velocity=velocity,
+            object_type=object_type,
+            movement_pattern=movement_pattern,
+            spawn_time=spawn_time,
+            lifespan=lifespan,
+            base_speed=base_speed,
+            turn_probability=random.uniform(0.01, 0.05),
+            direction_change_time=random.uniform(3, 8),
+            circular_center=circular_center_param,
+            circular_radius=circular_radius_param
+        )
+
     def _create_ground_truth_object(self, spawn_time: float) -> GroundTruthObject:
         """Create a new ground truth object with random properties"""
         obj_id = self.next_object_id
@@ -331,27 +415,14 @@ class SimulationEnvironment:
         # Remove expired objects
         for obj in objects_to_remove:
             self.ground_truth_objects.remove(obj)
-        
+
         # Fixed number of ground truth objects - no dynamic spawning
-        
-        # Update shared FP objects based on adversarial robot FOVs
-        self._update_shared_fp_objects()
+
+        # Update false positive objects (same dynamics as ground truth objects)
+        self._update_fp_objects()
     
-    def _update_shared_fp_objects(self):
-        """Manage shared FP objects with random spawning and adversarial robot FOV constraints"""
-        false_positive_rate = self.false_positive_rate
-        adversarial_robots = [r for r in self.robots if r.is_adversarial]
-        
-        if not adversarial_robots:
-            # No adversarial robots - clear all FP objects
-            self.shared_fp_objects.clear()
-            return
-        
-        # Calculate max FP count based on current ground truth objects
-        max_fp_objects = int(len(self.ground_truth_objects) * false_positive_rate)
-        
-        # Update existing FP object dynamics using same logic as ground truth objects
-        
+    def _update_fp_objects(self):
+        """Update false positive object dynamics (same as ground truth objects)"""
         for fp_obj in self.shared_fp_objects:
             # Update FP object based on movement pattern (similar to ground truth objects)
             if fp_obj.movement_pattern == 'stationary':
@@ -394,73 +465,18 @@ class SimulationEnvironment:
                 fp_obj.position += fp_obj.velocity * self.dt
                 fp_obj.position[0] = np.clip(fp_obj.position[0], 0, self.world_size[0])
                 fp_obj.position[1] = np.clip(fp_obj.position[1], 0, self.world_size[1])
-        
-        # Random FP spawning (small probability)
-        if random.random() < 0.2: 
-            # Pick a random adversarial robot to create FP near
-            target_robot = random.choice(adversarial_robots)
-            
-            # Create FP in robot's FOV
-            angle = target_robot.orientation + random.uniform(-target_robot.fov_angle/2, target_robot.fov_angle/2)
-            distance = random.uniform(3, target_robot.fov_range)
-            new_pos = target_robot.position + np.array([
-                distance*np.cos(angle), 
-                distance*np.sin(angle), 
-                random.uniform(-5, 5)
-            ])
-            
-            # Check it's not too close to true objects or existing FPs
-            too_close = any(np.linalg.norm(new_pos - gt.position) < 3.0 
-                           for gt in self.ground_truth_objects)
-            too_close = too_close or any(np.linalg.norm(new_pos - fp.position) < 2.0 
-                                       for fp in self.shared_fp_objects)
-            
-            if not too_close:
-                # Create a new FP object using GroundTruthObject structure
-                fp_obj = GroundTruthObject(
-                    id=self.next_shared_fp_id,
-                    position=new_pos,
-                    velocity=np.array([random.uniform(0.2, 1.5) * np.cos(random.uniform(0, 2*np.pi)),
-                                      random.uniform(0.2, 1.5) * np.sin(random.uniform(0, 2*np.pi)),
-                                      random.uniform(-0.2, 0.2)]),
-                    object_type='false_positive',
-                    movement_pattern=random.choice(['linear', 'random_walk']),
-                    spawn_time=self.time,
-                    lifespan=-1,  # Permanent like ground truth objects
-                    base_speed=random.uniform(0.2, 1.5),
-                    turn_probability=random.uniform(0.01, 0.05)
-                )
-                
-                self.next_shared_fp_id += 1
-                self.shared_fp_objects.append(fp_obj)
-        
-        # Remove excess FP objects if we're over the limit (prioritize those outside adversarial FOVs)
-        if len(self.shared_fp_objects) > max_fp_objects:
-            fps_outside_fov = []
-            fps_inside_fov = []
-            
-            for fp_obj in self.shared_fp_objects:
-                visible_to_adversarial = any(robot.is_in_fov(fp_obj.position) 
-                                           for robot in adversarial_robots)
-                if visible_to_adversarial:
-                    fps_inside_fov.append(fp_obj)
-                else:
-                    fps_outside_fov.append(fp_obj)
-            
-            # How many to remove
-            excess_count = len(self.shared_fp_objects) - max_fp_objects
-            fps_to_remove = []
-            
-            # First remove FPs outside adversarial FOV
-            fps_to_remove.extend(fps_outside_fov[:excess_count])
-            remaining_to_remove = excess_count - len(fps_to_remove)
-            
-            # If still need to remove more, remove some inside FOV
-            if remaining_to_remove > 0:
-                fps_to_remove.extend(fps_inside_fov[:remaining_to_remove])
-            
-            for fp_obj in fps_to_remove:
-                self.shared_fp_objects.remove(fp_obj)
+
+            elif fp_obj.movement_pattern == 'circular':
+                # Circular movement
+                if fp_obj.circular_center is not None:
+                    center = fp_obj.circular_center
+                    radius = fp_obj.circular_radius
+                    angular_velocity = fp_obj.base_speed / radius
+
+                    angle = angular_velocity * (self.time - fp_obj.spawn_time)
+                    fp_obj.position = center + radius * np.array([
+                        np.cos(angle), np.sin(angle), 0.0
+                    ])
     
     def _update_robot_navigation(self, robot: Robot):
         """Update robot's velocity and orientation based on current patrol target"""
@@ -568,6 +584,8 @@ class SimulationEnvironment:
             if existing_track:
                 # Update existing track with new observation
                 existing_track.update_state(noisy_pos, noisy_vel, self.time)
+                # Mark track as current for this timestep
+                robot.mark_track_as_current(object_id)
                 # DO NOT update trust here - trust is managed by the trust algorithm
                 # Set additional attributes that are used by the simulation
                 track = existing_track
@@ -588,38 +606,45 @@ class SimulationEnvironment:
                 robot.add_track(track)
             tracks.append(track)
                 
-        # Generate tracks for visible FP objects (now using same structure as ground truth)
+        # Generate tracks for FP objects with probability = false_positive_rate
+        # Simplified: Adversarial robots detect FP objects with probability = FP rate
+        false_positive_rate = robot.false_positive_rate if hasattr(robot, 'false_positive_rate') else self.false_positive_rate
+
         for fp_obj in self.shared_fp_objects:
             if robot.is_in_fov(fp_obj.position):
-                fp_object_id = f"fp_obj_{fp_obj.id}"
-                fp_track_key = f"{robot.id}_{fp_object_id}"
-                
-                # Initialize trust values
-                trust_alpha = 1.0
-                trust_beta = 1.0
-                
-                # Check if track already exists in robot's local tracks
-                existing_track = robot.get_track(fp_object_id)
-                if existing_track:
-                    # Update existing track with new observation
-                    existing_track.update_state(fp_obj.position.copy(), fp_obj.velocity.copy(), self.time)
-                    track = existing_track
-                else:
-                    # Create new track using the new Track class
-                    track = Track(
-                        track_id=fp_track_key,
-                        robot_id=robot.id,
-                        object_id=fp_object_id,
-                        position=fp_obj.position.copy(),
-                        velocity=fp_obj.velocity.copy(),
-                        trust_alpha=trust_alpha,
-                        trust_beta=trust_beta,
-                        timestamp=self.time
-                    )
-                    # Add new track to robot's local tracks
-                    robot.add_track(track)
-                
-                tracks.append(track)
+                # Probability-based detection: Only detect with probability = false_positive_rate
+                if random.random() < false_positive_rate:
+                    fp_object_id = f"fp_obj_{fp_obj.id}"
+                    fp_track_key = f"{robot.id}_{fp_object_id}"
+
+                    # Initialize trust values
+                    trust_alpha = 1.0
+                    trust_beta = 1.0
+
+                    # Check if track already exists in robot's local tracks
+                    existing_track = robot.get_track(fp_object_id)
+                    if existing_track:
+                        # Update existing track with new observation
+                        existing_track.update_state(fp_obj.position.copy(), fp_obj.velocity.copy(), self.time)
+                        # Mark track as current for this timestep
+                        robot.mark_track_as_current(fp_object_id)
+                        track = existing_track
+                    else:
+                        # Create new track using the new Track class
+                        track = Track(
+                            track_id=fp_track_key,
+                            robot_id=robot.id,
+                            object_id=fp_object_id,
+                            position=fp_obj.position.copy(),
+                            velocity=fp_obj.velocity.copy(),
+                            trust_alpha=trust_alpha,
+                            trust_beta=trust_beta,
+                            timestamp=self.time
+                        )
+                        # Add new track to robot's local tracks
+                        robot.add_track(track)
+
+                    tracks.append(track)
         
         return tracks
     

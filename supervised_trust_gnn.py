@@ -23,9 +23,6 @@ import numpy as np
 from robot_track_classes import Robot
 
 
-# TrustFeatureCalculator class removed - structure-only learning does not require feature calculations
-
-
 class SupervisedTrustGNN(nn.Module):
     """
     Supervised GNN model for binary trust classification
@@ -45,8 +42,8 @@ class SupervisedTrustGNN(nn.Module):
         # Pure structure-only learning: NO node features, NO type embeddings
         # All nodes start with zero features - only edges provide information
 
-        # Graph convolution layers using heterogeneous GAT
-        edge_types = [
+        # Define edge types for heterogeneous graph
+        self.edge_types = [
             ('agent', 'in_fov_and_observed', 'track'),
             ('track', 'observed_and_in_fov_by', 'agent'),
             ('agent', 'in_fov_only', 'track'),
@@ -55,23 +52,11 @@ class SupervisedTrustGNN(nn.Module):
             ('agent', 'contradicts', 'agent'),   # Contradiction edges (robot A detects track that B should see but doesn't)
         ]
 
-        # Create GAT convolution dictionary for each edge type
-        conv_dict = {}
-        for src_type, relation, dst_type in edge_types:
-            src_dim = hidden_dim  # All use hidden_dim after embedding
-            conv_dict[(src_type, relation, dst_type)] = GATConv(
-                in_channels=src_dim,
-                out_channels=hidden_dim,
-                heads=4,
-                concat=False,
-                add_self_loops=False,
-                dropout=0.1
-            )
-
-        # Three layers of heterogeneous convolution
-        self.conv1 = HeteroConv(conv_dict, aggr='mean')
-        self.conv2 = HeteroConv(conv_dict, aggr='mean')
-        self.conv3 = HeteroConv(conv_dict, aggr='mean')
+        # Three layers of heterogeneous convolution (each with independent parameters)
+        # FIXED: Create separate conv_dict for each layer to avoid parameter sharing
+        self.conv1 = HeteroConv(self._create_conv_dict(), aggr='mean')
+        self.conv2 = HeteroConv(self._create_conv_dict(), aggr='mean')
+        self.conv3 = HeteroConv(self._create_conv_dict(), aggr='mean')
 
         # Batch normalization layers
         self.norm1 = nn.ModuleDict({
@@ -112,6 +97,27 @@ class SupervisedTrustGNN(nn.Module):
             nn.Sigmoid()  # Output probability of being trustworthy
         )
 
+    def _create_conv_dict(self):
+        """
+        Create a new GAT convolution dictionary with independent parameters
+
+        This helper method is called for each conv layer to ensure they have
+        separate learnable parameters (no parameter sharing).
+
+        Returns:
+            Dictionary mapping edge types to GATConv modules
+        """
+        conv_dict = {}
+        for src_type, relation, dst_type in self.edge_types:
+            conv_dict[(src_type, relation, dst_type)] = GATConv(
+                in_channels=self.hidden_dim,
+                out_channels=self.hidden_dim,
+                heads=4,
+                concat=False,
+                add_self_loops=False,
+                dropout=0.3
+            )
+        return conv_dict
 
     def forward(self, num_agents, num_tracks, edge_index_dict, device='cpu'):
         """
@@ -279,12 +285,111 @@ class SupervisedTrustPredictor:
         self.model.to(self.device)
         self.model.eval()
 
+    def _check_ego_cross_validation(self, edge_index_dict: Dict) -> bool:
+        """
+        Check if ego robot (index 0) has cross-validation with other robots
+
+        Args:
+            edge_index_dict: Dictionary of edge indices from ego graph
+
+        Returns:
+            True if ego robot has co_detection or contradicts edges with other robots
+        """
+        # Check for co_detection edges
+        if ('agent', 'co_detection', 'agent') in edge_index_dict:
+            co_detection_edges = edge_index_dict[('agent', 'co_detection', 'agent')]
+            if co_detection_edges.numel() > 0:
+                ego_in_co_detection = (co_detection_edges[0] == 0).any() or (co_detection_edges[1] == 0).any()
+                if ego_in_co_detection:
+                    return True
+
+        # Check for contradicts edges
+        if ('agent', 'contradicts', 'agent') in edge_index_dict:
+            contradicts_edges = edge_index_dict[('agent', 'contradicts', 'agent')]
+            if contradicts_edges.numel() > 0:
+                ego_in_contradicts = (contradicts_edges[0] == 0).any() or (contradicts_edges[1] == 0).any()
+                if ego_in_contradicts:
+                    return True
+
+        return False
+
+    def _identify_meaningful_tracks(self, ego_robot: 'Robot', graph_data, num_tracks: int) -> List[int]:
+        """
+        Identify meaningful tracks for inference
+
+        A track is meaningful if:
+        1. It's currently detected by ego robot (in get_all_current_tracks())
+        2. It has edges to >= 2 robots (cross-validation constraint)
+
+        Args:
+            ego_robot: The ego robot
+            graph_data: Ego graph HeteroData object
+            num_tracks: Number of tracks in the ego graph
+
+        Returns:
+            List of meaningful track indices
+        """
+        meaningful_indices = []
+
+        # Get tracks currently detected by ego robot
+        ego_current_tracks = ego_robot.get_all_current_tracks()
+        ego_track_ids = set(track.track_id for track in ego_current_tracks)
+
+        # Get fused and individual tracks from ego graph
+        if hasattr(graph_data, '_fused_tracks') and hasattr(graph_data, '_individual_tracks'):
+            all_tracks = graph_data._fused_tracks + graph_data._individual_tracks
+        else:
+            return []
+
+        edge_index_dict = graph_data.edge_index_dict
+
+        # For each track, check if it's meaningful
+        for track_idx, track in enumerate(all_tracks[:num_tracks]):
+            # Check 1: Is this track currently detected by ego robot?
+            if track.track_id not in ego_track_ids:
+                continue
+
+            # Check 2: Does this track have edges to >= 2 robots?
+            num_robots_with_edges = self._count_robots_with_edges_to_track(edge_index_dict, track_idx)
+            if num_robots_with_edges >= 2:
+                meaningful_indices.append(track_idx)
+
+        return meaningful_indices
+
+    def _count_robots_with_edges_to_track(self, edge_index_dict: Dict, track_idx: int) -> int:
+        """
+        Count how many robots have edges to a specific track
+
+        Args:
+            edge_index_dict: Dictionary of edge indices from ego graph
+            track_idx: Index of the track to check
+
+        Returns:
+            Number of robots with edges to this track
+        """
+        robots_with_edges = set()
+
+        # Check agent->track edges
+        agent_to_track_edge_types = [
+            ('agent', 'in_fov_and_observed', 'track'),
+            ('agent', 'in_fov_only', 'track')
+        ]
+
+        for edge_type in agent_to_track_edge_types:
+            if edge_type in edge_index_dict:
+                edges = edge_index_dict[edge_type]
+                if edges.numel() > 0:
+                    agents_to_this_track = edges[0][edges[1] == track_idx]
+                    robots_with_edges.update(agents_to_this_track.tolist())
+
+        return len(robots_with_edges)
+
     def predict_from_robots_tracks(self,
                                  ego_robot: 'Robot',
                                  robots: List['Robot'],
                                  threshold: float = 0.5) -> Dict:
         """
-        Predict trust labels directly from ego robot and all robots
+        Predict trust labels directly from ego robot and all robots with cross-validation constraints
 
         Args:
             ego_robot: The robot for which to build the ego graph
@@ -292,7 +397,11 @@ class SupervisedTrustPredictor:
             threshold: Classification threshold
 
         Returns:
-            Dict containing trust predictions and probabilities
+            Dict containing trust predictions and probabilities, or None if no cross-validation
+
+        Note: Only returns predictions if:
+        - Ego robot has cross-validation (co_detection or contradicts edges)
+        - There are meaningful tracks (ego-detected AND have edges to >=2 robots)
         """
         if self.model is None:
             raise ValueError("Model not loaded successfully")
@@ -300,17 +409,33 @@ class SupervisedTrustPredictor:
         # Create ego graph using proper build_ego_graph method with fusion map
         graph_data = self.ego_graph_builder.build_ego_graph(ego_robot, robots)
 
+        # Check cross-validation: Does ego robot have co_detection or contradicts edges?
+        ego_has_cross_validation = self._check_ego_cross_validation(graph_data.edge_index_dict)
+
+        if not ego_has_cross_validation:
+            # Ego robot has no cross-validation, skip update
+            return None
+
         # Extract graph size
         num_agents = graph_data.x_dict['agent'].shape[0] if 'agent' in graph_data.x_dict else 0
         num_tracks = graph_data.x_dict['track'].shape[0] if 'track' in graph_data.x_dict else 0
 
+        # Identify meaningful tracks
+        meaningful_track_indices = self._identify_meaningful_tracks(ego_robot, graph_data, num_tracks)
+
+        if len(meaningful_track_indices) == 0:
+            # No meaningful tracks, skip update
+            return None
+
         # Make predictions
         predictions = self.predict(num_agents, num_tracks, graph_data.edge_index_dict, threshold)
 
-        # Return both predictions and graph data for proper node mapping
+        # Return predictions with meaningful track indices for filtering
         return {
             'predictions': predictions,
-            'graph_data': graph_data
+            'graph_data': graph_data,
+            'meaningful_track_indices': meaningful_track_indices,
+            'ego_has_cross_validation': ego_has_cross_validation
         }
 
     def predict(self, num_agents, num_tracks, edge_index_dict, threshold: float = 0.5):
@@ -646,6 +771,10 @@ class EgoGraphBuilder:
             'agent': graph_data['agent'].x,
             'track': graph_data['track'].x
         }
+
+        # Store fused_tracks and individual_tracks for sanity checking
+        graph_data._fused_tracks = fused_tracks
+        graph_data._individual_tracks = individual_tracks
 
         return graph_data
 

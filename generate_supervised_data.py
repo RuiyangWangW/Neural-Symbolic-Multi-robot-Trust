@@ -24,12 +24,24 @@ from supervised_trust_gnn import EgoGraphBuilder
 @dataclass
 class SupervisedDataSample:
     """
-    Single data sample for supervised learning
+    Single data sample for supervised learning (structure-only, no node features)
+
+    The full ego graph is saved (all robots and tracks) for GNN input.
+    Cross-validation constraints are applied via:
+    - ego_has_cross_validation: Only samples where ego robot has co_detection/contradicts edges
+    - meaningful_track_indices: Tracks detected by ego at current timestep AND have edges to >=2 robots
+
+    During training, loss is computed only for:
+    - Ego robot (index 0) if ego_has_cross_validation=True
+    - Tracks with indices in meaningful_track_indices
     """
-    x_dict: Dict  # Node features dictionary
-    edge_index_dict: Dict  # Edge indices dictionary
-    agent_labels: torch.Tensor  # Binary trust labels for agents [num_agents, 1]
-    track_labels: torch.Tensor  # Binary trust labels for tracks [num_tracks, 1]
+    edge_index_dict: Dict  # Edge indices dictionary (full ego graph structure)
+    agent_labels: torch.Tensor  # Binary trust labels for ALL agents [num_agents, 1]
+    track_labels: torch.Tensor  # Binary trust labels for ALL tracks [num_tracks, 1]
+    num_agents: int  # Number of agent nodes in full ego graph
+    num_tracks: int  # Number of track nodes in full ego graph
+    ego_has_cross_validation: bool  # Does ego robot have co_detection or contradicts edges?
+    meaningful_track_indices: List[int]  # Indices of tracks for loss (ego-detected + >=2 robot edges)
     timestep: int
     episode: int
     ego_robot_id: str  # ID of the ego robot for this sample
@@ -280,6 +292,115 @@ class SupervisedDataGenerator:
         # Update ego graph builder with fixed proximal range
         self.ego_graph_builder = EgoGraphBuilder(proximal_range=params['proximal_range'])
 
+    def _check_ego_cross_validation(self, ego_graph: HeteroData) -> bool:
+        """
+        Check if ego robot (index 0) has cross-validation with other robots.
+
+        Cross-validation means ego robot has at least one of:
+        - co_detection edge with another robot (both detect same object)
+        - contradicts edge with another robot (ego detects something other doesn't)
+
+        Args:
+            ego_graph: Ego graph with edge_index_dict
+
+        Returns:
+            True if ego robot has cross-validation, False otherwise
+        """
+        edge_index_dict = ego_graph.edge_index_dict
+
+        # Check for co_detection edges: (agent, co_detection, agent)
+        if ('agent', 'co_detection', 'agent') in edge_index_dict:
+            co_detection_edges = edge_index_dict[('agent', 'co_detection', 'agent')]
+            if co_detection_edges.numel() > 0:
+                # Check if ego robot (index 0) is in any co_detection edge
+                ego_in_co_detection = (co_detection_edges[0] == 0).any() or (co_detection_edges[1] == 0).any()
+                if ego_in_co_detection:
+                    return True
+
+        # Check for contradicts edges: (agent, contradicts, agent)
+        if ('agent', 'contradicts', 'agent') in edge_index_dict:
+            contradicts_edges = edge_index_dict[('agent', 'contradicts', 'agent')]
+            if contradicts_edges.numel() > 0:
+                # Check if ego robot (index 0) is in any contradicts edge
+                ego_in_contradicts = (contradicts_edges[0] == 0).any() or (contradicts_edges[1] == 0).any()
+                if ego_in_contradicts:
+                    return True
+
+        return False
+
+    def _identify_meaningful_tracks(self, ego_robot, ego_graph: HeteroData, num_tracks: int) -> List[int]:
+        """
+        Identify meaningful tracks for loss computation.
+
+        A track is meaningful if:
+        1. It's currently detected by ego robot (in get_all_current_tracks())
+        2. It has edges to >= 2 robots (cross-validation constraint)
+
+        Args:
+            ego_robot: The ego robot
+            ego_graph: Ego graph with track nodes and edges
+            num_tracks: Total number of tracks in ego graph
+
+        Returns:
+            List of track indices that are meaningful
+        """
+        meaningful_indices = []
+
+        # Get tracks currently detected by ego robot
+        ego_current_tracks = ego_robot.get_all_current_tracks()
+        ego_track_ids = set(track.track_id for track in ego_current_tracks)
+
+        # Get fused and individual tracks from ego graph (in same order as track nodes)
+        if hasattr(ego_graph, '_fused_tracks') and hasattr(ego_graph, '_individual_tracks'):
+            all_tracks = ego_graph._fused_tracks + ego_graph._individual_tracks
+        else:
+            # Fallback: can't identify tracks without stored track list
+            return []
+
+        # For each track, check if it's meaningful
+        for track_idx, track in enumerate(all_tracks[:num_tracks]):
+            # Check 1: Is this track currently detected by ego robot?
+            if track.track_id not in ego_track_ids:
+                continue
+
+            # Check 2: Does this track have edges to >= 2 robots?
+            num_robots_with_edges = self._count_robots_with_edges_to_track(ego_graph, track_idx)
+            if num_robots_with_edges >= 2:
+                meaningful_indices.append(track_idx)
+
+        return meaningful_indices
+
+    def _count_robots_with_edges_to_track(self, ego_graph: HeteroData, track_idx: int) -> int:
+        """
+        Count how many robots have edges to a specific track.
+
+        Args:
+            ego_graph: Ego graph with edge_index_dict
+            track_idx: Index of the track node
+
+        Returns:
+            Number of unique robots with edges to this track
+        """
+        edge_index_dict = ego_graph.edge_index_dict
+        robots_with_edges = set()
+
+        # Check agent->track edges (in_fov_and_observed, in_fov_only)
+        agent_to_track_edge_types = [
+            ('agent', 'in_fov_and_observed', 'track'),
+            ('agent', 'in_fov_only', 'track')
+        ]
+
+        for edge_type in agent_to_track_edge_types:
+            if edge_type in edge_index_dict:
+                edges = edge_index_dict[edge_type]
+                if edges.numel() > 0:
+                    # edges[0] is source (agent), edges[1] is target (track)
+                    # Find all agents that have edges to this track
+                    agents_to_this_track = edges[0][edges[1] == track_idx]
+                    robots_with_edges.update(agents_to_this_track.tolist())
+
+        return len(robots_with_edges)
+
     def _generate_labels_from_ego_graph(self, ego_robot, ego_graph: HeteroData) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate labels for ALL robots and tracks in the ego graph.
@@ -313,22 +434,22 @@ class SupervisedDataGenerator:
 
         # Generate labels for ALL tracks in ego graph
         track_labels = []
-        if 'track' in ego_graph.x_dict and ego_graph.x_dict['track'].shape[0] > 0:
-            # Get all proximal robot tracks
-            proximal_robot_tracks = {}
-            for robot in proximal_robots:
-                robot_tracks = robot.get_all_current_tracks()
-                proximal_robot_tracks[robot.id] = robot_tracks
+        # Get all proximal robot tracks
+        proximal_robot_tracks = {}
+        for robot in proximal_robots:
+            robot_tracks = robot.get_all_current_tracks()
+            proximal_robot_tracks[robot.id] = robot_tracks
 
-            # Get tracks in same order as ego graph builder
-            fused_tracks, individual_tracks, _ = self.ego_graph_builder._perform_track_fusion(
-                proximal_robots, proximal_robot_tracks)
-            all_tracks = fused_tracks + individual_tracks
+        # Get tracks in same order as ego graph builder
+        fused_tracks, individual_tracks, _ = self.ego_graph_builder._perform_track_fusion(
+            proximal_robots, proximal_robot_tracks)
+        all_tracks = fused_tracks + individual_tracks
 
+        if len(all_tracks) > 0:
             ground_truth_objects = getattr(self.sim_env, 'ground_truth_objects', [])
 
             # Create labels for ALL tracks (not just ego-owned)
-            for track in all_tracks[:ego_graph.x_dict['track'].shape[0]]:
+            for track in all_tracks:
                 track_id_str = str(track.object_id)
 
                 # Check if track is ground truth
@@ -348,15 +469,13 @@ class SupervisedDataGenerator:
 
         return agent_labels, track_labels
 
-    def generate_episode_data(self, episode_idx: int = 0, step_interval: int = 10,
-                             ego_sample_ratio: float = 0.2) -> Tuple[List[SupervisedDataSample], Dict]:
+    def generate_episode_data(self, episode_idx: int = 0, step_interval: int = 10) -> Tuple[List[SupervisedDataSample], Dict]:
         """
         Generate supervised data for one episode using RL trust algorithm
 
         Args:
             episode_idx: Episode index for tracking
             step_interval: Sample ego graphs every N steps (default: 10)
-            ego_sample_ratio: Proportion of ego graphs to sample at each timestep (default: 0.2)
 
         Returns:
             Tuple of (list of data samples for the episode, episode parameters)
@@ -366,7 +485,7 @@ class SupervisedDataGenerator:
 
         print(f"Generating data for episode {episode_idx}...")
         print(f"  Parameters: {episode_params}")
-        print(f"  Sampling: every {step_interval} steps, {ego_sample_ratio*100:.0f}% of ego graphs per step")
+        print(f"  Sampling: every {step_interval} steps, all robots")
 
         # Create simulation environment with sampled parameters
         self._create_simulation_environment(episode_params)
@@ -397,35 +516,51 @@ class SupervisedDataGenerator:
                 print(f"Warning: No robots at step {step}")
                 continue
 
-            # Sample a subset of robots for ego graphs
-            num_robots_to_sample = max(1, int(len(robots) * ego_sample_ratio))
-            sampled_robots = random.sample(robots, num_robots_to_sample)
-
-            # Generate ego graphs for sampled robots
-            for ego_robot in sampled_robots:
+            # Generate ego graphs for all robots
+            for ego_robot in robots:
                 try:
                     # Build ego-graph for this robot
                     ego_graph = self.ego_graph_builder.build_ego_graph(ego_robot, robots)
                     if ego_graph is None:
                         continue
 
-                    # Generate labels ONLY for ego robot and its tracks (corrected MDP)
+                    # Generate labels for ALL nodes in ego graph
                     agent_labels, track_labels = self._generate_labels_from_ego_graph(ego_robot, ego_graph)
 
-                    # Create clean data sample
+                    num_agents = agent_labels.shape[0]
+                    num_tracks = track_labels.shape[0]
+
+                    # Check cross-validation: Does ego robot have co_detection or contradicts edges?
+                    ego_has_cross_validation = self._check_ego_cross_validation(ego_graph)
+
+                    # Skip samples where ego robot has no cross-validation
+                    if not ego_has_cross_validation:
+                        continue
+
+                    # Identify meaningful tracks: ego-detected at current timestep AND have edges to >= 2 robots
+                    meaningful_track_indices = self._identify_meaningful_tracks(
+                        ego_robot, ego_graph, num_tracks
+                    )
+
+                    # Skip if no meaningful tracks (rare but possible)
+                    if len(meaningful_track_indices) == 0:
+                        continue
+
+                    # Create data sample with full ego graph + meaningful track indices
                     sample = SupervisedDataSample(
-                        x_dict=ego_graph.x_dict.copy(),
                         edge_index_dict=ego_graph.edge_index_dict.copy(),
                         agent_labels=agent_labels,
                         track_labels=track_labels,
+                        num_agents=num_agents,
+                        num_tracks=num_tracks,
+                        ego_has_cross_validation=ego_has_cross_validation,
+                        meaningful_track_indices=meaningful_track_indices,
                         timestep=step,
                         episode=episode_idx,
                         ego_robot_id=ego_robot.id
                     )
 
-                    # Only save samples that have tracks (skip empty track graphs)
-                    if 'track' in sample.x_dict and sample.x_dict['track'].shape[0] > 0:
-                        episode_data.append(sample)
+                    episode_data.append(sample)
 
                 except Exception as e:
                     print(f"Warning: Error generating ego graph for robot {ego_robot.id} at step {step}: {e}")
@@ -437,8 +572,7 @@ class SupervisedDataGenerator:
                         num_episodes: int = 10,
                         save_path: str = "supervised_trust_dataset.pkl",
                         log_path: str = None,
-                        step_interval: int = 10,
-                        ego_sample_ratio: float = 0.2) -> Tuple[List[SupervisedDataSample], List[Dict]]:
+                        step_interval: int = 10) -> Tuple[List[SupervisedDataSample], List[Dict]]:
         """
         Generate complete dataset with multiple episodes using diverse parameters
 
@@ -447,7 +581,6 @@ class SupervisedDataGenerator:
             save_path: Path to save the dataset
             log_path: Optional path to save generation log (default: save_path.replace('.pkl', '.log'))
             step_interval: Sample ego graphs every N steps (default: 10)
-            ego_sample_ratio: Proportion of ego graphs to sample at each timestep (default: 0.2)
 
         Returns:
             Tuple of (list of all data samples, list of episode parameters)
@@ -492,8 +625,8 @@ class SupervisedDataGenerator:
         log_print(f"⏱️  Max steps per episode: {self.max_steps_per_episode}")
         log_print(f"📊 Sampling strategy:")
         log_print(f"   - Step interval: every {step_interval} steps")
-        log_print(f"   - Ego sample ratio: {ego_sample_ratio*100:.0f}% of robots per sampled step")
-        log_print(f"   - Expected samples per episode: ~{(self.max_steps_per_episode // step_interval) * ego_sample_ratio * 5:.0f} (assuming ~5 robots)")
+        log_print(f"   - Robot sampling: ALL robots at each sampled timestep")
+        log_print(f"   - Expected samples per episode: ~{(self.max_steps_per_episode // step_interval) * 10:.0f} (assuming ~10 robots)")
 
         log_print(f"🧠 Using ground truth trust assignment:")
         log_print(f"   - Legitimate robots/tracks: trust ∈ [0.7, 1.0]")
@@ -507,7 +640,7 @@ class SupervisedDataGenerator:
         for episode in range(num_episodes):
             try:
                 episode_data, episode_params = self.generate_episode_data(
-                    episode, step_interval=step_interval, ego_sample_ratio=ego_sample_ratio
+                    episode, step_interval=step_interval
                 )
                 all_data.extend(episode_data)
                 all_episode_params.append(episode_params)
@@ -553,11 +686,13 @@ class SupervisedDataGenerator:
         num_adversarial = len(adversarial_samples)
         num_legitimate = len(legitimate_samples)
 
+        # Import random for shuffling (needed regardless of balancing)
+        import random as random_module
+        random_module.seed(42)  # Reproducible sampling
+
         if num_legitimate > num_adversarial:
             # Randomly sample legitimate samples to match adversarial count
-            import random
-            random.seed(42)  # Reproducible sampling
-            sampled_legitimate = random.sample(legitimate_samples, num_adversarial)
+            sampled_legitimate = random_module.sample(legitimate_samples, num_adversarial)
 
             log_print(f"\nBalancing dataset:")
             log_print(f"  Keeping all {num_adversarial} adversarial samples")
@@ -573,7 +708,7 @@ class SupervisedDataGenerator:
 
         # Merge balanced samples
         all_data = adversarial_samples + legitimate_samples
-        random.shuffle(all_data)  # Shuffle to mix adversarial and legitimate
+        random_module.shuffle(all_data)  # Shuffle to mix adversarial and legitimate
 
         log_print(f"\nBalanced dataset:")
         log_print(f"  Total samples: {len(all_data)} (was {len(adversarial_samples) + num_legitimate})")
@@ -590,23 +725,11 @@ class SupervisedDataGenerator:
                                     if ('agent', 'co_detection', 'agent') in sample.edge_index_dict)
 
         if all_data:
-            avg_agents_per_sample = np.mean([sample.agent_labels.shape[0] for sample in all_data])
-            avg_tracks_per_sample = np.mean([sample.track_labels.shape[0] for sample in all_data])
-
-            # Feature dimensions after alpha/beta removal
-            sample_agent_features = all_data[0].x_dict['agent'].shape[1] if 'agent' in all_data[0].x_dict else 0
-
-            # Find a sample with tracks to get track feature dimensions
-            sample_track_features = 0
-            for sample in all_data:
-                if 'track' in sample.x_dict and sample.x_dict['track'].shape[0] > 0:
-                    sample_track_features = sample.x_dict['track'].shape[1]
-                    break
+            avg_agents_per_sample = np.mean([sample.num_agents for sample in all_data])
+            avg_tracks_per_sample = np.mean([sample.num_tracks for sample in all_data])
         else:
             avg_agents_per_sample = 0
             avg_tracks_per_sample = 0
-            sample_agent_features = 0
-            sample_track_features = 0
 
         # Calculate parameter diversity statistics
         param_stats = {}
@@ -670,8 +793,7 @@ class SupervisedDataGenerator:
         log_print(f"   - Samples with agent co-detection edges: {codetection_edge_samples}")
         log_print(f"   - Avg agents per sample: {avg_agents_per_sample:.1f}")
         log_print(f"   - Avg tracks per sample: {avg_tracks_per_sample:.1f}")
-        log_print(f"   - Agent feature dimensions: {sample_agent_features} (alpha/beta removed)")
-        log_print(f"   - Track feature dimensions: {sample_track_features} (alpha/beta removed)")
+        log_print(f"   - Structure-only learning: No node features (graph edges only)")
 
         if all_episode_params:
             log_print(f"\n📈 Parameter Diversity:")
@@ -753,10 +875,8 @@ def main():
                        help='Proximal sensing range: fixed value (default: 50.0)')
     parser.add_argument('--steps', type=int, default=100,
                        help='Max steps per episode (default: 100)')
-    parser.add_argument('--step-interval', type=int, default=10,
-                       help='Sample ego graphs every N steps to reduce duplicates (default: 10)')
-    parser.add_argument('--ego-sample-ratio', type=float, default=0.2,
-                       help='Proportion of ego graphs to sample at each timestep (default: 0.2 = 20%%)')
+    parser.add_argument('--step-interval', type=int, default=5,
+                       help='Sample ego graphs every N steps to reduce duplicates (default: 5)')
     parser.add_argument('--output', type=str, default='supervised_trust_dataset.pkl',
                        help='Output file path (default: supervised_trust_dataset.pkl)')
     args = parser.parse_args()
@@ -798,8 +918,7 @@ def main():
     dataset, episode_params = generator.generate_dataset(
         num_episodes=args.episodes,
         save_path=args.output,
-        step_interval=args.step_interval,
-        ego_sample_ratio=args.ego_sample_ratio
+        step_interval=args.step_interval
     )
 
     print(f"\n🎯 Dataset generation complete!")
@@ -809,7 +928,7 @@ def main():
     print(f"   - Adversarial robots/tracks: trust ∈ [0.0, 0.3]")
     print(f"   - Confidence: Higher when trust is closer to 0 or 1")
     print(f"🔗 Agent co-detection edges included (robots detecting same objects)")
-    print(f"📉 Alpha/beta features removed from node features")
+    print(f"🏗️  Structure-only learning: Graph edges only, no node features")
     print(f"🎲 Parameter diversity across episodes for more robust training")
 
 

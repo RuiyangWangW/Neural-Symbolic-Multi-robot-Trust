@@ -361,27 +361,38 @@ class TrustMethodComparison:
                 if trust_system.evidence_extractor.available:
                     try:
                         ego_result = trust_system.evidence_extractor.predictor.predict_from_robots_tracks(robot, env.robots)
+
+                        # Check if ego_result is None (no cross-validation or no meaningful tracks)
+                        if ego_result is None:
+                            # Skip this ego-graph - no cross-validation constraints met
+                            continue
+
                         predictions = ego_result['predictions']
                         graph_data = ego_result['graph_data']
+                        meaningful_track_indices = ego_result.get('meaningful_track_indices', [])
 
                         agent_scores_array = predictions.get('agent', {}).get('trust_scores', [])
                         track_scores_array = predictions.get('track', {}).get('trust_scores', [])
                         agent_nodes = getattr(graph_data, 'agent_nodes', {})
                         track_nodes = getattr(graph_data, 'track_nodes', {})
 
+                        # Only include ego robot (index 0) in agent scores
                         agent_scores = {}
                         for agent_id, idx in agent_nodes.items():
-                            if idx < len(agent_scores_array):
-                                agent_scores[str(agent_id)] = float(np.clip(np.asarray(agent_scores_array[idx]).item(), 0.0, 1.0))
-                            else:
-                                agent_scores[str(agent_id)] = 0.5
+                            if idx == 0:  # Only ego robot
+                                if idx < len(agent_scores_array):
+                                    agent_scores[str(agent_id)] = float(np.clip(np.asarray(agent_scores_array[idx]).item(), 0.0, 1.0))
+                                else:
+                                    agent_scores[str(agent_id)] = 0.5
 
+                        # Only include meaningful tracks in track scores
                         track_scores = {}
                         for track_id, idx in track_nodes.items():
-                            if idx < len(track_scores_array):
-                                track_scores[track_id] = float(np.clip(np.asarray(track_scores_array[idx]).item(), 0.0, 1.0))
-                            else:
-                                track_scores[track_id] = 0.5
+                            if idx in meaningful_track_indices:  # Only meaningful tracks
+                                if idx < len(track_scores_array):
+                                    track_scores[track_id] = float(np.clip(np.asarray(track_scores_array[idx]).item(), 0.0, 1.0))
+                                else:
+                                    track_scores[track_id] = 0.5
 
                         edge_index = {}
                         for edge_type, edge_tensor in graph_data.edge_index_dict.items():
@@ -394,6 +405,7 @@ class TrustMethodComparison:
                             'agent_scores': agent_scores,
                             'track_scores': track_scores,
                             'edges': edge_index,
+                            'meaningful_track_indices': meaningful_track_indices,
                         }
                     except Exception as graph_err:
                         print(f"⚠️ Failed to capture ego graph for robot {robot.id} at step {step}: {graph_err}")
