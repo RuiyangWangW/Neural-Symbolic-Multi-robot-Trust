@@ -15,22 +15,123 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import HeteroConv, GATConv, Linear
 from torch_geometric.data import HeteroData
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from pathlib import Path
+from dataclasses import dataclass
 import numpy as np
 
 # Import required modules
 from robot_track_classes import Robot
 
 
+@dataclass
+class NodeScores:
+    """Container for evidence scores from GNN"""
+    agent_scores: Dict[int, float]  # robot_id -> evidence score
+    track_scores: Dict[str, float]  # track_id -> evidence score
+
+
+class TripletEncoder(nn.Module):
+    """
+    Encodes local edge structure around each node as symbolic triplets using Transformer.
+
+    For each node, we encode all outgoing edges as triplets:
+    τ = (source_type, edge_relation, target_type)
+
+    where:
+    - source_type: 0=agent, 1=track (1-bit)
+    - edge_relation: one-hot over 6 edge types (6-bit)
+    - target_type: 0=agent, 1=track (1-bit)
+    Total: 8 dimensions per triplet
+
+    The transformer processes variable-length sequences of triplets and produces
+    fixed-size node embeddings.
+    """
+
+    def __init__(self, hidden_dim=128, num_heads=4, num_layers=2, dropout=0.1):
+        super().__init__()
+
+        self.hidden_dim = hidden_dim
+
+        # Triplet embedding: 8-dim symbolic representation → hidden_dim
+        self.triplet_embedding = nn.Linear(8, hidden_dim)
+
+        # Learnable positional encoding for edge ordering
+        # Max 100 edges per node should be sufficient for most cases
+        self.pos_encoding = nn.Parameter(torch.randn(1, 100, hidden_dim) * 0.02)
+
+        # Transformer encoder layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation='relu',
+            batch_first=True,
+            norm_first=False
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Output projection
+        self.output_proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, triplets, mask=None):
+        """
+        Encode symbolic triplets into node embeddings.
+
+        Args:
+            triplets: [num_nodes, max_edges, 8] - symbolic triplet representations
+            mask: [num_nodes, max_edges] - True for padding positions
+
+        Returns:
+            [num_nodes, hidden_dim] - node embeddings
+        """
+        batch_size, seq_len, _ = triplets.shape
+
+        # Embed triplets
+        x = self.triplet_embedding(triplets)  # [num_nodes, max_edges, hidden_dim]
+
+        # Add positional encoding (truncate or pad as needed)
+        if seq_len <= self.pos_encoding.size(1):
+            x = x + self.pos_encoding[:, :seq_len, :]
+        else:
+            # For sequences longer than 100, repeat the last position
+            pos_enc = torch.cat([
+                self.pos_encoding,
+                self.pos_encoding[:, -1:, :].repeat(1, seq_len - 100, 1)
+            ], dim=1)
+            x = x + pos_enc
+
+        # Apply transformer
+        # mask: True for positions to ignore
+        x = self.transformer(x, src_key_padding_mask=mask)
+
+        # Pool over sequence: mean of non-padded positions
+        if mask is not None:
+            # Mask out padded positions
+            x_masked = x.masked_fill(mask.unsqueeze(-1), 0.0)
+            # Count non-padded positions
+            counts = (~mask).sum(dim=1, keepdim=True).clamp(min=1).float()
+            # Mean over non-padded
+            pooled = x_masked.sum(dim=1) / counts
+        else:
+            # No padding, simple mean
+            pooled = x.mean(dim=1)
+
+        # Final projection
+        output = self.output_proj(pooled)  # [num_nodes, hidden_dim]
+
+        return output
+
+
 class SupervisedTrustGNN(nn.Module):
     """
-    Supervised GNN model for binary trust classification
+    Supervised GNN model for binary trust classification with Transformer-based Triplet Encoding
 
-    PURE STRUCTURE-ONLY DESIGN:
-    - No node features - learns purely from graph structure
-    - No type embeddings - all nodes start with zero features
-    - Information flows entirely through edge structure and message passing
+    SYMBOLIC STRUCTURE ENCODING:
+    - Triplet encoder: Encodes local edge patterns as symbolic triplets τ = (src_type, relation, dst_type)
+    - Transformer: Processes variable-length sequences of triplets per node
+    - Rich initial features: Nodes start with meaningful embeddings from local structure
     - Edge types: 6 heterogeneous relations define the graph topology
     """
 
@@ -38,9 +139,6 @@ class SupervisedTrustGNN(nn.Module):
         super(SupervisedTrustGNN, self).__init__()
 
         self.hidden_dim = hidden_dim
-
-        # Pure structure-only learning: NO node features, NO type embeddings
-        # All nodes start with zero features - only edges provide information
 
         # Define edge types for heterogeneous graph
         self.edge_types = [
@@ -51,6 +149,25 @@ class SupervisedTrustGNN(nn.Module):
             ('agent', 'co_detection', 'agent'),  # Co-detection edges (robots detecting same object)
             ('agent', 'contradicts', 'agent'),   # Contradiction edges (robot A detects track that B should see but doesn't)
         ]
+
+        # Map edge types to indices for one-hot encoding
+        self.edge_type_to_idx = {edge_type: i for i, edge_type in enumerate(self.edge_types)}
+
+        # Triplet encoders: Convert local edge structure to node embeddings
+        # Separate encoders for agents and tracks (they have different edge patterns)
+        self.agent_triplet_encoder = TripletEncoder(
+            hidden_dim=hidden_dim,
+            num_heads=4,
+            num_layers=2,
+            dropout=0.1
+        )
+
+        self.track_triplet_encoder = TripletEncoder(
+            hidden_dim=hidden_dim,
+            num_heads=4,
+            num_layers=2,
+            dropout=0.1
+        )
 
         # Three layers of heterogeneous convolution (each with independent parameters)
         # FIXED: Create separate conv_dict for each layer to avoid parameter sharing
@@ -121,7 +238,7 @@ class SupervisedTrustGNN(nn.Module):
 
     def forward(self, num_agents, num_tracks, edge_index_dict, device='cpu'):
         """
-        Forward pass for trust classification (structure-only)
+        Forward pass for trust classification with triplet encoding
 
         Args:
             num_agents: Number of agent nodes
@@ -135,15 +252,21 @@ class SupervisedTrustGNN(nn.Module):
         # Check if we have any tracks
         has_tracks = num_tracks > 0
 
-        # Pure structure-only: Initialize ALL nodes with ZEROS
-        # No initial features - all information comes from graph structure and message passing
-        agent_embeddings = torch.zeros(num_agents, self.hidden_dim, device=device)
+        # ============================================================
+        # STEP 1: Triplet Encoding - Extract and encode local structure
+        # ============================================================
+
+        # Extract triplets for agent nodes
+        agent_triplets, agent_mask = self._extract_triplets('agent', num_agents, edge_index_dict, device)
+        # Encode with transformer
+        agent_embeddings = self.agent_triplet_encoder(agent_triplets, agent_mask)
 
         x_dict = {'agent': agent_embeddings}
 
-        # Track nodes: also initialized with zeros
+        # Extract and encode triplets for track nodes
         if has_tracks:
-            track_embeddings = torch.zeros(num_tracks, self.hidden_dim, device=device)
+            track_triplets, track_mask = self._extract_triplets('track', num_tracks, edge_index_dict, device)
+            track_embeddings = self.track_triplet_encoder(track_triplets, track_mask)
             x_dict['track'] = track_embeddings
         else:
             # Create empty track tensor with correct dimensions
@@ -205,6 +328,95 @@ class SupervisedTrustGNN(nn.Module):
             predictions['track'] = track_trust_probs
 
         return predictions
+
+    def _extract_triplets(self, node_type: str, num_nodes: int, edge_index_dict: Dict, device='cpu') -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract symbolic triplets for all nodes of a given type.
+
+        For each node, we find all outgoing edges and encode them as triplets:
+        τ = (source_type, edge_relation, target_type)
+
+        Args:
+            node_type: 'agent' or 'track'
+            num_nodes: Number of nodes of this type
+            edge_index_dict: Dictionary of edge indices
+            device: Device for tensors
+
+        Returns:
+            Tuple of (triplets, mask)
+            - triplets: [num_nodes, max_edges, 8] - symbolic triplet representations
+            - mask: [num_nodes, max_edges] - True for padding positions
+        """
+        # Collect all edges where this node type is the source
+        node_edges = []  # List of (node_idx, edge_list) pairs
+
+        for node_idx in range(num_nodes):
+            edge_list = []
+
+            # Iterate through all edge types
+            for edge_type in self.edge_types:
+                src_type, relation, dst_type = edge_type
+
+                # Check if this edge type originates from our node_type
+                if src_type == node_type and edge_type in edge_index_dict:
+                    edge_index = edge_index_dict[edge_type]
+
+                    if edge_index.numel() > 0:
+                        # Find edges where source is node_idx
+                        mask = (edge_index[0] == node_idx)
+                        if mask.any():
+                            # Get target nodes for these edges
+                            target_nodes = edge_index[1][mask]
+
+                            # Create triplet for each edge
+                            for target_idx in target_nodes:
+                                # Encode triplet: (src_type, relation, dst_type)
+                                # src_type: 0=agent, 1=track (1 bit)
+                                src_bit = 1.0 if src_type == 'track' else 0.0
+
+                                # relation: one-hot over 6 edge types (6 bits)
+                                relation_onehot = [0.0] * 6
+                                relation_idx = self.edge_type_to_idx[edge_type]
+                                relation_onehot[relation_idx] = 1.0
+
+                                # dst_type: 0=agent, 1=track (1 bit)
+                                dst_bit = 1.0 if dst_type == 'track' else 0.0
+
+                                # Concatenate: [src_bit, relation_onehot (6), dst_bit] = 8 dims
+                                triplet = [src_bit] + relation_onehot + [dst_bit]
+                                edge_list.append(triplet)
+
+            node_edges.append(edge_list)
+
+        # Find maximum number of edges across all nodes
+        max_edges = max(len(edges) for edges in node_edges) if node_edges else 1
+        max_edges = max(max_edges, 1)  # At least 1 to avoid empty tensors
+
+        # Pad all edge lists to max_edges
+        triplets_list = []
+        mask_list = []
+
+        for edges in node_edges:
+            num_edges = len(edges)
+
+            if num_edges > 0:
+                # Pad with zeros
+                padded_edges = edges + [[0.0] * 8] * (max_edges - num_edges)
+                # Mask: False for real edges, True for padding
+                mask = [False] * num_edges + [True] * (max_edges - num_edges)
+            else:
+                # No edges: all padding
+                padded_edges = [[0.0] * 8] * max_edges
+                mask = [True] * max_edges
+
+            triplets_list.append(padded_edges)
+            mask_list.append(mask)
+
+        # Convert to tensors
+        triplets = torch.tensor(triplets_list, dtype=torch.float32, device=device)  # [num_nodes, max_edges, 8]
+        mask = torch.tensor(mask_list, dtype=torch.bool, device=device)  # [num_nodes, max_edges]
+
+        return triplets, mask
 
 
 class SupervisedTrustPredictor:
@@ -476,6 +688,56 @@ class SupervisedTrustPredictor:
     def is_available(self) -> bool:
         """Check if model is available for inference"""
         return self.model is not None
+
+    def get_scores(self, ego_robot, all_robots) -> NodeScores:
+        """
+        Get evidence scores for ego robot and meaningful tracks only.
+
+        This enforces cross-validation constraints:
+        - Only returns ego robot score (index 0)
+        - Only returns tracks with >=2 robot observations
+
+        Args:
+            ego_robot: Robot for which to build ego graph
+            all_robots: List of all robots
+
+        Returns:
+            NodeScores containing agent and track evidence scores
+        """
+        if not self.is_available():
+            # Return empty scores if model not available
+            return NodeScores(agent_scores={}, track_scores={})
+
+        # Get predictions from supervised GNN
+        result = self.predict_from_robots_tracks(ego_robot, all_robots)
+
+        # Check if prediction returned None (no cross-validation or no meaningful tracks)
+        if result is None:
+            return NodeScores(agent_scores={}, track_scores={})
+
+        predictions = result['predictions']
+        graph_data = result['graph_data']
+        meaningful_track_indices = result.get('meaningful_track_indices', [])
+
+        # Extract agent scores - ONLY ego robot (index 0)
+        agent_scores = {}
+        if 'agent' in predictions and hasattr(graph_data, 'agent_nodes'):
+            agent_trust_probs = predictions['agent']['trust_scores']
+            for robot_id, node_idx in graph_data.agent_nodes.items():
+                if node_idx == 0:  # Only ego robot
+                    if node_idx < len(agent_trust_probs):
+                        agent_scores[robot_id] = float(agent_trust_probs[node_idx])
+
+        # Extract track scores - ONLY meaningful tracks
+        track_scores = {}
+        if 'track' in predictions and hasattr(graph_data, 'track_nodes'):
+            track_trust_probs = predictions['track']['trust_scores']
+            for track_id, node_idx in graph_data.track_nodes.items():
+                if node_idx in meaningful_track_indices:  # Only meaningful tracks
+                    if node_idx < len(track_trust_probs):
+                        track_scores[track_id] = float(track_trust_probs[node_idx])
+
+        return NodeScores(agent_scores=agent_scores, track_scores=track_scores)
 
 
 class EgoGraphBuilder:
