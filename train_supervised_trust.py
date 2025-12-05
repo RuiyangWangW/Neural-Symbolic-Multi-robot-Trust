@@ -131,11 +131,35 @@ def collate_batch_pyg(batch: List[Dict]) -> Dict:
     agent_labels_batched = torch.cat(agent_labels_list, dim=0)
     track_labels_batched = torch.cat(track_labels_list, dim=0)
 
+    # Batch pre-computed triplets if available
+    agent_triplets_batched = None
+    agent_triplet_mask_batched = None
+    track_triplets_batched = None
+    track_triplet_mask_batched = None
+
+    if 'agent_triplets' in batch[0] and batch[0]['agent_triplets'] is not None:
+        # Concatenate agent triplets from all samples
+        agent_triplets_list = [sample['agent_triplets'] for sample in batch]
+        agent_triplet_mask_list = [sample['agent_triplet_mask'] for sample in batch]
+        agent_triplets_batched = torch.cat(agent_triplets_list, dim=0)
+        agent_triplet_mask_batched = torch.cat(agent_triplet_mask_list, dim=0)
+
+    if 'track_triplets' in batch[0] and batch[0]['track_triplets'] is not None:
+        # Concatenate track triplets from all samples
+        track_triplets_list = [sample['track_triplets'] for sample in batch]
+        track_triplet_mask_list = [sample['track_triplet_mask'] for sample in batch]
+        track_triplets_batched = torch.cat(track_triplets_list, dim=0)
+        track_triplet_mask_batched = torch.cat(track_triplet_mask_list, dim=0)
+
     return {
         'use_pyg_batch': True,
         'batch_size': len(batch),
         'batched_data': batched_data,
         'ego_robot_indices': ego_robot_indices,  # List of ego indices in batched graph
+        'agent_triplets': agent_triplets_batched,
+        'agent_triplet_mask': agent_triplet_mask_batched,
+        'track_triplets': track_triplets_batched,
+        'track_triplet_mask': track_triplet_mask_batched,
         'ego_cross_validation_flags': ego_cross_validation_flags,  # Per-graph flags
         'meaningful_track_indices': meaningful_track_indices_batched,  # Global indices (all)
         'meaningful_track_indices_per_graph': meaningful_track_indices_per_graph_batched,  # Per-graph lists
@@ -221,7 +245,8 @@ class SupervisedTrustTrainer:
 
         Returns:
             Tuple of (num_agents, num_tracks, edge_index_dict, agent_labels, track_labels,
-                     ego_has_cross_validation, meaningful_track_indices)
+                     ego_has_cross_validation, meaningful_track_indices,
+                     agent_triplets, agent_triplet_mask, track_triplets, track_triplet_mask)
         """
         try:
             # For MPS, disable non_blocking transfers to avoid placeholder tensor issues
@@ -248,7 +273,23 @@ class SupervisedTrustTrainer:
             ego_has_cross_validation = sample['ego_has_cross_validation']
             meaningful_track_indices = sample['meaningful_track_indices']  # Keep as list
 
-            return num_agents, num_tracks, edge_index_dict, agent_labels, track_labels, ego_has_cross_validation, meaningful_track_indices
+            # Transfer pre-computed triplets if available (performance optimization)
+            agent_triplets = None
+            agent_triplet_mask = None
+            track_triplets = None
+            track_triplet_mask = None
+
+            if 'agent_triplets' in sample and sample['agent_triplets'] is not None:
+                agent_triplets = sample['agent_triplets'].to(self.device, non_blocking=use_non_blocking)
+                agent_triplet_mask = sample['agent_triplet_mask'].to(self.device, non_blocking=use_non_blocking)
+
+            if 'track_triplets' in sample and sample['track_triplets'] is not None:
+                track_triplets = sample['track_triplets'].to(self.device, non_blocking=use_non_blocking)
+                track_triplet_mask = sample['track_triplet_mask'].to(self.device, non_blocking=use_non_blocking)
+
+            return (num_agents, num_tracks, edge_index_dict, agent_labels, track_labels,
+                    ego_has_cross_validation, meaningful_track_indices,
+                    agent_triplets, agent_triplet_mask, track_triplets, track_triplet_mask)
 
         except Exception as e:
             # Fallback to synchronous transfer for problematic samples
@@ -458,8 +499,10 @@ class SupervisedTrustTrainer:
         Returns:
             Tuple of (loss, metrics)
         """
-        # Move data to device
-        num_agents, num_tracks, edge_index_dict, agent_labels, track_labels, ego_has_cross_validation, meaningful_track_indices = self._transfer_to_device(sample)
+        # Move data to device (including pre-computed triplets if available)
+        (num_agents, num_tracks, edge_index_dict, agent_labels, track_labels,
+         ego_has_cross_validation, meaningful_track_indices,
+         agent_triplets, agent_triplet_mask, track_triplets, track_triplet_mask) = self._transfer_to_device(sample)
 
         # Skip samples without cross-validation (should already be filtered in dataset)
         if not ego_has_cross_validation:
@@ -473,8 +516,12 @@ class SupervisedTrustTrainer:
         if len(meaningful_track_indices) == 0:
             return 0.0, {}
 
-        # Forward pass (no HeteroData needed - model creates embeddings from scratch)
-        predictions = self.model(num_agents, num_tracks, edge_index_dict, device=self.device)
+        # Forward pass with pre-computed triplets (if available)
+        predictions = self.model(
+            num_agents, num_tracks, edge_index_dict, device=self.device,
+            agent_triplets=agent_triplets, agent_triplet_mask=agent_triplet_mask,
+            track_triplets=track_triplets, track_triplet_mask=track_triplet_mask
+        )
 
         # Skip if ego robot is isolated (predictions will be None)
         if predictions is None:
@@ -533,8 +580,26 @@ class SupervisedTrustTrainer:
         # Get edge index dict
         edge_index_dict = batched_graph.edge_index_dict
 
-        # Forward pass on entire batch
-        predictions = self.model(total_agents, total_tracks, edge_index_dict, device=self.device)
+        # Get pre-computed triplets if available
+        agent_triplets = batch_data.get('agent_triplets', None)
+        agent_triplet_mask = batch_data.get('agent_triplet_mask', None)
+        track_triplets = batch_data.get('track_triplets', None)
+        track_triplet_mask = batch_data.get('track_triplet_mask', None)
+
+        # Transfer triplets to device if available
+        if agent_triplets is not None:
+            agent_triplets = agent_triplets.to(self.device, non_blocking=use_non_blocking)
+            agent_triplet_mask = agent_triplet_mask.to(self.device, non_blocking=use_non_blocking)
+        if track_triplets is not None:
+            track_triplets = track_triplets.to(self.device, non_blocking=use_non_blocking)
+            track_triplet_mask = track_triplet_mask.to(self.device, non_blocking=use_non_blocking)
+
+        # Forward pass on entire batch with pre-computed triplets
+        predictions = self.model(
+            total_agents, total_tracks, edge_index_dict, device=self.device,
+            agent_triplets=agent_triplets, agent_triplet_mask=agent_triplet_mask,
+            track_triplets=track_triplets, track_triplet_mask=track_triplet_mask
+        )
 
         # Compute loss with cross-validation filtering
         loss = self._compute_batched_loss(

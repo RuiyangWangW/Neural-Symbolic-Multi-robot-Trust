@@ -81,6 +81,26 @@ The model is a single heterogeneous Graph Attention Network (GAT) that predicts 
 - **Dropout**: 0.1-0.2 (GAT layers and classifiers)
 - **Architecture**: PyTorch Geometric HeteroData + GAT + Transformer
 
+### Performance Optimization: Pre-computed Triplets
+
+**Problem**: Triplet extraction (iterating through edges to create symbolic representations) was a bottleneck during training, taking significant time per forward pass.
+
+**Solution**: Pre-compute triplet sequences during dataset generation and store them with each sample.
+
+**Implementation**:
+- Dataset stores: `agent_triplets`, `agent_triplet_mask`, `track_triplets`, `track_triplet_mask`
+- During training: Load pre-computed triplets, skip extraction, pass directly to Transformer
+- Transformer still trains normally (parameters not frozen)
+
+**Performance Gains**:
+- **1.49x faster** forward pass (~33% speedup)
+- **~6 hours saved** per 100-epoch training (100k samples/epoch)
+- **Memory cost**: ~20-30% larger dataset size (triplet tensors stored)
+
+**When to Use**:
+- ✅ **Training**: Always use pre-computed triplets (automatic if dataset generated with latest code)
+- ⚠️  **Inference**: Dynamic extraction still used (graph structure varies at runtime)
+
 ---
 
 ## Cross-Validation Constraints
@@ -433,17 +453,19 @@ Generation time: ~8-12 hours
 **Per Episode** (200 steps, step_interval=5):
 ```
 Timesteps sampled: 200 / 5 = 40 timesteps
-Robots per timestep: ~12 (all robots)
-Potential samples: 40 × 12 = 480 samples
-After cross-validation (~25%): ~100-120 samples per episode
+Robots per timestep: ~2 (20% of ~12 robots)
+Potential samples: 40 × 2 = 80 samples
+After cross-validation (~50-70%): ~40-56 samples per episode
 ```
 
 **Total** (15,000 episodes):
 ```
-Potential samples: 15,000 × 480 = 7,200,000
-After cross-validation: ~1,800,000 samples
-Training points: 1,800,000 × 10 labels = 18,000,000
+Potential samples: 15,000 × 80 = 1,200,000
+After cross-validation: ~600,000-840,000 samples
+Training points: ~700,000 × 10 labels = 7,000,000
 ```
+
+**Note**: Robot sampling (20%) reduces dataset size by 80% while maintaining diversity across timesteps and episodes.
 
 ### Alternative: Minimal Configuration
 
@@ -502,9 +524,12 @@ python train_supervised_trust.py \
 - **Optimizer**: AdamW (lr=1e-3, weight_decay=1e-4)
 - **Scheduler**: ReduceLROnPlateau (factor=0.7, patience=10)
 - **Batch Processing**: PyTorch Geometric batching (default) for 2-3× faster training
+- **Triplet Optimization**: Pre-computed triplets (automatic) for 1.49× faster training
 - **Early Stopping**: Patience of 100 epochs
 
-**PyG Batching**: The training script now uses PyTorch Geometric batching by default, which concatenates multiple heterogeneous graphs into a single batch for parallel GPU processing. This provides significant speedup without affecting training quality. To disable batching (for debugging), use `--no-pyg-batch`.
+**Performance Optimizations**:
+- **PyG Batching**: Concatenates multiple heterogeneous graphs into a single batch for parallel GPU processing. Provides 2-3× speedup. To disable (for debugging), use `--no-pyg-batch`.
+- **Pre-computed Triplets**: Triplet sequences are pre-computed during dataset generation and stored with each sample, eliminating the need for dynamic extraction during training. Provides 1.49× speedup. Enabled automatically when dataset is generated with latest code.
 
 ### Batch Processing (PyG Batching - Default)
 

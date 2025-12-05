@@ -45,6 +45,11 @@ class SupervisedDataSample:
     timestep: int
     episode: int
     ego_robot_id: str  # ID of the ego robot for this sample
+    # Pre-computed triplets for faster training
+    agent_triplets: torch.Tensor = None  # [num_agents, max_edges, 8] - pre-computed triplet sequences
+    agent_triplet_mask: torch.Tensor = None  # [num_agents, max_edges] - True for padding
+    track_triplets: torch.Tensor = None  # [num_tracks, max_edges, 8] - pre-computed triplet sequences
+    track_triplet_mask: torch.Tensor = None  # [num_tracks, max_edges] - True for padding
 
 
 class SupervisedDataGenerator:
@@ -348,7 +353,8 @@ class SupervisedDataGenerator:
 
         # Get tracks currently detected by ego robot
         ego_current_tracks = ego_robot.get_all_current_tracks()
-        ego_track_ids = set(track.track_id for track in ego_current_tracks)
+        # IMPORTANT: Match by object_id, not track_id, because track fusion changes track_id
+        ego_object_ids = set(track.object_id for track in ego_current_tracks)
 
         # Get fused and individual tracks from ego graph (in same order as track nodes)
         if hasattr(ego_graph, '_fused_tracks') and hasattr(ego_graph, '_individual_tracks'):
@@ -360,7 +366,8 @@ class SupervisedDataGenerator:
         # For each track, check if it's meaningful
         for track_idx, track in enumerate(all_tracks[:num_tracks]):
             # Check 1: Is this track currently detected by ego robot?
-            if track.track_id not in ego_track_ids:
+            # Match by object_id (not track_id) since fusion changes track_id
+            if track.object_id not in ego_object_ids:
                 continue
 
             # Check 2: Does this track have edges to >= 2 robots?
@@ -400,6 +407,105 @@ class SupervisedDataGenerator:
                     robots_with_edges.update(agents_to_this_track.tolist())
 
         return len(robots_with_edges)
+
+    def _extract_triplets_for_storage(self, node_type: str, num_nodes: int, edge_index_dict: Dict):
+        """
+        Extract symbolic triplets for all nodes of a given type (for pre-computation during dataset generation).
+
+        For each node, we find all outgoing edges and encode them as triplets:
+        τ = (source_type, edge_relation, target_type)
+
+        Args:
+            node_type: 'agent' or 'track'
+            num_nodes: Number of nodes of this type
+            edge_index_dict: Dictionary of edge indices
+
+        Returns:
+            Tuple of (triplets, mask)
+            - triplets: [num_nodes, max_edges, 8] - symbolic triplet representations
+            - mask: [num_nodes, max_edges] - True for padding positions
+        """
+        # Define all edge types (same as in SupervisedTrustGNN)
+        edge_types = [
+            ('agent', 'in_fov_and_observed', 'track'),
+            ('track', 'observed_and_in_fov_by', 'agent'),
+            ('agent', 'in_fov_only', 'track'),
+            ('track', 'in_fov_only_by', 'agent'),
+            ('agent', 'co_detection', 'agent'),
+            ('agent', 'contradicts', 'agent'),
+        ]
+        edge_type_to_idx = {edge_type: i for i, edge_type in enumerate(edge_types)}
+
+        # Collect all edges where this node type is the source
+        node_edges = []  # List of (node_idx, edge_list) pairs
+
+        for node_idx in range(num_nodes):
+            edge_list = []
+
+            # Iterate through all edge types
+            for edge_type in edge_types:
+                src_type, relation, dst_type = edge_type
+
+                # Check if this edge type originates from our node_type
+                if src_type == node_type and edge_type in edge_index_dict:
+                    edge_index = edge_index_dict[edge_type]
+
+                    if edge_index.numel() > 0:
+                        # Find edges where source is node_idx
+                        mask = (edge_index[0] == node_idx)
+                        if mask.any():
+                            # Get target nodes for these edges
+                            target_nodes = edge_index[1][mask]
+
+                            # Create triplet for each edge
+                            for target_idx in target_nodes:
+                                # Encode triplet: (src_type, relation, dst_type)
+                                # src_type: 0=agent, 1=track (1 bit)
+                                src_bit = 1.0 if src_type == 'track' else 0.0
+
+                                # relation: one-hot over 6 edge types (6 bits)
+                                relation_onehot = [0.0] * 6
+                                relation_idx = edge_type_to_idx[edge_type]
+                                relation_onehot[relation_idx] = 1.0
+
+                                # dst_type: 0=agent, 1=track (1 bit)
+                                dst_bit = 1.0 if dst_type == 'track' else 0.0
+
+                                # Concatenate: [src_bit, relation_onehot (6), dst_bit] = 8 dims
+                                triplet = [src_bit] + relation_onehot + [dst_bit]
+                                edge_list.append(triplet)
+
+            node_edges.append(edge_list)
+
+        # Find maximum number of edges across all nodes
+        max_edges = max(len(edges) for edges in node_edges) if node_edges else 1
+        max_edges = max(max_edges, 1)  # At least 1 to avoid empty tensors
+
+        # Pad all edge lists to max_edges
+        triplets_list = []
+        mask_list = []
+
+        for edges in node_edges:
+            num_edges = len(edges)
+
+            if num_edges > 0:
+                # Pad with zeros
+                padded_edges = edges + [[0.0] * 8] * (max_edges - num_edges)
+                # Mask: False for real edges, True for padding
+                mask = [False] * num_edges + [True] * (max_edges - num_edges)
+            else:
+                # No edges: all padding
+                padded_edges = [[0.0] * 8] * max_edges
+                mask = [True] * max_edges
+
+            triplets_list.append(padded_edges)
+            mask_list.append(mask)
+
+        # Convert to tensors
+        triplets = torch.tensor(triplets_list, dtype=torch.float32)  # [num_nodes, max_edges, 8]
+        mask = torch.tensor(mask_list, dtype=torch.bool)  # [num_nodes, max_edges]
+
+        return triplets, mask
 
     def _generate_labels_from_ego_graph(self, ego_robot, ego_graph: HeteroData) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -485,7 +591,7 @@ class SupervisedDataGenerator:
 
         print(f"Generating data for episode {episode_idx}...")
         print(f"  Parameters: {episode_params}")
-        print(f"  Sampling: every {step_interval} steps, all robots")
+        print(f"  Sampling: every {step_interval} steps, 20% of robots")
 
         # Create simulation environment with sampled parameters
         self._create_simulation_environment(episode_params)
@@ -516,8 +622,12 @@ class SupervisedDataGenerator:
                 print(f"Warning: No robots at step {step}")
                 continue
 
-            # Generate ego graphs for all robots
-            for ego_robot in robots:
+            # Sample 20% of robots at each timestep to reduce dataset size
+            num_robots_to_sample = max(1, int(len(robots) * 0.2))
+            sampled_robots = random.sample(robots, num_robots_to_sample)
+
+            # Generate ego graphs for sampled robots only
+            for ego_robot in sampled_robots:
                 try:
                     # Build ego-graph for this robot
                     ego_graph = self.ego_graph_builder.build_ego_graph(ego_robot, robots)
@@ -546,7 +656,15 @@ class SupervisedDataGenerator:
                     if len(meaningful_track_indices) == 0:
                         continue
 
-                    # Create data sample with full ego graph + meaningful track indices
+                    # Pre-compute triplet sequences for faster training
+                    agent_triplets, agent_triplet_mask = self._extract_triplets_for_storage(
+                        'agent', num_agents, ego_graph.edge_index_dict
+                    )
+                    track_triplets, track_triplet_mask = self._extract_triplets_for_storage(
+                        'track', num_tracks, ego_graph.edge_index_dict
+                    )
+
+                    # Create data sample with full ego graph + meaningful track indices + pre-computed triplets
                     sample = SupervisedDataSample(
                         edge_index_dict=ego_graph.edge_index_dict.copy(),
                         agent_labels=agent_labels,
@@ -557,7 +675,11 @@ class SupervisedDataGenerator:
                         meaningful_track_indices=meaningful_track_indices,
                         timestep=step,
                         episode=episode_idx,
-                        ego_robot_id=ego_robot.id
+                        ego_robot_id=ego_robot.id,
+                        agent_triplets=agent_triplets,
+                        agent_triplet_mask=agent_triplet_mask,
+                        track_triplets=track_triplets,
+                        track_triplet_mask=track_triplet_mask
                     )
 
                     episode_data.append(sample)
@@ -625,8 +747,8 @@ class SupervisedDataGenerator:
         log_print(f"⏱️  Max steps per episode: {self.max_steps_per_episode}")
         log_print(f"📊 Sampling strategy:")
         log_print(f"   - Step interval: every {step_interval} steps")
-        log_print(f"   - Robot sampling: ALL robots at each sampled timestep")
-        log_print(f"   - Expected samples per episode: ~{(self.max_steps_per_episode // step_interval) * 10:.0f} (assuming ~10 robots)")
+        log_print(f"   - Robot sampling: 20% of robots at each sampled timestep")
+        log_print(f"   - Expected samples per episode: ~{(self.max_steps_per_episode // step_interval) * 2:.0f} (assuming ~10 robots, 20% = 2 robots)")
 
         log_print(f"🧠 Using ground truth trust assignment:")
         log_print(f"   - Legitimate robots/tracks: trust ∈ [0.7, 1.0]")
@@ -690,8 +812,20 @@ class SupervisedDataGenerator:
         import random as random_module
         random_module.seed(42)  # Reproducible sampling
 
-        if num_legitimate > num_adversarial:
-            # Randomly sample legitimate samples to match adversarial count
+        if num_adversarial > num_legitimate:
+            # More adversarial samples: sample down to match legitimate count
+            sampled_adversarial = random_module.sample(adversarial_samples, num_legitimate)
+
+            log_print(f"\nBalancing dataset:")
+            log_print(f"  Warning: Cross-validation filtering favored adversarial robots ({num_adversarial} adv vs {num_legitimate} legit)")
+            log_print(f"  Reason: Adversarial robots have more contradicts edges (false positives)")
+            log_print(f"  Sampling {num_legitimate} out of {num_adversarial} adversarial samples")
+            log_print(f"  Keeping all {num_legitimate} legitimate samples")
+            log_print(f"  Final ratio: 50% adversarial, 50% legitimate")
+
+            adversarial_samples = sampled_adversarial
+        elif num_legitimate > num_adversarial:
+            # More legitimate samples: sample down to match adversarial count
             sampled_legitimate = random_module.sample(legitimate_samples, num_adversarial)
 
             log_print(f"\nBalancing dataset:")
@@ -700,9 +834,6 @@ class SupervisedDataGenerator:
             log_print(f"  Final ratio: 50% adversarial, 50% legitimate")
 
             legitimate_samples = sampled_legitimate
-        elif num_adversarial > num_legitimate:
-            log_print(f"\nWarning: More adversarial ({num_adversarial}) than legitimate ({num_legitimate})!")
-            log_print(f"  Keeping all samples (cannot balance)")
         else:
             log_print(f"\nAlready balanced: {num_adversarial} adversarial, {num_legitimate} legitimate")
 
@@ -863,20 +994,20 @@ def main():
                        help='Robot density range in robots per square unit (default: 0.0005,0.0020)')
     parser.add_argument('--target-density-multiplier', type=str, default='2.0',
                        help='Target density multiplier applied to sampled robot density (default: 2.0)')
-    parser.add_argument('--adversarial-ratio', type=str, default='0.2,0.5',
-                       help='Adversarial robot ratio: single value or range "min,max" (default: 0.2,0.5)')
-    parser.add_argument('--false-positive-rate', type=str, default='0.1,0.7',
-                       help='False positive rate: single value or range "min,max" (default: 0.1,0.7)')
-    parser.add_argument('--false-negative-rate', type=str, default='0.0,0.3',
-                       help='False negative rate: single value or range "min,max" (default: 0.0,0.3)')
+    parser.add_argument('--adversarial-ratio', type=str, default='0.0,0.5',
+                       help='Adversarial robot ratio: single value or range "min,max" (default: 0.0,0.5)')
+    parser.add_argument('--false-positive-rate', type=str, default='0.0,0.5',
+                       help='False positive rate: single value or range "min,max" (default: 0.0,0.5)')
+    parser.add_argument('--false-negative-rate', type=str, default='0.0,0.5',
+                       help='False negative rate: single value or range "min,max" (default: 0.0,0.5)')
     parser.add_argument('--world-size', type=float, default=100.0,
                        help='Side length of the square world (fixed, default: 100.0)')
     parser.add_argument('--proximal-range', type=float, default=50.0,
                        help='Proximal sensing range: fixed value (default: 50.0)')
     parser.add_argument('--steps', type=int, default=100,
                        help='Max steps per episode (default: 100)')
-    parser.add_argument('--step-interval', type=int, default=5,
-                       help='Sample ego graphs every N steps to reduce duplicates (default: 5)')
+    parser.add_argument('--step-interval', type=int, default=10,
+                       help='Sample ego graphs every N steps to reduce duplicates (default: 10)')
     parser.add_argument('--output', type=str, default='supervised_trust_dataset.pkl',
                        help='Output file path (default: supervised_trust_dataset.pkl)')
     args = parser.parse_args()

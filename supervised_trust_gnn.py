@@ -236,7 +236,9 @@ class SupervisedTrustGNN(nn.Module):
             )
         return conv_dict
 
-    def forward(self, num_agents, num_tracks, edge_index_dict, device='cpu'):
+    def forward(self, num_agents, num_tracks, edge_index_dict, device='cpu',
+                agent_triplets=None, agent_triplet_mask=None,
+                track_triplets=None, track_triplet_mask=None):
         """
         Forward pass for trust classification with triplet encoding
 
@@ -245,6 +247,10 @@ class SupervisedTrustGNN(nn.Module):
             num_tracks: Number of track nodes
             edge_index_dict: Edge indices dictionary
             device: Device for tensors
+            agent_triplets: Pre-computed agent triplets [num_agents, max_edges, 8] (optional)
+            agent_triplet_mask: Pre-computed agent triplet mask [num_agents, max_edges] (optional)
+            track_triplets: Pre-computed track triplets [num_tracks, max_edges, 8] (optional)
+            track_triplet_mask: Pre-computed track triplet mask [num_tracks, max_edges] (optional)
 
         Returns:
             Dict containing trust predictions for agents and tracks
@@ -256,17 +262,31 @@ class SupervisedTrustGNN(nn.Module):
         # STEP 1: Triplet Encoding - Extract and encode local structure
         # ============================================================
 
-        # Extract triplets for agent nodes
-        agent_triplets, agent_mask = self._extract_triplets('agent', num_agents, edge_index_dict, device)
+        # Use pre-computed triplets if available, otherwise extract them
+        if agent_triplets is not None and agent_triplet_mask is not None:
+            # Use pre-computed triplets (faster - skip extraction)
+            agent_triplets = agent_triplets.to(device)
+            agent_triplet_mask = agent_triplet_mask.to(device)
+        else:
+            # Extract triplets dynamically (slower - for inference)
+            agent_triplets, agent_triplet_mask = self._extract_triplets('agent', num_agents, edge_index_dict, device)
+
         # Encode with transformer
-        agent_embeddings = self.agent_triplet_encoder(agent_triplets, agent_mask)
+        agent_embeddings = self.agent_triplet_encoder(agent_triplets, agent_triplet_mask)
 
         x_dict = {'agent': agent_embeddings}
 
         # Extract and encode triplets for track nodes
         if has_tracks:
-            track_triplets, track_mask = self._extract_triplets('track', num_tracks, edge_index_dict, device)
-            track_embeddings = self.track_triplet_encoder(track_triplets, track_mask)
+            if track_triplets is not None and track_triplet_mask is not None:
+                # Use pre-computed triplets (faster - skip extraction)
+                track_triplets = track_triplets.to(device)
+                track_triplet_mask = track_triplet_mask.to(device)
+            else:
+                # Extract triplets dynamically (slower - for inference)
+                track_triplets, track_triplet_mask = self._extract_triplets('track', num_tracks, edge_index_dict, device)
+
+            track_embeddings = self.track_triplet_encoder(track_triplets, track_triplet_mask)
             x_dict['track'] = track_embeddings
         else:
             # Create empty track tensor with correct dimensions
@@ -435,6 +455,7 @@ class SupervisedTrustPredictor:
         """
         self.device = torch.device(device)
         self.model = None
+        self.available = False  # Track whether model loaded successfully
         self.ego_graph_builder = EgoGraphBuilder(proximal_range=proximal_range)
         self._load_model(model_path)
 
@@ -472,9 +493,11 @@ class SupervisedTrustPredictor:
 
                 if matched_keys:
                     self.model.load_state_dict(model_state)
+                    self.available = True  # Model loaded successfully
                     loaded_msg = f"✅ Loaded supervised trust model from {resolved_path} (matched {len(matched_keys)} tensors)"
                     print(loaded_msg)
                 else:
+                    self.available = False  # No compatible tensors
                     print(f"ℹ️ Checkpoint '{resolved_path}' has no compatible tensors. Using randomly initialized weights.")
 
                 if mismatched_keys:
@@ -545,7 +568,8 @@ class SupervisedTrustPredictor:
 
         # Get tracks currently detected by ego robot
         ego_current_tracks = ego_robot.get_all_current_tracks()
-        ego_track_ids = set(track.track_id for track in ego_current_tracks)
+        # IMPORTANT: Match by object_id, not track_id, because track fusion changes track_id
+        ego_object_ids = set(track.object_id for track in ego_current_tracks)
 
         # Get fused and individual tracks from ego graph
         if hasattr(graph_data, '_fused_tracks') and hasattr(graph_data, '_individual_tracks'):
@@ -558,7 +582,8 @@ class SupervisedTrustPredictor:
         # For each track, check if it's meaningful
         for track_idx, track in enumerate(all_tracks[:num_tracks]):
             # Check 1: Is this track currently detected by ego robot?
-            if track.track_id not in ego_track_ids:
+            # Match by object_id (not track_id) since fusion changes track_id
+            if track.object_id not in ego_object_ids:
                 continue
 
             # Check 2: Does this track have edges to >= 2 robots?
