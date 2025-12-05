@@ -680,7 +680,7 @@ class SupervisedTrustTrainer:
 
             # Scale this graph's loss
             if loss_components > 0:
-                total_loss += graph_loss * 100.0
+                total_loss += graph_loss
 
         return total_loss
 

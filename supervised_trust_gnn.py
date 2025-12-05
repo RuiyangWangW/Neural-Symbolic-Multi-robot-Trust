@@ -70,7 +70,8 @@ class TripletEncoder(nn.Module):
             batch_first=True,
             norm_first=False
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Disable nested tensor optimization to avoid deprecated API warnings
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
 
         # Output projection
         self.output_proj = nn.Linear(hidden_dim, hidden_dim)

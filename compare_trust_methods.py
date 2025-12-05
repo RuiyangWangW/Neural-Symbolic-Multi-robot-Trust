@@ -360,7 +360,7 @@ class TrustMethodComparison:
                 # Capture ego-graph snapshot if GNN evidence is available
                 if trust_system.evidence_extractor.available:
                     try:
-                        ego_result = trust_system.evidence_extractor.predictor.predict_from_robots_tracks(robot, env.robots)
+                        ego_result = trust_system.evidence_extractor.predict_from_robots_tracks(robot, env.robots)
 
                         # Check if ego_result is None (no cross-validation or no meaningful tracks)
                         if ego_result is None:
