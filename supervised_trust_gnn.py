@@ -972,7 +972,10 @@ class EgoGraphBuilder:
 
         # Create agent-to-agent contradiction edges
         # Robot A contradicts Robot B if A detects a track that B should see (in B's FoV) but doesn't
+        # Allow multiple contradictions per robot pair (one per track)
+        # Make each contradiction bidirectional for symmetric inconsistency signaling
         agent_contradiction_edges = []
+        processed_contradictions = set()  # Track (robot_a, robot_b, object_id) to avoid duplicates
 
         for robot_a_idx, robot_a in enumerate(robots):
             # Get tracks that robot A detects
@@ -1001,10 +1004,19 @@ class EgoGraphBuilder:
                                 b_detects_object = True
                                 break
 
-                        # If B doesn't detect the object, A contradicts B
-                        if not b_detects_object:
-                            agent_contradiction_edges.append([robot_a_idx, robot_b_idx])
-                            break  # Only add one contradiction edge per robot pair
+                        # If B doesn't detect the object, A contradicts B on this specific track
+                        if not b_detects_object and track_a_obj_id:
+                            # Check if we've already processed this contradiction
+                            contradiction_key = (robot_a_idx, robot_b_idx, track_a_obj_id)
+                            if contradiction_key not in processed_contradictions:
+                                # Add bidirectional edges for this specific contradiction
+                                agent_contradiction_edges.append([robot_a_idx, robot_b_idx])
+                                agent_contradiction_edges.append([robot_b_idx, robot_a_idx])
+                                # Mark this contradiction as processed
+                                processed_contradictions.add(contradiction_key)
+                                # Also mark the reverse to avoid re-adding when we loop to robot B
+                                processed_contradictions.add((robot_b_idx, robot_a_idx, track_a_obj_id))
+                            # Continue checking other tracks (allow multiple contradictions)
 
         # Convert to tensors and create proper edge structure
         edge_types = [

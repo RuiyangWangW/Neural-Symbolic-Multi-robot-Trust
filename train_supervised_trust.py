@@ -313,8 +313,6 @@ class SupervisedTrustTrainer:
                     loss += track_loss
                     loss_components += 1
 
-        if loss_components > 0:
-            return loss * 100
         return None
 
     def _compute_metrics(self, predictions: Dict, labels: Dict) -> Dict:
@@ -1048,7 +1046,7 @@ def main():
                        help='Path to dataset file')
     parser.add_argument('--epochs', type=int, default=1000,
                        help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=128,
+    parser.add_argument('--batch-size', type=int, default=256,
                        help='Number of samples per DataLoader batch (processed individually per ego-graph)')
     parser.add_argument('--lr', type=float, default=1e-3,
                        help='Learning rate')
