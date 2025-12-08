@@ -1010,7 +1010,8 @@ class SupervisedTrustTrainer:
               val_loader: DataLoader,
               epochs: int = 100,
               save_path: str = 'supervised_trust_model.pth',
-              patience: int = 20) -> Dict:
+              patience: int = 20,
+              log_print=None) -> Dict:
         """
         Train the model
 
@@ -1020,13 +1021,18 @@ class SupervisedTrustTrainer:
             epochs: Number of epochs to train
             save_path: Path to save best model
             patience: Early stopping patience (epochs without improvement)
+            log_print: Optional logging function (defaults to print)
 
         Returns:
             Training history dictionary
         """
-        print(f"🚀 Starting supervised trust training for {epochs} epochs...")
-        print(f"📊 Device: {self.device}")
-        print(f"⏰ Early stopping patience: {patience} epochs")
+        # Use provided log_print or default to print
+        if log_print is None:
+            log_print = print
+
+        log_print(f"🚀 Starting supervised trust training for {epochs} epochs...")
+        log_print(f"📊 Device: {self.device}")
+        log_print(f"⏰ Early stopping patience: {patience} epochs")
 
         best_val_loss = float('inf')
         patience_counter = 0
@@ -1046,7 +1052,7 @@ class SupervisedTrustTrainer:
             self.scheduler.step(val_loss)
 
             # Progress logging - print every epoch
-            print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            log_print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
 
             # Print separate losses for monitoring
             train_agent_loss = train_metrics.get('agent_loss', 0.0)
@@ -1056,34 +1062,34 @@ class SupervisedTrustTrainer:
             agent_samples = train_metrics.get('agent_samples', 0)
             track_samples = train_metrics.get('track_samples', 0)
 
-            print(f"             | Agent Loss: {train_agent_loss:.4f} (n={agent_samples}) | Track Loss: {train_track_loss:.4f} (n={track_samples})")
-            print(f"             | Val Agent: {val_agent_loss:.4f} | Val Track: {val_track_loss:.4f}")
+            log_print(f"             | Agent Loss: {train_agent_loss:.4f} (n={agent_samples}) | Track Loss: {train_track_loss:.4f} (n={track_samples})")
+            log_print(f"             | Val Agent: {val_agent_loss:.4f} | Val Track: {val_track_loss:.4f}")
 
             # Print detailed metrics every 10 epochs or on last epoch
             if epoch % 10 == 0 or epoch == epochs - 1:
                 # Print overall metrics for agents
                 if 'agent_accuracy' in train_metrics:
-                    print(f"  Agent Overall: Train Acc={train_metrics['agent_accuracy']:.3f}, Val Acc={val_metrics.get('agent_accuracy', 0):.3f}")
-                    print(f"                 Train F1={train_metrics['agent_f1']:.3f}, Val F1={val_metrics.get('agent_f1', 0):.3f}")
+                    log_print(f"  Agent Overall: Train Acc={train_metrics['agent_accuracy']:.3f}, Val Acc={val_metrics.get('agent_accuracy', 0):.3f}")
+                    log_print(f"                 Train F1={train_metrics['agent_f1']:.3f}, Val F1={val_metrics.get('agent_f1', 0):.3f}")
 
                 # Print detailed agent metrics (adversarial vs honest)
                 if 'adversarial_agent_accuracy' in train_metrics:
-                    print(f"  Adversarial:   Train Acc={train_metrics['adversarial_agent_accuracy']:.3f}, Val Acc={val_metrics.get('adversarial_agent_accuracy', 0):.3f}")
+                    log_print(f"  Adversarial:   Train Acc={train_metrics['adversarial_agent_accuracy']:.3f}, Val Acc={val_metrics.get('adversarial_agent_accuracy', 0):.3f}")
                 if 'honest_agent_accuracy' in train_metrics:
-                    print(f"  Honest:        Train Acc={train_metrics['honest_agent_accuracy']:.3f}, Val Acc={val_metrics.get('honest_agent_accuracy', 0):.3f}")
+                    log_print(f"  Honest:        Train Acc={train_metrics['honest_agent_accuracy']:.3f}, Val Acc={val_metrics.get('honest_agent_accuracy', 0):.3f}")
 
                 # Print overall metrics for tracks if available
                 if 'track_accuracy' in train_metrics:
-                    print(f"  Track Overall: Train Acc={train_metrics['track_accuracy']:.3f}, Val Acc={val_metrics.get('track_accuracy', 0):.3f}")
-                    print(f"                 Train F1={train_metrics['track_f1']:.3f}, Val F1={val_metrics.get('track_f1', 0):.3f}")
+                    log_print(f"  Track Overall: Train Acc={train_metrics['track_accuracy']:.3f}, Val Acc={val_metrics.get('track_accuracy', 0):.3f}")
+                    log_print(f"                 Train F1={train_metrics['track_f1']:.3f}, Val F1={val_metrics.get('track_f1', 0):.3f}")
 
                 # Print detailed track metrics (ground truth vs false positive)
                 if 'ground_truth_track_accuracy' in train_metrics:
-                    print(f"  GT Tracks:     Train Acc={train_metrics['ground_truth_track_accuracy']:.3f}, Val Acc={val_metrics.get('ground_truth_track_accuracy', 0):.3f}")
+                    log_print(f"  GT Tracks:     Train Acc={train_metrics['ground_truth_track_accuracy']:.3f}, Val Acc={val_metrics.get('ground_truth_track_accuracy', 0):.3f}")
                 if 'false_positive_track_accuracy' in train_metrics:
-                    print(f"  FP Tracks:     Train Acc={train_metrics['false_positive_track_accuracy']:.3f}, Val Acc={val_metrics.get('false_positive_track_accuracy', 0):.3f}")
+                    log_print(f"  FP Tracks:     Train Acc={train_metrics['false_positive_track_accuracy']:.3f}, Val Acc={val_metrics.get('false_positive_track_accuracy', 0):.3f}")
 
-                print("-" * 50)
+                log_print("-" * 50)
 
             # Save best model
             if val_loss < best_val_loss:
@@ -1101,16 +1107,16 @@ class SupervisedTrustTrainer:
                     'val_metrics': val_metrics
                 }, save_path)
 
-                print(f"✅ Saved best model (val_loss: {best_val_loss:.4f}) to {save_path}")
+                log_print(f"✅ Saved best model (val_loss: {best_val_loss:.4f}) to {save_path}")
             else:
                 patience_counter += 1
 
             # Early stopping
             if patience_counter >= patience:
-                print(f"⚠️ Early stopping triggered after {patience} epochs without improvement")
+                log_print(f"⚠️ Early stopping triggered after {patience} epochs without improvement")
                 break
 
-        print(f"🎉 Training completed! Best validation loss: {best_val_loss:.4f}")
+        log_print(f"🎉 Training completed! Best validation loss: {best_val_loss:.4f}")
 
         return {
             'train_losses': self.train_losses,
@@ -1119,9 +1125,12 @@ class SupervisedTrustTrainer:
             'val_metrics': self.val_metrics
         }
 
-def load_dataset(data_path: str) -> List[SupervisedDataSample]:
+def load_dataset(data_path: str, log_print=None) -> List[SupervisedDataSample]:
     """Load dataset from pickle file with parameter diversity metadata"""
-    print(f"📂 Loading dataset from {data_path}...")
+    if log_print is None:
+        log_print = print
+
+    log_print(f"📂 Loading dataset from {data_path}...")
     with open(data_path, 'rb') as f:
         data = pickle.load(f)
 
@@ -1131,34 +1140,41 @@ def load_dataset(data_path: str) -> List[SupervisedDataSample]:
     param_ranges = data.get('parameter_ranges', {})
     statistics = data.get('statistics', {})
 
-    print(f"✅ Loaded {len(dataset)} samples with parameter diversity")
-    print(f"📊 Dataset generated with parameter ranges:")
+    log_print(f"✅ Loaded {len(dataset)} samples with parameter diversity")
+    log_print(f"📊 Dataset generated with parameter ranges:")
     for param_name, param_range in param_ranges.items():
-        print(f"   - {param_name}: {param_range}")
+        log_print(f"   - {param_name}: {param_range}")
 
     if statistics and 'parameter_diversity' in statistics:
         param_div = statistics['parameter_diversity']
-        print(f"🎲 Actual parameter diversity across {len(episode_params)} episodes:")
+        log_print(f"🎲 Actual parameter diversity across {len(episode_params)} episodes:")
         for param_name, stats in param_div.items():
-            print(f"   - {param_name}: {stats['min']:.3f} - {stats['max']:.3f} (avg: {stats['avg']:.3f})")
+            log_print(f"   - {param_name}: {stats['min']:.3f} - {stats['max']:.3f} (avg: {stats['avg']:.3f})")
 
     return dataset
 
 
 def split_dataset(dataset: List[SupervisedDataSample],
-                 train_ratio: float = 0.8) -> Tuple[List[SupervisedDataSample], List[SupervisedDataSample]]:
+                 train_ratio: float = 0.8,
+                 log_print=None) -> Tuple[List[SupervisedDataSample], List[SupervisedDataSample]]:
     """Split dataset into train and validation sets"""
+    if log_print is None:
+        log_print = print
+
     np.random.shuffle(dataset)
     split_idx = int(len(dataset) * train_ratio)
     train_data = dataset[:split_idx]
     val_data = dataset[split_idx:]
 
-    print(f"📊 Dataset split: {len(train_data)} train, {len(val_data)} validation")
+    log_print(f"📊 Dataset split: {len(train_data)} train, {len(val_data)} validation")
     return train_data, val_data
 
 
-def plot_training_results(history: Dict, save_path: str = 'supervised_training_results.png'):
+def plot_training_results(history: Dict, save_path: str = 'supervised_training_results.png', log_print=None):
     """Plot training results"""
+    if log_print is None:
+        log_print = print
+
     _, axes = plt.subplots(2, 2, figsize=(15, 10))
 
     # Loss curves
@@ -1212,12 +1228,13 @@ def plot_training_results(history: Dict, save_path: str = 'supervised_training_r
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"📊 Training results saved to {save_path}")
+    log_print(f"📊 Training results saved to {save_path}")
 
 
 def main():
     """Main training function"""
     import argparse
+    import datetime
 
     parser = argparse.ArgumentParser(description='Train supervised trust prediction model')
     parser.add_argument('--data', type=str, default='supervised_trust_dataset.pkl',
@@ -1238,6 +1255,8 @@ def main():
                        help='Early stopping patience - epochs without improvement (default: 100)')
     parser.add_argument('--output', type=str, default='supervised_trust_model.pth',
                        help='Output model path')
+    parser.add_argument('--log', type=str, default=None,
+                       help='Log file path (default: output_path.replace(.pth, _training.log))')
     parser.add_argument('--no-pyg-batch', action='store_true',
                        help='Disable PyTorch Geometric batching (use individual processing instead)')
     parser.add_argument('--agent-loss-weight', type=float, default=10.0,
@@ -1247,18 +1266,43 @@ def main():
 
     args = parser.parse_args()
 
+    # Set up logging
+    log_path = args.log
+    if log_path is None:
+        log_path = args.output.replace('.pth', '_training.log')
+
+    # Create log file and tee output
+    log_file = open(log_path, 'w', buffering=1)  # Line buffering
+
+    def log_print(*print_args, **kwargs):
+        """Print to both console and log file"""
+        message = ' '.join(str(arg) for arg in print_args)
+        print(message, **kwargs)
+        log_file.write(message + '\n')
+        log_file.flush()
+
+    # Log header
+    log_print("=" * 80)
+    log_print("SUPERVISED TRUST MODEL TRAINING")
+    log_print("=" * 80)
+    log_print(f"Start time: {datetime.datetime.now()}")
+    log_print(f"Dataset: {args.data}")
+    log_print(f"Output model: {args.output}")
+    log_print(f"Log file: {log_path}")
+    log_print("")
+
     # Setup device with GPU acceleration support
     if args.force_cpu:
         device = 'cpu'
-        print(f"🖥️  CPU training forced by user")
+        log_print(f"🖥️  CPU training forced by user")
     elif args.device == 'auto':
         if torch.cuda.is_available():
             device = 'cuda'
-            print(f"🚀 CUDA GPU detected: {torch.cuda.get_device_name(0)}")
+            log_print(f"🚀 CUDA GPU detected: {torch.cuda.get_device_name(0)}")
         elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             device = 'mps'
-            print(f"🚀 Apple Silicon MPS detected")
-            print(f"💡 If you encounter MPS issues, use --force-cpu")
+            log_print(f"🚀 Apple Silicon MPS detected")
+            log_print(f"💡 If you encounter MPS issues, use --force-cpu")
 
 
             # Enable MPS memory optimizations
@@ -1267,25 +1311,26 @@ def main():
                     torch.mps.set_per_process_memory_fraction(0.8)  # Use 80% of available memory
                 if hasattr(torch.mps, 'empty_cache'):
                     torch.mps.empty_cache()  # Clear any cached memory
-                print("💡 MPS memory optimizations enabled")
+                log_print("💡 MPS memory optimizations enabled")
             except Exception as e:
-                print(f"⚠️  Could not enable MPS memory optimizations: {e}")
+                log_print(f"⚠️  Could not enable MPS memory optimizations: {e}")
         else:
             device = 'cpu'
-            print(f"⚠️  No GPU acceleration available, using CPU")
+            log_print(f"⚠️  No GPU acceleration available, using CPU")
     else:
         device = args.device
 
-    print(f"🖥️  Using device: {device}")
+    log_print(f"🖥️  Using device: {device}")
 
     # Load and split dataset
     if not os.path.exists(args.data):
-        print(f"❌ Dataset file not found: {args.data}")
-        print("Please run generate_supervised_data.py first to create the dataset")
+        log_print(f"❌ Dataset file not found: {args.data}")
+        log_print("Please run generate_supervised_data.py first to create the dataset")
+        log_file.close()
         return
 
-    dataset = load_dataset(args.data)
-    train_data, val_data = split_dataset(dataset)
+    dataset = load_dataset(args.data, log_print=log_print)
+    train_data, val_data = split_dataset(dataset, log_print=log_print)
 
     # Create data loaders with MPS/CUDA optimizations
     train_dataset = SupervisedTrustDataset(train_data)
@@ -1315,13 +1360,13 @@ def main():
     # Create supervised model with structure-only learning (no input features)
     model = SupervisedTrustGNN(hidden_dim=128)
 
-    print(f"🧠 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"📦 Batching mode: {batching_mode}")
-    print(f"👷 DataLoader workers: {num_workers}")
-    print(f"📌 Pin memory: {pin_memory}")
+    log_print(f"🧠 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    log_print(f"📦 Batching mode: {batching_mode}")
+    log_print(f"👷 DataLoader workers: {num_workers}")
+    log_print(f"📌 Pin memory: {pin_memory}")
 
     # Create trainer with loss weighting
-    print(f"⚖️  Loss weights: Agent={args.agent_loss_weight}, Track={args.track_loss_weight}")
+    log_print(f"⚖️  Loss weights: Agent={args.agent_loss_weight}, Track={args.track_loss_weight}")
     trainer = SupervisedTrustTrainer(
         model,
         device=device,
@@ -1330,13 +1375,20 @@ def main():
         track_loss_weight=args.track_loss_weight
     )
 
-    # Train model
-    history = trainer.train(train_loader, val_loader, epochs=args.epochs, save_path=args.output, patience=args.patience)
+    # Train model with logging
+    history = trainer.train(train_loader, val_loader, epochs=args.epochs, save_path=args.output,
+                           patience=args.patience, log_print=log_print)
 
     # Plot results
-    plot_training_results(history)
+    plot_training_results(history, log_print=log_print)
 
-    print("✅ Training completed successfully!")
+    log_print("")
+    log_print("=" * 80)
+    log_print(f"End time: {datetime.datetime.now()}")
+    log_print("✅ Training completed successfully!")
+    log_print("=" * 80)
+
+    log_file.close()
 
 
 if __name__ == "__main__":
