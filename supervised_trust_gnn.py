@@ -808,13 +808,22 @@ class EgoGraphBuilder:
             proximal_robots, proximal_robot_tracks)
 
         # Step 4: Build ego-graph with only proximal robots and their tracks
+        # NOTE: This also removes isolated agents and updates robot/track lists
         ego_graph_data = self._build_multi_robot_graph(
             proximal_robots, fused_tracks, individual_tracks, track_fusion_map)
 
         # Mark this as an ego-graph
         ego_graph_data._is_ego_graph = True
         ego_graph_data._ego_robot_id = ego_robot.id
-        ego_graph_data._proximal_robots = proximal_robots
+
+        # Use filtered robot list (after isolated agent removal) for _proximal_robots
+        # This is CRITICAL - ensures labels match the filtered graph structure
+        if hasattr(ego_graph_data, '_filtered_robots'):
+            ego_graph_data._proximal_robots = ego_graph_data._filtered_robots
+            delattr(ego_graph_data, '_filtered_robots')  # Clean up temporary attribute
+        else:
+            # Fallback if no removal occurred
+            ego_graph_data._proximal_robots = proximal_robots
 
         return ego_graph_data
 
@@ -1075,6 +1084,192 @@ class EgoGraphBuilder:
         # Store fused_tracks and individual_tracks for sanity checking
         graph_data._fused_tracks = fused_tracks
         graph_data._individual_tracks = individual_tracks
+
+        # Remove isolated agents (agents with no agent-to-agent edges)
+        graph_data = self._remove_isolated_agents(graph_data, robots, all_tracks)
+
+        return graph_data
+
+    def _remove_isolated_agents(self, graph_data, robots, all_tracks):
+        """
+        Remove isolated agents (those with no agent-to-agent edges) from the graph.
+        This improves computational efficiency and focuses on robots that provide cross-validation signal.
+
+        Args:
+            graph_data: HeteroData graph
+            robots: List of robots
+            all_tracks: List of all tracks
+
+        Returns:
+            Updated HeteroData graph with isolated agents removed
+        """
+        import torch
+
+        num_agents = len(robots)
+
+        # Identify agents with agent-to-agent edges
+        agents_with_edges = set()
+
+        # Check co_detection edges
+        co_detection_edges = graph_data.edge_index_dict.get(('agent', 'co_detection', 'agent'), None)
+        if co_detection_edges is not None and co_detection_edges.numel() > 0:
+            agents_with_edges.update(co_detection_edges[0].tolist())
+            agents_with_edges.update(co_detection_edges[1].tolist())
+
+        # Check contradicts edges
+        contradicts_edges = graph_data.edge_index_dict.get(('agent', 'contradicts', 'agent'), None)
+        if contradicts_edges is not None and contradicts_edges.numel() > 0:
+            agents_with_edges.update(contradicts_edges[0].tolist())
+            agents_with_edges.update(contradicts_edges[1].tolist())
+
+        # Identify isolated agents (excluding ego robot at index 0)
+        isolated_agents = []
+        for agent_idx in range(num_agents):
+            if agent_idx != 0 and agent_idx not in agents_with_edges:
+                isolated_agents.append(agent_idx)
+
+        # If no isolated agents, return unchanged
+        if not isolated_agents:
+            return graph_data
+
+        # Create mapping from old indices to new indices
+        kept_agents = [i for i in range(num_agents) if i not in isolated_agents]
+        old_to_new_agent = {old_idx: new_idx for new_idx, old_idx in enumerate(kept_agents)}
+
+        # Identify tracks that should be removed (only connected to isolated agents)
+        tracks_to_remove = set()
+
+        # Check which tracks are only connected to isolated agents
+        for track_idx in range(len(all_tracks)):
+            connected_agents = set()
+
+            # Check in_fov_and_observed edges (agent->track)
+            edges = graph_data.edge_index_dict.get(('agent', 'in_fov_and_observed', 'track'), None)
+            if edges is not None and edges.numel() > 0:
+                mask = edges[1] == track_idx
+                connected_agents.update(edges[0][mask].tolist())
+
+            # Check in_fov_only edges (agent->track)
+            edges = graph_data.edge_index_dict.get(('agent', 'in_fov_only', 'track'), None)
+            if edges is not None and edges.numel() > 0:
+                mask = edges[1] == track_idx
+                connected_agents.update(edges[0][mask].tolist())
+
+            # If track is only connected to isolated agents, remove it
+            if connected_agents and all(agent_idx in isolated_agents for agent_idx in connected_agents):
+                tracks_to_remove.add(track_idx)
+
+        # Create mapping from old track indices to new track indices
+        kept_tracks = [i for i in range(len(all_tracks)) if i not in tracks_to_remove]
+        old_to_new_track = {old_idx: new_idx for new_idx, old_idx in enumerate(kept_tracks)}
+
+        # Update agent features
+        if len(kept_agents) > 0:
+            graph_data['agent'].x = graph_data['agent'].x[kept_agents]
+        else:
+            graph_data['agent'].x = torch.empty(0, graph_data['agent'].x.shape[1])
+
+        # Update track features
+        if len(kept_tracks) > 0:
+            graph_data['track'].x = graph_data['track'].x[kept_tracks]
+        else:
+            graph_data['track'].x = torch.empty(0, graph_data['track'].x.shape[1])
+
+        # Update all edge indices
+        new_edge_index_dict = {}
+
+        for edge_type, edge_index in graph_data.edge_index_dict.items():
+            src_type, relation, dst_type = edge_type
+
+            if edge_index.numel() == 0:
+                new_edge_index_dict[edge_type] = edge_index
+                continue
+
+            # Filter and remap edges
+            src_indices = edge_index[0].tolist()
+            dst_indices = edge_index[1].tolist()
+
+            new_src = []
+            new_dst = []
+
+            for src_idx, dst_idx in zip(src_indices, dst_indices):
+                # Check if both src and dst are kept
+                if src_type == 'agent':
+                    if src_idx in old_to_new_agent:
+                        new_src_idx = old_to_new_agent[src_idx]
+                    else:
+                        continue  # Skip this edge
+                else:  # src_type == 'track'
+                    if src_idx in old_to_new_track:
+                        new_src_idx = old_to_new_track[src_idx]
+                    else:
+                        continue  # Skip this edge
+
+                if dst_type == 'agent':
+                    if dst_idx in old_to_new_agent:
+                        new_dst_idx = old_to_new_agent[dst_idx]
+                    else:
+                        continue  # Skip this edge
+                else:  # dst_type == 'track'
+                    if dst_idx in old_to_new_track:
+                        new_dst_idx = old_to_new_track[dst_idx]
+                    else:
+                        continue  # Skip this edge
+
+                new_src.append(new_src_idx)
+                new_dst.append(new_dst_idx)
+
+            # Create new edge tensor
+            if new_src:
+                new_edge_index_dict[edge_type] = torch.tensor([new_src, new_dst], dtype=torch.long)
+            else:
+                new_edge_index_dict[edge_type] = torch.empty((2, 0), dtype=torch.long)
+
+        graph_data.edge_index_dict = new_edge_index_dict
+
+        # Update x_dict
+        graph_data.x_dict = {
+            'agent': graph_data['agent'].x,
+            'track': graph_data['track'].x
+        }
+
+        # Update node mappings (if they exist)
+        if hasattr(graph_data, 'agent_nodes'):
+            new_agent_nodes = {}
+            for robot_id, old_idx in graph_data.agent_nodes.items():
+                if old_idx in old_to_new_agent:
+                    new_agent_nodes[robot_id] = old_to_new_agent[old_idx]
+            graph_data.agent_nodes = new_agent_nodes
+
+        if hasattr(graph_data, 'track_nodes'):
+            new_track_nodes = {}
+            for track_id, old_idx in graph_data.track_nodes.items():
+                if old_idx in old_to_new_track:
+                    new_track_nodes[track_id] = old_to_new_track[old_idx]
+            graph_data.track_nodes = new_track_nodes
+
+        # Update stored robot and track lists to match filtered graph
+        # This is CRITICAL for label generation and batch processing
+        # Store filtered robot list - will be used to set _proximal_robots
+        graph_data._filtered_robots = [robots[i] for i in kept_agents]
+
+        # Update fused and individual track lists (these were set earlier in _build_multi_robot_graph)
+        if hasattr(graph_data, '_fused_tracks') and hasattr(graph_data, '_individual_tracks'):
+            all_tracks_list = graph_data._fused_tracks + graph_data._individual_tracks
+            filtered_all_tracks = [all_tracks_list[i] for i in kept_tracks]
+
+            # Reconstruct fused and individual track lists
+            # Check which filtered tracks are fused vs individual
+            new_fused_tracks = []
+            new_individual_tracks = []
+            for track in filtered_all_tracks:
+                if track in graph_data._fused_tracks:
+                    new_fused_tracks.append(track)
+                elif track in graph_data._individual_tracks:
+                    new_individual_tracks.append(track)
+
+            graph_data._fused_tracks = new_fused_tracks
+            graph_data._individual_tracks = new_individual_tracks
 
         return graph_data
 

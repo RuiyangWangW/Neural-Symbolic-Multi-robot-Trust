@@ -518,6 +518,9 @@ class TrustMethodComparison:
             def safe_corr(a, b):
                 if len(a) < 2:
                     return 0.0
+                # Check for zero standard deviation (constant values)
+                if np.std(a) == 0 or np.std(b) == 0:
+                    return 0.0
                 try:
                     corr = np.corrcoef(a, b)[0, 1]
                     if np.isnan(corr):

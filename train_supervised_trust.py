@@ -196,6 +196,8 @@ class SupervisedTrustTrainer:
                  device: str = 'cpu',
                  learning_rate: float = 1e-3,
                  weight_decay: float = 1e-4,
+                 agent_loss_weight: float = 1.0,
+                 track_loss_weight: float = 1.0,
                 ):
         """
         Initialize trainer
@@ -205,10 +207,17 @@ class SupervisedTrustTrainer:
             device: Device to train on
             learning_rate: Learning rate for optimizer
             weight_decay: Weight decay for regularization
+            agent_loss_weight: Weight for agent loss (default: 1.0)
+            track_loss_weight: Weight for track loss (default: 1.0)
         """
         self.model = model
         self.device = torch.device(device)
         self.model.to(self.device)
+
+        # Loss weights for balancing agent and track objectives
+        self.agent_loss_weight = agent_loss_weight
+        self.track_loss_weight = track_loss_weight
+
         # Optimizer and loss function
         self.optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -223,6 +232,12 @@ class SupervisedTrustTrainer:
         self.val_losses = []
         self.train_metrics = []
         self.val_metrics = []
+
+        # Separate loss tracking
+        self.train_agent_losses = []
+        self.train_track_losses = []
+        self.val_agent_losses = []
+        self.val_track_losses = []
 
         # MPS-specific optimizations
         if device == 'mps':
@@ -307,7 +322,7 @@ class SupervisedTrustTrainer:
             return num_agents, num_tracks, edge_index_dict, agent_labels, track_labels, ego_has_cross_validation, meaningful_track_indices
 
     def _compute_loss(self, predictions: Dict, agent_labels: torch.Tensor, track_labels: torch.Tensor,
-                     ego_has_cross_validation: bool, meaningful_track_indices: List[int]) -> torch.Tensor:
+                     ego_has_cross_validation: bool, meaningful_track_indices: List[int]) -> Tuple[torch.Tensor, Dict]:
         """
         Compute loss for predictions with cross-validation constraints
 
@@ -318,20 +333,29 @@ class SupervisedTrustTrainer:
             ego_has_cross_validation: Whether ego robot has cross-validation
             meaningful_track_indices: Indices of tracks that are meaningful for loss computation
 
+        Returns:
+            Tuple of (total_loss, loss_components_dict)
+
         Note: We only compute loss for:
         - Ego robot (index 0) if ego_has_cross_validation is True
         - Tracks in meaningful_track_indices (ego-detected with edges to >=2 robots)
         """
         loss = 0.0
-        loss_components = 0
+        agent_loss_value = 0.0
+        track_loss_value = 0.0
+        agent_loss_count = 0
+        track_loss_count = 0
 
         # Agent loss (ego robot only - index 0, only if has cross-validation)
         if ego_has_cross_validation and 'agent' in predictions and agent_labels.shape[0] > 0:
             # predictions['agent'] is a tensor [num_agents, 1]
             agent_preds = predictions['agent']
             agent_loss = self.criterion(agent_preds[0:1], agent_labels[0:1])
-            loss += agent_loss
-            loss_components += 1
+            # Apply weight to agent loss
+            weighted_agent_loss = self.agent_loss_weight * agent_loss
+            loss += weighted_agent_loss
+            agent_loss_value = agent_loss.item()
+            agent_loss_count = 1
 
         # Track loss (only for meaningful tracks)
         if 'track' in predictions and len(meaningful_track_indices) > 0:
@@ -351,10 +375,20 @@ class SupervisedTrustTrainer:
                     # Select predictions for meaningful tracks
                     selected_track_preds = track_preds[meaningful_indices_tensor]
                     track_loss = self.criterion(selected_track_preds, selected_track_labels)
-                    loss += track_loss
-                    loss_components += 1
+                    # Apply weight to track loss
+                    weighted_track_loss = self.track_loss_weight * track_loss
+                    loss += weighted_track_loss
+                    track_loss_value = track_loss.item()
+                    track_loss_count = len(meaningful_track_indices)
 
-        return None
+        loss_components = {
+            'agent_loss': agent_loss_value,
+            'track_loss': track_loss_value,
+            'agent_count': agent_loss_count,
+            'track_count': track_loss_count,
+        }
+
+        return loss, loss_components
 
     def _compute_metrics(self, predictions: Dict, labels: Dict) -> Dict:
         """
@@ -525,18 +559,16 @@ class SupervisedTrustTrainer:
 
         # Skip if ego robot is isolated (predictions will be None)
         if predictions is None:
-            return 0.0, {}
+            return 0.0, {}, {}
 
         # Compute loss with cross-validation constraints
-        loss = self._compute_loss(predictions, agent_labels, track_labels, ego_has_cross_validation, meaningful_track_indices)
-        if loss is None:
-            return 0.0, {}
+        loss, loss_components = self._compute_loss(predictions, agent_labels, track_labels, ego_has_cross_validation, meaningful_track_indices)
 
         # Compute metrics
         labels_dict = {'agent': agent_labels, 'track': track_labels}
         metrics = self._compute_metrics(predictions, labels_dict)
 
-        return loss, metrics
+        return loss, metrics, loss_components
 
 
 
@@ -602,7 +634,7 @@ class SupervisedTrustTrainer:
         )
 
         # Compute loss with cross-validation filtering
-        loss = self._compute_batched_loss(
+        loss, loss_components = self._compute_batched_loss(
             predictions,
             agent_labels,
             track_labels,
@@ -625,12 +657,12 @@ class SupervisedTrustTrainer:
             all_meaningful_indices
         )
 
-        return loss, metrics
+        return loss, metrics, loss_components
 
     def _compute_batched_loss(self, predictions: Dict, agent_labels: torch.Tensor,
                               track_labels: torch.Tensor, ego_robot_indices: List[int],
                               ego_cross_validation_flags: List[bool],
-                              meaningful_track_indices_per_graph: List[List[int]]) -> torch.Tensor:
+                              meaningful_track_indices_per_graph: List[List[int]]) -> Tuple[torch.Tensor, Dict]:
         """
         Compute loss for batched predictions with cross-validation constraints.
 
@@ -646,17 +678,20 @@ class SupervisedTrustTrainer:
             meaningful_track_indices_per_graph: List of lists, per-graph meaningful track indices
 
         Returns:
-            Total loss across all graphs (sum, not mean)
+            Tuple of (total_loss, loss_components_dict) where total_loss is sum across all graphs
         """
         import torch
 
         total_loss = 0.0
+        total_agent_loss = 0.0
+        total_track_loss = 0.0
+        total_agent_count = 0
+        total_track_count = 0
         num_samples = len(ego_robot_indices)
 
         # Process each graph individually to match individual processing behavior
         for graph_idx in range(num_samples):
             graph_loss = 0.0
-            loss_components = 0
 
             # Agent loss: Only ego robot if it has cross-validation
             if ego_cross_validation_flags[graph_idx] and 'agent' in predictions:
@@ -664,8 +699,11 @@ class SupervisedTrustTrainer:
                 ego_pred = predictions['agent'][ego_idx:ego_idx+1]
                 ego_label = agent_labels[ego_idx:ego_idx+1]
                 agent_loss = self.criterion(ego_pred, ego_label)
-                graph_loss += agent_loss
-                loss_components += 1
+                # Apply weight to agent loss
+                weighted_agent_loss = self.agent_loss_weight * agent_loss
+                graph_loss += weighted_agent_loss
+                total_agent_loss += agent_loss.item()
+                total_agent_count += 1
 
             # Track loss: Only meaningful tracks for this graph
             graph_meaningful_indices = meaningful_track_indices_per_graph[graph_idx]
@@ -675,14 +713,22 @@ class SupervisedTrustTrainer:
                 meaningful_preds = track_preds[indices_tensor]
                 meaningful_labels = track_labels[indices_tensor]
                 track_loss = self.criterion(meaningful_preds, meaningful_labels)
-                graph_loss += track_loss
-                loss_components += 1
+                # Apply weight to track loss
+                weighted_track_loss = self.track_loss_weight * track_loss
+                graph_loss += weighted_track_loss
+                total_track_loss += track_loss.item()
+                total_track_count += len(graph_meaningful_indices)
 
-            # Scale this graph's loss
-            if loss_components > 0:
-                total_loss += graph_loss
+            total_loss += graph_loss
 
-        return total_loss
+        loss_components = {
+            'agent_loss': total_agent_loss,
+            'track_loss': total_track_loss,
+            'agent_count': total_agent_count,
+            'track_count': total_track_count,
+        }
+
+        return total_loss, loss_components
 
     def _compute_batched_metrics(self, predictions: Dict, agent_labels: torch.Tensor,
                                   track_labels: torch.Tensor, ego_robot_indices: List[int],
@@ -763,6 +809,12 @@ class SupervisedTrustTrainer:
         num_samples = 0
         all_metrics = []
 
+        # Track separate losses
+        total_agent_loss = 0.0
+        total_track_loss = 0.0
+        total_agent_count = 0
+        total_track_count = 0
+
         for batch_data in dataloader:
             try:
                 # Zero gradients
@@ -770,7 +822,7 @@ class SupervisedTrustTrainer:
 
                 if batch_data.get('use_pyg_batch', False):
                     # Process as a PyG batch
-                    loss, metrics = self._process_pyg_batch(batch_data)
+                    loss, metrics, loss_components = self._process_pyg_batch(batch_data)
                     current_batch_size = batch_data['batch_size']
 
                     if loss > 0:
@@ -781,6 +833,12 @@ class SupervisedTrustTrainer:
 
                         total_loss += loss.item()
                         num_samples += current_batch_size
+
+                        # Track separate losses
+                        total_agent_loss += loss_components.get('agent_loss', 0.0)
+                        total_track_loss += loss_components.get('track_loss', 0.0)
+                        total_agent_count += loss_components.get('agent_count', 0)
+                        total_track_count += loss_components.get('track_count', 0)
 
                         if metrics:
                             all_metrics.append(metrics)
@@ -794,7 +852,7 @@ class SupervisedTrustTrainer:
                     for sample in samples:
                         try:
                             # Process single sample
-                            loss, metrics = self._process_sample(sample)
+                            loss, metrics, loss_components = self._process_sample(sample)
 
                             if loss > 0:
                                 # Accumulate gradients (don't step yet!)
@@ -802,6 +860,12 @@ class SupervisedTrustTrainer:
 
                                 batch_loss += loss.item()
                                 batch_samples += 1
+
+                                # Track separate losses
+                                total_agent_loss += loss_components.get('agent_loss', 0.0)
+                                total_track_loss += loss_components.get('track_loss', 0.0)
+                                total_agent_count += loss_components.get('agent_count', 0)
+                                total_track_count += loss_components.get('track_count', 0)
 
                                 if metrics:
                                     all_metrics.append(metrics)
@@ -824,12 +888,22 @@ class SupervisedTrustTrainer:
 
         avg_loss = total_loss / max(num_samples, 1)
 
+        # Compute average separate losses
+        avg_agent_loss = total_agent_loss / max(total_agent_count, 1)
+        avg_track_loss = total_track_loss / max(total_track_count, 1)
+
         # Average metrics
         avg_metrics = {}
         if all_metrics:
             for key in all_metrics[0].keys():
                 values = [m[key] for m in all_metrics if key in m]
                 avg_metrics[key] = np.mean(values) if values else 0.0
+
+        # Add separate loss tracking to metrics
+        avg_metrics['agent_loss'] = avg_agent_loss
+        avg_metrics['track_loss'] = avg_track_loss
+        avg_metrics['agent_samples'] = total_agent_count
+        avg_metrics['track_samples'] = total_track_count
 
         return avg_loss, avg_metrics
 
@@ -848,17 +922,29 @@ class SupervisedTrustTrainer:
         num_samples = 0
         all_metrics = []
 
+        # Track separate losses
+        total_agent_loss = 0.0
+        total_track_loss = 0.0
+        total_agent_count = 0
+        total_track_count = 0
+
         with torch.no_grad():
             for batch_data in dataloader:
                 try:
                     if batch_data.get('use_pyg_batch', False):
                         # Process as a PyG batch
-                        loss, metrics = self._process_pyg_batch(batch_data)
+                        loss, metrics, loss_components = self._process_pyg_batch(batch_data)
                         current_batch_size = batch_data['batch_size']
 
                         if loss > 0:
                             total_loss += loss.item()
                             num_samples += current_batch_size
+
+                            # Track separate losses
+                            total_agent_loss += loss_components.get('agent_loss', 0.0)
+                            total_track_loss += loss_components.get('track_loss', 0.0)
+                            total_agent_count += loss_components.get('agent_count', 0)
+                            total_track_count += loss_components.get('track_count', 0)
 
                             if metrics:
                                 all_metrics.append(metrics)
@@ -870,11 +956,17 @@ class SupervisedTrustTrainer:
                         for sample in samples:
                             try:
                                 # Process single sample
-                                loss, metrics = self._process_sample(sample)
+                                loss, metrics, loss_components = self._process_sample(sample)
 
                                 if loss > 0:
                                     total_loss += loss.item()
                                     num_samples += 1
+
+                                    # Track separate losses
+                                    total_agent_loss += loss_components.get('agent_loss', 0.0)
+                                    total_track_loss += loss_components.get('track_loss', 0.0)
+                                    total_agent_count += loss_components.get('agent_count', 0)
+                                    total_track_count += loss_components.get('track_count', 0)
 
                                     if metrics:
                                         all_metrics.append(metrics)
@@ -894,12 +986,22 @@ class SupervisedTrustTrainer:
 
         avg_loss = total_loss / max(num_samples, 1)
 
+        # Compute average separate losses
+        avg_agent_loss = total_agent_loss / max(total_agent_count, 1)
+        avg_track_loss = total_track_loss / max(total_track_count, 1)
+
         # Average metrics
         avg_metrics = {}
         if all_metrics:
             for key in all_metrics[0].keys():
                 values = [m[key] for m in all_metrics if key in m]
                 avg_metrics[key] = np.mean(values) if values else 0.0
+
+        # Add separate loss tracking to metrics
+        avg_metrics['agent_loss'] = avg_agent_loss
+        avg_metrics['track_loss'] = avg_track_loss
+        avg_metrics['agent_samples'] = total_agent_count
+        avg_metrics['track_samples'] = total_track_count
 
         return avg_loss, avg_metrics
 
@@ -945,6 +1047,17 @@ class SupervisedTrustTrainer:
 
             # Progress logging - print every epoch
             print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+            # Print separate losses for monitoring
+            train_agent_loss = train_metrics.get('agent_loss', 0.0)
+            train_track_loss = train_metrics.get('track_loss', 0.0)
+            val_agent_loss = val_metrics.get('agent_loss', 0.0)
+            val_track_loss = val_metrics.get('track_loss', 0.0)
+            agent_samples = train_metrics.get('agent_samples', 0)
+            track_samples = train_metrics.get('track_samples', 0)
+
+            print(f"             | Agent Loss: {train_agent_loss:.4f} (n={agent_samples}) | Track Loss: {train_track_loss:.4f} (n={track_samples})")
+            print(f"             | Val Agent: {val_agent_loss:.4f} | Val Track: {val_track_loss:.4f}")
 
             # Print detailed metrics every 10 epochs or on last epoch
             if epoch % 10 == 0 or epoch == epochs - 1:
@@ -1127,6 +1240,10 @@ def main():
                        help='Output model path')
     parser.add_argument('--no-pyg-batch', action='store_true',
                        help='Disable PyTorch Geometric batching (use individual processing instead)')
+    parser.add_argument('--agent-loss-weight', type=float, default=10.0,
+                       help='Weight for agent loss (default: 10.0 to balance with multiple tracks)')
+    parser.add_argument('--track-loss-weight', type=float, default=1.0,
+                       help='Weight for track loss (default: 1.0)')
 
     args = parser.parse_args()
 
@@ -1203,8 +1320,15 @@ def main():
     print(f"👷 DataLoader workers: {num_workers}")
     print(f"📌 Pin memory: {pin_memory}")
 
-    # Create trainer
-    trainer = SupervisedTrustTrainer(model, device=device, learning_rate=args.lr)
+    # Create trainer with loss weighting
+    print(f"⚖️  Loss weights: Agent={args.agent_loss_weight}, Track={args.track_loss_weight}")
+    trainer = SupervisedTrustTrainer(
+        model,
+        device=device,
+        learning_rate=args.lr,
+        agent_loss_weight=args.agent_loss_weight,
+        track_loss_weight=args.track_loss_weight
+    )
 
     # Train model
     history = trainer.train(train_loader, val_loader, epochs=args.epochs, save_path=args.output, patience=args.patience)
