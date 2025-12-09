@@ -56,9 +56,12 @@ class TripletEncoder(nn.Module):
         # Triplet embedding: 8-dim symbolic representation → hidden_dim
         self.triplet_embedding = nn.Linear(8, hidden_dim)
 
-        # Learnable positional encoding for edge ordering
-        # Max 100 edges per node should be sufficient for most cases
-        self.pos_encoding = nn.Parameter(torch.randn(1, 100, hidden_dim) * 0.02)
+        # NOTE: No positional encoding needed!
+        # Edges form an unordered set, not a sequence.
+        # Transformer self-attention is naturally permutation-equivariant,
+        # and SUM pooling makes the output permutation-invariant.
+        # Adding positional encoding would break this property and introduce
+        # spurious correlations based on arbitrary edge ordering.
 
         # Transformer encoder layers
         encoder_layer = nn.TransformerEncoderLayer(
@@ -87,21 +90,12 @@ class TripletEncoder(nn.Module):
         Returns:
             [num_nodes, hidden_dim] - node embeddings
         """
-        batch_size, seq_len, _ = triplets.shape
-
         # Embed triplets
         x = self.triplet_embedding(triplets)  # [num_nodes, max_edges, hidden_dim]
 
-        # Add positional encoding (truncate or pad as needed)
-        if seq_len <= self.pos_encoding.size(1):
-            x = x + self.pos_encoding[:, :seq_len, :]
-        else:
-            # For sequences longer than 100, repeat the last position
-            pos_enc = torch.cat([
-                self.pos_encoding,
-                self.pos_encoding[:, -1:, :].repeat(1, seq_len - 100, 1)
-            ], dim=1)
-            x = x + pos_enc
+        # No positional encoding: edges form an unordered set, order doesn't matter
+        # The transformer self-attention is permutation-equivariant, and SUM pooling
+        # makes the final output permutation-invariant.
 
         # Apply transformer
         # mask: True for positions to ignore
