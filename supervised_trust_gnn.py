@@ -107,17 +107,15 @@ class TripletEncoder(nn.Module):
         # mask: True for positions to ignore
         x = self.transformer(x, src_key_padding_mask=mask)
 
-        # Pool over sequence: mean of non-padded positions
+        # Pool over sequence: SUM of non-padded positions (preserves edge count information)
         if mask is not None:
             # Mask out padded positions
             x_masked = x.masked_fill(mask.unsqueeze(-1), 0.0)
-            # Count non-padded positions
-            counts = (~mask).sum(dim=1, keepdim=True).clamp(min=1).float()
-            # Mean over non-padded
-            pooled = x_masked.sum(dim=1) / counts
+            # Sum over non-padded positions (count-aware: more edges = larger sum)
+            pooled = x_masked.sum(dim=1)
         else:
-            # No padding, simple mean
-            pooled = x.mean(dim=1)
+            # No padding, simple sum
+            pooled = x.sum(dim=1)
 
         # Final projection
         output = self.output_proj(pooled)  # [num_nodes, hidden_dim]
