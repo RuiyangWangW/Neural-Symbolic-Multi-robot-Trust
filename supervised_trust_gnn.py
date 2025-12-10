@@ -76,6 +76,10 @@ class TripletEncoder(nn.Module):
         # Disable nested tensor optimization to avoid deprecated API warnings
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
 
+        # LayerNorm after SUM pooling to normalize varying embedding magnitudes
+        # (nodes with different edge counts have different sum magnitudes)
+        self.pool_norm = nn.LayerNorm(hidden_dim)
+
         # Output projection
         self.output_proj = nn.Linear(hidden_dim, hidden_dim)
 
@@ -110,6 +114,10 @@ class TripletEncoder(nn.Module):
         else:
             # No padding, simple sum
             pooled = x.sum(dim=1)
+
+        # Normalize after SUM pooling to handle varying embedding magnitudes
+        # (nodes with more edges have larger sums; LayerNorm equalizes the scale)
+        pooled = self.pool_norm(pooled)
 
         # Final projection
         output = self.output_proj(pooled)  # [num_nodes, hidden_dim]
