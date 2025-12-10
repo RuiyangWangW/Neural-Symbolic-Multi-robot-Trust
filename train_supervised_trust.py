@@ -826,9 +826,11 @@ class SupervisedTrustTrainer:
                     current_batch_size = batch_data['batch_size']
 
                     if loss > 0:
-                        # Backward pass
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        # Normalize loss by batch size before backward to prevent exploding gradients
+                        # (batched loss is sum of per-sample losses, so gradients scale with batch size)
+                        normalized_loss = loss / current_batch_size
+                        normalized_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                         self.optimizer.step()
 
                         total_loss += loss.item()
@@ -876,7 +878,7 @@ class SupervisedTrustTrainer:
 
                     # Update weights once per batch (after accumulating all gradients)
                     if batch_samples > 0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                         self.optimizer.step()
 
                         total_loss += batch_loss
