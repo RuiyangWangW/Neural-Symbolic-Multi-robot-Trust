@@ -33,7 +33,7 @@ parameters:
 
   # Device (fixed per sweep, not tuned)
   device:
-    value: auto  # Change to 'cuda', 'cuda:0', 'cuda:1', etc. for specific GPU
+    value: 'cuda:2'  # Change to 'cuda', 'cuda:0', 'cuda:1', etc. for specific GPU
 
 # Early termination
 early_terminate:
