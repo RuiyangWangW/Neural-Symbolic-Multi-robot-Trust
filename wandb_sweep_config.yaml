@@ -6,27 +6,27 @@ metric:
 
 parameters:
   # Loss weights (most important!)
-  agent_loss_weight:
+  agent-loss-weight:
     min: 2.0
     max: 5.0
 
-  track_loss_weight:
+  track-loss-weight:
     value: 1.0  # Keep fixed
 
   # Learning rate
-  learning_rate:
+  learning-rate:
     min: 0.0001
     max: 0.01
     distribution: log_uniform_values
 
   # Other hyperparameters
-  batch_size:
+  batch-size:
     values: [128, 256, 512]
 
-  hidden_dim:
+  hidden-dim:
     values: [128, 256]
 
-  weight_decay:
+  weight-decay:
     min: 0.00001
     max: 0.001
     distribution: log_uniform_values
