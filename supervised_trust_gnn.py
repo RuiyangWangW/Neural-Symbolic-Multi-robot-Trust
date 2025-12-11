@@ -997,20 +997,25 @@ class EgoGraphBuilder:
                     object_detectors[obj_id].append(idx)
 
         # Create bidirectional edges between robots that co-detected the same object
+        # DEDUPLICATED: Only one edge per pair, regardless of how many objects they co-detected
+        codetection_pairs = set()  # Track (src, dst) pairs to avoid duplicates
         for obj_id, detector_indices in object_detectors.items():
             if len(detector_indices) >= 2:  # At least 2 robots detected this object
                 # Create edges between all pairs of co-detectors
                 for i in range(len(detector_indices)):
                     for j in range(len(detector_indices)):
                         if i != j:
-                            agent_codetection_edges.append([detector_indices[i], detector_indices[j]])
+                            pair = (detector_indices[i], detector_indices[j])
+                            if pair not in codetection_pairs:
+                                agent_codetection_edges.append([detector_indices[i], detector_indices[j]])
+                                codetection_pairs.add(pair)
 
         # Create agent-to-agent contradiction edges
         # Robot A contradicts Robot B if A detects a track that B should see (in B's FoV) but doesn't
-        # Allow multiple contradictions per robot pair (one per track)
+        # DEDUPLICATED: Only one edge per pair, regardless of how many tracks they contradict on
         # Make each contradiction bidirectional for symmetric inconsistency signaling
         agent_contradiction_edges = []
-        processed_contradictions = set()  # Track (robot_a, robot_b, object_id) to avoid duplicates
+        contradiction_pairs = set()  # Track (robot_a, robot_b) pairs to avoid duplicates
 
         for robot_a_idx, robot_a in enumerate(robots):
             # Get tracks that robot A detects
@@ -1020,10 +1025,15 @@ class EgoGraphBuilder:
                 if robot_a_idx == robot_b_idx:
                     continue  # Skip self
 
+                # Skip if we've already added edges for this pair
+                if (robot_a_idx, robot_b_idx) in contradiction_pairs:
+                    continue
+
                 # Get tracks that robot B detects
                 tracks_detected_by_b = robot_b.get_current_timestep_tracks()
 
                 # Check if A detects any track that B should see but doesn't
+                found_contradiction = False
                 for track_a in tracks_detected_by_a:
                     # Check if this track is in B's FoV
                     if self._track_in_robot_fov(robot_b, track_a):
@@ -1039,19 +1049,17 @@ class EgoGraphBuilder:
                                 b_detects_object = True
                                 break
 
-                        # If B doesn't detect the object, A contradicts B on this specific track
+                        # If B doesn't detect the object, A contradicts B
                         if not b_detects_object and track_a_obj_id:
-                            # Check if we've already processed this contradiction
-                            contradiction_key = (robot_a_idx, robot_b_idx, track_a_obj_id)
-                            if contradiction_key not in processed_contradictions:
-                                # Add bidirectional edges for this specific contradiction
-                                agent_contradiction_edges.append([robot_a_idx, robot_b_idx])
-                                agent_contradiction_edges.append([robot_b_idx, robot_a_idx])
-                                # Mark this contradiction as processed
-                                processed_contradictions.add(contradiction_key)
-                                # Also mark the reverse to avoid re-adding when we loop to robot B
-                                processed_contradictions.add((robot_b_idx, robot_a_idx, track_a_obj_id))
-                            # Continue checking other tracks (allow multiple contradictions)
+                            found_contradiction = True
+                            break  # Found one contradiction, that's enough for this pair
+
+                # If contradiction found, add bidirectional edges (only once per pair)
+                if found_contradiction:
+                    agent_contradiction_edges.append([robot_a_idx, robot_b_idx])
+                    agent_contradiction_edges.append([robot_b_idx, robot_a_idx])
+                    contradiction_pairs.add((robot_a_idx, robot_b_idx))
+                    contradiction_pairs.add((robot_b_idx, robot_a_idx))
 
         # Convert to tensors and create proper edge structure
         edge_types = [
