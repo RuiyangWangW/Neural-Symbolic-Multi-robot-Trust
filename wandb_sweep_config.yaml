@@ -53,4 +53,4 @@ command:
   - "15"
   - --wandb-project
   - robot-trust-tuning
-  - ${args_no_hyphens}
+  - ${args}
