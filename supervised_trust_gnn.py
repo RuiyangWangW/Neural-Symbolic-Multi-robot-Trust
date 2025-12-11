@@ -76,9 +76,15 @@ class TripletEncoder(nn.Module):
         # Disable nested tensor optimization to avoid deprecated API warnings
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
 
-        # LayerNorm after SUM pooling to normalize varying embedding magnitudes
-        # (nodes with different edge counts have different sum magnitudes)
-        self.pool_norm = nn.LayerNorm(hidden_dim)
+        # Attention pooling: learn which edges are important
+        # This is permutation-invariant because softmax normalizes over the edge dimension
+        # (the attention weights sum to 1 regardless of edge order)
+        self.edge_attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1)
+        )
 
         # Output projection
         self.output_proj = nn.Linear(hidden_dim, hidden_dim)
@@ -98,26 +104,28 @@ class TripletEncoder(nn.Module):
         x = self.triplet_embedding(triplets)  # [num_nodes, max_edges, hidden_dim]
 
         # No positional encoding: edges form an unordered set, order doesn't matter
-        # The transformer self-attention is permutation-equivariant, and SUM pooling
+        # The transformer self-attention is permutation-equivariant, and attention pooling
         # makes the final output permutation-invariant.
 
         # Apply transformer
         # mask: True for positions to ignore
         x = self.transformer(x, src_key_padding_mask=mask)
 
-        # Pool over sequence: SUM of non-padded positions (preserves edge count information)
-        if mask is not None:
-            # Mask out padded positions
-            x_masked = x.masked_fill(mask.unsqueeze(-1), 0.0)
-            # Sum over non-padded positions (count-aware: more edges = larger sum)
-            pooled = x_masked.sum(dim=1)
-        else:
-            # No padding, simple sum
-            pooled = x.sum(dim=1)
+        # Attention pooling: learn to weight edges by importance
+        # Compute attention scores for each edge
+        attn_scores = self.edge_attention(x)  # [num_nodes, max_edges, 1]
 
-        # Normalize after SUM pooling to handle varying embedding magnitudes
-        # (nodes with more edges have larger sums; LayerNorm equalizes the scale)
-        pooled = self.pool_norm(pooled)
+        if mask is not None:
+            # Mask padded positions with -inf so they get 0 weight after softmax
+            attn_scores = attn_scores.masked_fill(mask.unsqueeze(-1), float('-inf'))
+
+        # Softmax over edges (dim=1) to get normalized attention weights
+        # This is permutation-invariant: weights sum to 1 regardless of edge order
+        attn_weights = torch.softmax(attn_scores, dim=1)  # [num_nodes, max_edges, 1]
+
+        # Weighted sum: aggregate edges weighted by their importance
+        # This removes the edge count bias - focuses on patterns, not quantity
+        pooled = (x * attn_weights).sum(dim=1)  # [num_nodes, hidden_dim]
 
         # Final projection
         output = self.output_proj(pooled)  # [num_nodes, hidden_dim]
