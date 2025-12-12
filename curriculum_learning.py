@@ -273,50 +273,39 @@ def sort_dataset_by_difficulty(dataset: List[SupervisedDataSample]) -> Tuple[Lis
     return sorted_dataset, difficulties
 
 
-def create_curriculum_schedule(num_samples: int, num_epochs: int, strategy: str = 'linear') -> List[int]:
+def create_curriculum_schedule(num_samples: int, num_epochs: int, strategy: str = 'performance') -> List[int]:
     """
-    Create curriculum schedule: how many samples to use at each epoch.
+    Create curriculum schedule placeholder for performance-based strategy.
+
+    For performance-based curriculum, the actual schedule is determined dynamically
+    during training based on achieving performance thresholds. This function creates
+    a simple step-based placeholder schedule (10% → 20% → 30% → ... → 100%).
 
     Args:
         num_samples: Total number of training samples
         num_epochs: Total number of training epochs
-        strategy: 'linear', 'root', 'exponential', or 'step'
+        strategy: Should be 'performance' (only supported strategy)
 
     Returns:
-        List of sample counts for each epoch
+        List of sample counts for each epoch (placeholder, not actively used)
     """
+    if strategy != 'performance':
+        raise ValueError(f"Only 'performance' strategy is supported, got: {strategy}")
+
     schedule = []
 
+    # Create step-based placeholder: 10%, 20%, 30%, ..., 100%
+    # This is not actively used - actual curriculum advancement is performance-based
     for epoch in range(num_epochs):
-        if strategy == 'linear':
-            # Linear growth: start with 10%, gradually add more
-            start_pct = 0.1
-            end_pct = 1.0
-            pct = start_pct + (end_pct - start_pct) * (epoch / max(num_epochs - 1, 1))
+        # Start at 10%, increase in 10% steps
+        # Spread the steps across epochs
+        step_size = 0.10
+        num_steps = int(1.0 / step_size)  # 10 steps total (10% to 100%)
+        epochs_per_step = max(1, num_epochs // num_steps)
 
-        elif strategy == 'root':
-            # Square root growth: faster early, slower later
-            pct = np.sqrt(epoch / max(num_epochs - 1, 1))
+        current_step = min(num_steps - 1, epoch // epochs_per_step)
+        pct = min(1.0, (current_step + 1) * step_size)
 
-        elif strategy == 'exponential':
-            # Exponential growth: slower early, faster later
-            pct = ((epoch / max(num_epochs - 1, 1)) ** 2)
-
-        elif strategy == 'step':
-            # Step function: 25% → 50% → 75% → 100%
-            if epoch < num_epochs // 4:
-                pct = 0.25
-            elif epoch < num_epochs // 2:
-                pct = 0.50
-            elif epoch < 3 * num_epochs // 4:
-                pct = 0.75
-            else:
-                pct = 1.0
-        else:
-            raise ValueError(f"Unknown strategy: {strategy}")
-
-        # Ensure minimum 10% and maximum 100%
-        pct = max(0.1, min(1.0, pct))
         num_samples_epoch = int(num_samples * pct)
         schedule.append(num_samples_epoch)
 
@@ -325,11 +314,15 @@ def create_curriculum_schedule(num_samples: int, num_epochs: int, strategy: str 
 
 class CurriculumDataLoader:
     """
-    DataLoader that implements curriculum learning by gradually introducing harder samples.
+    DataLoader for performance-based curriculum learning.
+
+    This class sorts the dataset by difficulty and provides access to the sorted dataset.
+    The actual curriculum advancement (deciding how much data to use) is handled by the
+    training loop based on achieving performance thresholds.
     """
 
     def __init__(self, dataset: List[SupervisedDataSample], batch_size: int,
-                 num_epochs: int, strategy: str = 'linear', shuffle_within_curriculum: bool = True):
+                 num_epochs: int, strategy: str = 'performance', shuffle_within_curriculum: bool = True):
         """
         Initialize curriculum dataloader.
 
@@ -337,7 +330,7 @@ class CurriculumDataLoader:
             dataset: Training dataset (will be sorted by difficulty internally)
             batch_size: Batch size
             num_epochs: Total number of training epochs
-            strategy: Curriculum strategy ('linear', 'root', 'exponential', 'step')
+            strategy: Curriculum strategy (only 'performance' is supported)
             shuffle_within_curriculum: Whether to shuffle samples within current difficulty level
         """
         self.batch_size = batch_size
@@ -346,18 +339,19 @@ class CurriculumDataLoader:
         self.shuffle_within_curriculum = shuffle_within_curriculum
 
         # Sort dataset by difficulty
-        print("Initializing curriculum learning...")
+        print("Initializing performance-based curriculum learning...")
         self.sorted_dataset, self.difficulties = sort_dataset_by_difficulty(dataset)
 
-        # Create curriculum schedule
+        # Create placeholder schedule (not actively used for performance-based)
         self.schedule = create_curriculum_schedule(
             len(self.sorted_dataset), num_epochs, strategy
         )
 
-        print(f"\n📚 Curriculum Learning Schedule ({strategy}):")
-        print(f"   Epoch 1: {self.schedule[0]} samples ({100*self.schedule[0]/len(self.sorted_dataset):.1f}%)")
-        print(f"   Epoch {num_epochs//2}: {self.schedule[num_epochs//2]} samples ({100*self.schedule[num_epochs//2]/len(self.sorted_dataset):.1f}%)")
-        print(f"   Epoch {num_epochs}: {self.schedule[-1]} samples ({100*self.schedule[-1]/len(self.sorted_dataset):.1f}%)")
+        print(f"\n📚 Performance-Based Curriculum:")
+        print(f"   Dataset sorted by difficulty: {len(self.sorted_dataset)} samples")
+        print(f"   Starting with: 10% of dataset")
+        print(f"   Advancement: Based on achieving performance thresholds")
+        print(f"   Step size: 10% increments")
         print()
 
     def get_epoch_data(self, epoch: int) -> List[SupervisedDataSample]:

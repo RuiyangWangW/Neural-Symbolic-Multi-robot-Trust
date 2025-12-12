@@ -41,7 +41,10 @@ def train_with_curriculum(trainer: SupervisedTrustTrainer,
                          log_print,
                          collate_fn,
                          num_workers: int = 0,
-                         pin_memory: bool = False) -> Dict:
+                         pin_memory: bool = False,
+                         min_batch_size: int = 32,
+                         performance_threshold: float = 0.90,
+                         curriculum_step_size: float = 0.10) -> Dict:
     """
     Train model with curriculum learning.
 
@@ -60,42 +63,79 @@ def train_with_curriculum(trainer: SupervisedTrustTrainer,
     Returns:
         Training history dictionary
     """
-    log_print(f"🚀 Starting curriculum learning training for {epochs} epochs...")
+    log_print(f"🚀 Starting performance-based curriculum learning for {epochs} epochs...")
     log_print(f"📊 Device: {trainer.device}")
-    log_print(f"⏰ Early stopping patience: {patience} epochs")
-    log_print(f"📚 Curriculum strategy: {curriculum_loader.strategy}")
+    log_print(f"⏰ Early stopping patience: {patience} epochs (after curriculum completes)")
     log_print("")
 
     best_val_loss = float('inf')
     patience_counter = 0
+    curriculum_complete_epoch = None  # Track when we first see full dataset
 
     # Track curriculum progress
     curriculum_stats = curriculum_loader.get_statistics()
+    total_samples = curriculum_stats['total_samples']
+
     log_print(f"📈 Curriculum Statistics:")
-    log_print(f"   Total samples: {curriculum_stats['total_samples']}")
+    log_print(f"   Total samples: {total_samples}")
     log_print(f"   Easiest difficulty: {curriculum_stats['easiest_difficulty']:.4f}")
     log_print(f"   Hardest difficulty: {curriculum_stats['hardest_difficulty']:.4f}")
+    log_print(f"")
+    log_print(f"📚 Curriculum Configuration:")
+    log_print(f"   Strategy: Performance-based (adaptive)")
+    log_print(f"   Performance threshold: {performance_threshold:.1%} training accuracy")
+    log_print(f"   Curriculum step size: {curriculum_step_size:.1%}")
+    log_print(f"   Starting with: 10% of dataset (easiest samples)")
+    log_print(f"")
+    log_print(f"⚙️  Training Configuration:")
+    log_print(f"   Adaptive batch sizing: {min_batch_size} → {curriculum_loader.batch_size}")
+    log_print(f"   Early stopping: DISABLED until 100% curriculum reached")
+    log_print(f"   Early stopping patience (after curriculum): {patience} epochs")
     log_print("")
 
+    # Performance-based curriculum state (always enabled)
+    current_curriculum_pct = 0.10  # Start with 10% of data
+
     for epoch in range(epochs):
-        # Get training data for this epoch based on curriculum
-        epoch_data = curriculum_loader.get_epoch_data(epoch)
-        num_epoch_samples = len(epoch_data)
+        # Performance-based curriculum: use current percentage of dataset
+        num_epoch_samples = min(int(total_samples * current_curriculum_pct), total_samples)
+        epoch_data = curriculum_loader.sorted_dataset[:num_epoch_samples]
+
+        # Shuffle within current difficulty level
+        import torch
+        indices = torch.randperm(len(epoch_data)).tolist()
+        epoch_data = [epoch_data[i] for i in indices]
+        pct_used = num_epoch_samples / total_samples
+
+        # Adaptive batch sizing: scale batch size with dataset size
+        max_batch_size = curriculum_loader.batch_size
+        current_batch_size = int(min_batch_size + (max_batch_size - min_batch_size) * pct_used)
+        current_batch_size = max(min_batch_size, min(max_batch_size, current_batch_size))
 
         # Create DataLoader for this epoch
         epoch_dataset = SupervisedTrustDataset(epoch_data)
         train_loader = DataLoader(
             epoch_dataset,
-            batch_size=curriculum_loader.batch_size,
+            batch_size=current_batch_size,
             shuffle=True,  # Shuffle within current difficulty level
             collate_fn=collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory
         )
 
+        # Track when curriculum is complete (first time we see 100% of data)
+        if pct_used >= 0.99 and curriculum_complete_epoch is None:
+            curriculum_complete_epoch = epoch
+            log_print(f"📚 Curriculum complete at epoch {epoch} - now training on full dataset")
+            log_print(f"✅ Early stopping NOW ENABLED (patience={patience})")
+            # Reset patience counter when curriculum completes
+            patience_counter = 0
+            best_val_loss = float('inf')
+            log_print("")
+
         # Log curriculum progress
-        pct_used = 100.0 * num_epoch_samples / curriculum_stats['total_samples']
-        log_print(f"📚 Epoch {epoch+1}/{epochs} - Using {num_epoch_samples} samples ({pct_used:.1f}% of dataset)")
+        num_batches = len(train_loader)
+        log_print(f"📚 Epoch {epoch}/{epochs} - Using {num_epoch_samples} samples ({100*pct_used:.1f}%) - Batch size: {current_batch_size} ({num_batches} batches)")
 
         # Training
         train_loss, train_metrics = trainer.train_epoch(train_loader)
@@ -138,7 +178,32 @@ def train_with_curriculum(trainer: SupervisedTrustTrainer,
 
             log_print("-" * 50)
 
-        # Save best model
+        # Performance-based curriculum advancement
+        if current_curriculum_pct < 1.0:
+            # Check if we've achieved the performance threshold on current training set
+            # Use BOTH agent and track training accuracy (NOT validation)
+            agent_train_acc = train_metrics.get('agent_accuracy', 0.0)
+            track_train_acc = train_metrics.get('track_accuracy', 0.0)
+
+            # Both must exceed threshold to advance
+            both_above_threshold = (agent_train_acc >= performance_threshold and
+                                   track_train_acc >= performance_threshold)
+
+            if both_above_threshold:
+                # Advance curriculum to next difficulty level
+                old_pct = current_curriculum_pct
+                current_curriculum_pct = min(1.0, current_curriculum_pct + curriculum_step_size)
+                log_print(f"")
+                log_print(f"🎯 Performance threshold achieved on TRAINING set!")
+                log_print(f"   Agent Train Acc: {agent_train_acc:.3f} ≥ {performance_threshold:.3f}")
+                log_print(f"   Track Train Acc: {track_train_acc:.3f} ≥ {performance_threshold:.3f}")
+                log_print(f"📈 Advancing curriculum: {old_pct:.1%} → {current_curriculum_pct:.1%} of dataset")
+                log_print(f"")
+
+        # Save best model and update patience
+        # Early stopping is ONLY enabled after curriculum reaches 100%
+        curriculum_is_complete = (curriculum_complete_epoch is not None)
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -152,16 +217,19 @@ def train_with_curriculum(trainer: SupervisedTrustTrainer,
                 'val_loss': val_loss,
                 'train_metrics': train_metrics,
                 'val_metrics': val_metrics,
-                'curriculum_stats': curriculum_stats
+                'curriculum_stats': curriculum_stats,
+                'curriculum_complete': curriculum_is_complete
             }, save_path)
 
             log_print(f"✅ Saved best model (val_loss: {best_val_loss:.4f}) to {save_path}")
-        else:
+        elif curriculum_is_complete:
+            # Only increment patience after curriculum is complete
             patience_counter += 1
 
-        # Early stopping
-        if patience_counter >= patience:
+        # Early stopping - only apply after reaching 100% curriculum
+        if curriculum_is_complete and patience_counter >= patience:
             log_print(f"⚠️ Early stopping triggered after {patience} epochs without improvement")
+            log_print(f"   (Curriculum was completed at epoch {curriculum_complete_epoch})")
             break
 
     log_print(f"🎉 Training completed! Best validation loss: {best_val_loss:.4f}")
@@ -179,8 +247,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train supervised trust model with curriculum learning')
     parser.add_argument('--data', type=str, default='supervised_trust_dataset.pkl',
                        help='Path to dataset file')
-    parser.add_argument('--epochs', type=int, default=100,
-                       help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=1000,
+                       help='Number of training epochs (default: 1000)')
     parser.add_argument('--batch-size', type=int, default=256,
                        help='Number of samples per DataLoader batch')
     parser.add_argument('--lr', type=float, default=1e-3,
@@ -189,8 +257,8 @@ def main():
                        help='Device to use (cpu/cuda/mps/auto)')
     parser.add_argument('--num-workers', type=int, default=0,
                        help='Number of DataLoader workers (default: 0)')
-    parser.add_argument('--patience', type=int, default=100,
-                       help='Early stopping patience - epochs without improvement')
+    parser.add_argument('--patience', type=int, default=10,
+                       help='Early stopping patience - epochs without improvement (default: 10)')
     parser.add_argument('--output', type=str, default='supervised_trust_model_curriculum.pth',
                        help='Output model path')
     parser.add_argument('--log', type=str, default=None,
@@ -203,11 +271,14 @@ def main():
                        help='Weight for track loss (default: 1.0)')
 
     # Curriculum learning parameters
-    parser.add_argument('--curriculum-strategy', type=str, default='linear',
-                       choices=['linear', 'root', 'exponential', 'step'],
-                       help='Curriculum learning strategy (default: linear)')
     parser.add_argument('--no-curriculum', action='store_true',
                        help='Disable curriculum learning (use standard training)')
+    parser.add_argument('--performance-threshold', type=float, default=0.90,
+                       help='Accuracy threshold to advance to next difficulty level (default: 0.90)')
+    parser.add_argument('--curriculum-step-size', type=float, default=0.10,
+                       help='Percentage increase when advancing curriculum (default: 0.10 = 10%%)')
+    parser.add_argument('--min-batch-size', type=int, default=32,
+                       help='Minimum batch size for early curriculum stages (default: 32)')
 
     args = parser.parse_args()
 
@@ -318,13 +389,13 @@ def main():
                                save_path=args.output, patience=args.patience,
                                log_print=log_print)
     else:
-        # Curriculum learning
-        log_print(f"📚 Initializing curriculum learning with strategy: {args.curriculum_strategy}")
+        # Curriculum learning (performance-based)
+        log_print(f"📚 Initializing performance-based curriculum learning...")
         curriculum_loader = CurriculumDataLoader(
             train_data,
             batch_size=args.batch_size,
             num_epochs=args.epochs,
-            strategy=args.curriculum_strategy,
+            strategy='performance',  # Always use performance-based
             shuffle_within_curriculum=True
         )
 
@@ -339,7 +410,10 @@ def main():
             log_print=log_print,
             collate_fn=collate_fn,
             num_workers=num_workers,
-            pin_memory=pin_memory
+            pin_memory=pin_memory,
+            min_batch_size=args.min_batch_size,
+            performance_threshold=args.performance_threshold,
+            curriculum_step_size=args.curriculum_step_size
         )
 
     # Plot results
