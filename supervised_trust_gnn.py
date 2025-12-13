@@ -203,7 +203,7 @@ class SupervisedTrustGNN(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.1),  # Standardized to 0.1
             nn.Linear(hidden_dim // 2, hidden_dim // 4),
             nn.ReLU(),
             nn.Dropout(0.1),
@@ -215,7 +215,7 @@ class SupervisedTrustGNN(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.1),  # Standardized to 0.1
             nn.Linear(hidden_dim // 2, hidden_dim // 4),
             nn.ReLU(),
             nn.Dropout(0.1),
@@ -241,7 +241,7 @@ class SupervisedTrustGNN(nn.Module):
                 heads=4,
                 concat=False,
                 add_self_loops=False,
-                dropout=0.3
+                dropout=0.1  # Standardized to 0.1
             )
         return conv_dict
 
