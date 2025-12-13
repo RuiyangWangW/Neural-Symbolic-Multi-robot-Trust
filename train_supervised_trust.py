@@ -143,18 +143,72 @@ def collate_batch_pyg(batch: List[Dict]) -> Dict:
     track_triplet_mask_batched = None
 
     if 'agent_triplets' in batch[0] and batch[0]['agent_triplets'] is not None:
-        # Concatenate agent triplets from all samples
+        # Agent triplets: need to re-pad to batch max_edges before concatenating
         agent_triplets_list = [sample['agent_triplets'] for sample in batch]
         agent_triplet_mask_list = [sample['agent_triplet_mask'] for sample in batch]
-        agent_triplets_batched = torch.cat(agent_triplets_list, dim=0)
-        agent_triplet_mask_batched = torch.cat(agent_triplet_mask_list, dim=0)
+
+        # Find max_edges across batch (dimension 1 of triplets)
+        max_edges_batch = max(t.shape[1] for t in agent_triplets_list)
+
+        # Re-pad all triplets to batch max_edges
+        padded_triplets = []
+        padded_masks = []
+        for triplets, mask in zip(agent_triplets_list, agent_triplet_mask_list):
+            num_nodes, curr_max_edges, triplet_dim = triplets.shape
+            if curr_max_edges < max_edges_batch:
+                # Pad triplets with zeros
+                pad_size = max_edges_batch - curr_max_edges
+                triplets_padded = torch.cat([
+                    triplets,
+                    torch.zeros(num_nodes, pad_size, triplet_dim, dtype=triplets.dtype)
+                ], dim=1)
+                # Pad mask with True (marking as padding)
+                mask_padded = torch.cat([
+                    mask,
+                    torch.ones(num_nodes, pad_size, dtype=torch.bool)
+                ], dim=1)
+            else:
+                triplets_padded = triplets
+                mask_padded = mask
+            padded_triplets.append(triplets_padded)
+            padded_masks.append(mask_padded)
+
+        agent_triplets_batched = torch.cat(padded_triplets, dim=0)
+        agent_triplet_mask_batched = torch.cat(padded_masks, dim=0)
 
     if 'track_triplets' in batch[0] and batch[0]['track_triplets'] is not None:
-        # Concatenate track triplets from all samples
+        # Track triplets: same re-padding logic
         track_triplets_list = [sample['track_triplets'] for sample in batch]
         track_triplet_mask_list = [sample['track_triplet_mask'] for sample in batch]
-        track_triplets_batched = torch.cat(track_triplets_list, dim=0)
-        track_triplet_mask_batched = torch.cat(track_triplet_mask_list, dim=0)
+
+        # Find max_edges across batch
+        max_edges_batch = max(t.shape[1] for t in track_triplets_list)
+
+        # Re-pad all triplets to batch max_edges
+        padded_triplets = []
+        padded_masks = []
+        for triplets, mask in zip(track_triplets_list, track_triplet_mask_list):
+            num_nodes, curr_max_edges, triplet_dim = triplets.shape
+            if curr_max_edges < max_edges_batch:
+                # Pad triplets with zeros
+                pad_size = max_edges_batch - curr_max_edges
+                triplets_padded = torch.cat([
+                    triplets,
+                    torch.zeros(num_nodes, pad_size, triplet_dim, dtype=triplets.dtype)
+                ], dim=1)
+                # Pad mask with True (marking as padding)
+                mask_padded = torch.cat([
+                    mask,
+                    torch.ones(num_nodes, pad_size, dtype=torch.bool)
+                ], dim=1)
+            else:
+                triplets_padded = triplets
+                mask_padded = mask
+            padded_triplets.append(triplets_padded)
+            padded_masks.append(mask_padded)
+
+        track_triplets_batched = torch.cat(padded_triplets, dim=0)
+        track_triplet_mask_batched = torch.cat(padded_masks, dim=0)
 
     return {
         'use_pyg_batch': True,
