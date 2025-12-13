@@ -297,6 +297,42 @@ class SupervisedDataGenerator:
         # Update ego graph builder with fixed proximal range
         self.ego_graph_builder = EgoGraphBuilder(proximal_range=params['proximal_range'])
 
+    def _check_adversarial_has_contradicts(self, ego_robot, ego_graph: HeteroData) -> bool:
+        """
+        Check if adversarial ego robot has at least one contradicts edge.
+
+        Adversarial robots with ZERO contradicts edges are nearly impossible to distinguish
+        from legitimate robots using only ego graph edges. We filter these out during
+        data generation.
+
+        Args:
+            ego_robot: The ego robot object
+            ego_graph: Ego graph with edge_index_dict
+
+        Returns:
+            True if ego robot is legitimate OR (ego robot is adversarial AND has contradicts edges)
+            False if ego robot is adversarial AND has ZERO contradicts edges
+        """
+        # If ego robot is legitimate, always return True (no filtering needed)
+        if not ego_robot.is_adversarial:
+            return True
+
+        # Ego robot is adversarial - check if it has contradicts edges
+        edge_index_dict = ego_graph.edge_index_dict
+        EGO_IDX = 0
+
+        # Check for contradicts edges where ego robot is the SOURCE
+        if ('agent', 'contradicts', 'agent') in edge_index_dict:
+            contradicts_edges = edge_index_dict[('agent', 'contradicts', 'agent')]
+            if contradicts_edges.numel() > 0:
+                # Count contradicts edges where ego (index 0) is the source
+                ego_contradicts_count = (contradicts_edges[0, :] == EGO_IDX).sum().item()
+                if ego_contradicts_count > 0:
+                    return True  # Adversarial with at least 1 contradicts edge - KEEP
+
+        # Adversarial robot with ZERO contradicts edges - REJECT
+        return False
+
     def _check_ego_cross_validation(self, ego_graph: HeteroData) -> bool:
         """
         Check if ego robot (index 0) has cross-validation with other robots.
@@ -606,6 +642,11 @@ class SupervisedDataGenerator:
 
         episode_data = []
 
+        # Track filtering statistics
+        filtered_no_cross_validation = 0
+        filtered_adversarial_no_contradicts = 0
+        filtered_no_meaningful_tracks = 0
+
         for step in range(self.max_steps_per_episode):
             try:
                 self._simulate_step_with_rl(step)
@@ -624,10 +665,23 @@ class SupervisedDataGenerator:
 
             # Sample 20% of robots at each timestep to reduce dataset size
             num_robots_to_sample = max(1, int(len(robots) * 0.2))
-            sampled_robots = random.sample(robots, num_robots_to_sample)
 
-            # Generate ego graphs for sampled robots only
-            for ego_robot in sampled_robots:
+            # IMPORTANT: Resample strategy to handle filtering
+            # When a robot is filtered out, try to sample a replacement from remaining robots
+            saved_robot_ids = set()  # Track which robots we've successfully saved at this timestep
+            available_robots = list(robots)  # Pool of robots we can sample from
+            random.shuffle(available_robots)  # Shuffle for random sampling
+
+            # Try to get num_robots_to_sample valid samples
+            robot_idx = 0
+            while len(saved_robot_ids) < num_robots_to_sample and robot_idx < len(available_robots):
+                ego_robot = available_robots[robot_idx]
+                robot_idx += 1
+
+                # Skip if we've already saved this robot at this timestep
+                if ego_robot.id in saved_robot_ids:
+                    continue
+
                 try:
                     # Build ego-graph for this robot
                     ego_graph = self.ego_graph_builder.build_ego_graph(ego_robot, robots)
@@ -644,7 +698,17 @@ class SupervisedDataGenerator:
                     ego_has_cross_validation = self._check_ego_cross_validation(ego_graph)
 
                     # Skip samples where ego robot has no cross-validation
+                    # Continue to next robot in available pool (resampling)
                     if not ego_has_cross_validation:
+                        filtered_no_cross_validation += 1
+                        continue
+
+                    # CRITICAL: Skip adversarial ego robots with ZERO contradicts edges
+                    # These samples are nearly impossible to learn (32% of adversarial samples!)
+                    # They behave identically to legitimate robots from ego graph perspective
+                    # Continue to next robot in available pool (resampling)
+                    if not self._check_adversarial_has_contradicts(ego_robot, ego_graph):
+                        filtered_adversarial_no_contradicts += 1
                         continue
 
                     # Identify meaningful tracks: ego-detected at current timestep AND have edges to >= 2 robots
@@ -654,6 +718,7 @@ class SupervisedDataGenerator:
 
                     # Skip if no meaningful tracks (rare but possible)
                     if len(meaningful_track_indices) == 0:
+                        filtered_no_meaningful_tracks += 1
                         continue
 
                     # Pre-compute triplet sequences for faster training
@@ -684,10 +749,28 @@ class SupervisedDataGenerator:
 
                     episode_data.append(sample)
 
+                    # Mark this robot as saved for this timestep
+                    # This prevents duplicate samples and enables resampling for filtered robots
+                    saved_robot_ids.add(ego_robot.id)
+
                 except Exception as e:
                     print(f"Warning: Error generating ego graph for robot {ego_robot.id} at step {step}: {e}")
                     continue
+
+            # If we exhausted all robots without getting enough valid samples, that's OK
+            # The while loop exits and we continue to next sampling step
+            # This handles cases where many robots are filtered out
+
+        # Report filtering statistics
+        total_filtered = (filtered_no_cross_validation +
+                         filtered_adversarial_no_contradicts +
+                         filtered_no_meaningful_tracks)
         print(f"Generated {len(episode_data)} samples for episode {episode_idx}")
+        if total_filtered > 0:
+            print(f"  Filtered out {total_filtered} samples:")
+            print(f"    - No cross-validation: {filtered_no_cross_validation}")
+            print(f"    - Adversarial with 0 contradicts: {filtered_adversarial_no_contradicts} ⚠️")
+            print(f"    - No meaningful tracks: {filtered_no_meaningful_tracks}")
         return episode_data, episode_params
 
     def generate_dataset(self,
@@ -845,6 +928,11 @@ class SupervisedDataGenerator:
         log_print(f"  Total samples: {len(all_data)} (was {len(adversarial_samples) + num_legitimate})")
         log_print(f"  Adversarial: {len(adversarial_samples)} ({100*len(adversarial_samples)/len(all_data):.1f}%)")
         log_print(f"  Legitimate:  {len(legitimate_samples)} ({100*len(legitimate_samples)/len(all_data):.1f}%)")
+        log_print("")
+        log_print(f"⚠️  CRITICAL FILTERING APPLIED:")
+        log_print(f"  Adversarial robots with ZERO contradicts edges were filtered out during generation.")
+        log_print(f"  These samples are nearly impossible to distinguish from legitimate robots")
+        log_print(f"  using only ego graph edges. See episode logs for counts.")
         log_print("="*80)
 
         # Calculate statistics
