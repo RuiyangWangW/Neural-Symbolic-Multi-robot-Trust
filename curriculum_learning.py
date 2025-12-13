@@ -3,11 +3,20 @@
 Curriculum Learning for Supervised Trust GNN
 
 This module implements curriculum learning by sorting training samples from easy to hard,
-where "easy" means clear distinction between legitimate/adversarial agents and GT/FP tracks.
+based on the EGO ROBOT'S OWN EDGE PATTERNS.
 
-Strategy:
-1. Easy: High contrast - adversarial agents have many contradictions and FP detections
-2. Hard: Low contrast - adversarial agents behave more like legitimate agents
+Strategy (focusing on ego robot's behavioral signature):
+
+For ADVERSARIAL ego robots:
+  - Easy: Many contradicts edges + few co_detection edges (clear adversarial signature)
+  - Hard: Few contradicts edges + many co_detection edges (behaving like legitimate)
+
+For LEGITIMATE ego robots:
+  - Easy: Many co_detection edges + few contradicts edges (clear collaborative signature)
+  - Hard: Few co_detection edges + many contradicts edges (behaving suspiciously)
+
+Each sample is an ego-centric graph. Difficulty is based solely on the ego robot's
+own edges, not averaged across all agents.
 """
 
 import torch
@@ -20,212 +29,145 @@ from generate_supervised_data import SupervisedDataSample
 
 @dataclass
 class SampleDifficulty:
-    """Stores difficulty metrics for a training sample"""
+    """
+    Stores difficulty metrics for a training sample (ego-centric graph).
+
+    Difficulty is based solely on the EGO ROBOT'S OWN EDGES (ego robot is at index 0).
+    """
     sample_idx: int
     sample: SupervisedDataSample
 
-    # Agent-level metrics
-    agent_contradiction_contrast: float  # Difference in contradiction edges between legit and adv
-    agent_fp_detection_clarity: float    # How clearly adversarial agents detect FPs
+    # Ego robot's own edge counts (stored for analysis, renamed for clarity)
+    agent_contradiction_contrast: float  # Now stores: ego robot's contradiction edge count
+    agent_fp_detection_clarity: float    # Now stores: ego robot's co_detection edge count
 
-    # Track-level metrics
-    track_fov_only_contrast: float       # Difference in in_fov_only edges between GT and FP
-    track_detection_clarity: float       # How clearly FP tracks have more fov_only than detections
+    # Track-level metrics (kept for backward compatibility, set to 0, NOT used for difficulty)
+    track_fov_only_contrast: float       # Not used (set to 0)
+    track_detection_clarity: float       # Not used (set to 0)
 
     # Overall difficulty score (lower = easier)
+    # Based on ego robot's signature strength:
+    #   - Adversarial ego: low difficulty if many contradicts + few codetection
+    #   - Legitimate ego: low difficulty if many codetection + few contradicts
     difficulty_score: float
 
 
 def compute_sample_difficulty(sample: SupervisedDataSample, sample_idx: int) -> SampleDifficulty:
     """
-    Compute difficulty metrics for a training sample.
+    Compute difficulty based solely on the EGO ROBOT'S OWN EDGE PATTERNS.
 
-    Easy samples have:
-    - Adversarial agents with many contradiction edges
-    - FP tracks detected only by adversarial agents
-    - Clear separation between legitimate and adversarial patterns
+    The ego robot is always at index 0 in the ego-centric graph. We measure difficulty
+    by how clearly the ego robot's edges match its true type.
 
-    Hard samples have:
-    - Adversarial agents behaving like legitimate agents
-    - FP tracks detected by multiple agents
-    - Ambiguous patterns
+    For ADVERSARIAL ego robots:
+      - Easy: Many contradicts edges + few co_detection edges
+        → Clear adversarial signature (conflicts with others, doesn't collaborate)
+      - Hard: Few contradicts edges + many co_detection edges
+        → Behaves like legitimate (collaborates, doesn't conflict)
+
+    For LEGITIMATE ego robots:
+      - Easy: Many co_detection edges + few contradicts edges
+        → Clear legitimate signature (collaborates well, doesn't conflict)
+      - Hard: Few co_detection edges + many contradicts edges
+        → Behaves suspiciously (conflicts with others, doesn't collaborate)
 
     Args:
-        sample: Training sample
+        sample: Training sample (ego-centric graph, ego robot at index 0)
         sample_idx: Index in dataset
 
     Returns:
-        SampleDifficulty object with computed metrics
+        SampleDifficulty object with difficulty score based on ego robot's behavioral signature
     """
 
     # Extract edge information
     edge_index_dict = sample.edge_index_dict
     agent_labels = sample.agent_labels  # 1 = legitimate, 0 = adversarial
-    track_labels = sample.track_labels  # 1 = GT, 0 = FP
 
     num_agents = sample.num_agents
-    num_tracks = sample.num_tracks
 
-    # Initialize metrics
-    agent_contradiction_contrast = 0.0
-    agent_fp_detection_clarity = 0.0
-    track_fov_only_contrast = 0.0
-    track_detection_clarity = 0.0
+    # Ego robot is always at index 0 in ego-centric graph
+    EGO_IDX = 0
+    ego_label = agent_labels[EGO_IDX].item()  # 1 = legitimate, 0 = adversarial
+    is_ego_adversarial = (ego_label == 0)
 
     # ========================================================================
-    # METRIC 1: Agent Contradiction Contrast
+    # METRIC 1: Ego Robot's Contradiction Edges
     # ========================================================================
-    # Easy: Adversarial agents have many contradictions, legitimate have few
+    # Count contradiction edges where ego robot is the source
 
+    ego_contradiction_count = 0
     if ('agent', 'contradicts', 'agent') in edge_index_dict:
         contra_edges = edge_index_dict[('agent', 'contradicts', 'agent')]
-
-        # Count contradictions per agent
-        agent_contra_count = torch.zeros(num_agents)
         for i in range(contra_edges.shape[1]):
             src = contra_edges[0, i].item()
-            agent_contra_count[src] += 1
-
-        # Average contradictions for legitimate vs adversarial
-        # Handle both 1D and 2D label tensors
-        agent_labels_flat = agent_labels.flatten() if agent_labels.dim() > 1 else agent_labels
-
-        legit_mask = agent_labels_flat == 1
-        adv_mask = agent_labels_flat == 0
-
-        if legit_mask.any() and adv_mask.any():
-            legit_avg_contra = agent_contra_count[legit_mask].mean().item()
-            adv_avg_contra = agent_contra_count[adv_mask].mean().item()
-
-            # Contrast: higher difference = easier
-            # Normalize by total agents to make comparable across samples
-            agent_contradiction_contrast = abs(adv_avg_contra - legit_avg_contra) / max(num_agents, 1)
+            if src == EGO_IDX:
+                ego_contradiction_count += 1
 
     # ========================================================================
-    # METRIC 2: Agent FP Detection Clarity
+    # METRIC 2: Ego Robot's Co-detection Edges
     # ========================================================================
-    # Easy: Only adversarial agents detect FP tracks
+    # Count co_detection edges where ego robot is the source
 
-    if ('agent', 'in_fov_and_observed', 'track') in edge_index_dict:
-        detection_edges = edge_index_dict[('agent', 'in_fov_and_observed', 'track')]
-
-        # Count FP detections by agent type
-        legit_fp_detections = 0
-        adv_fp_detections = 0
-
-        for i in range(detection_edges.shape[1]):
-            agent_idx = detection_edges[0, i].item()
-            track_idx = detection_edges[1, i].item()
-
-            if track_idx < len(track_labels):  # Safety check
-                is_fp = track_labels[track_idx].item() == 0
-                is_adv = agent_labels[agent_idx].item() == 0
-
-                if is_fp:
-                    if is_adv:
-                        adv_fp_detections += 1
-                    else:
-                        legit_fp_detections += 1
-
-        # Clarity: high if only adversarial detect FPs
-        total_fp_detections = legit_fp_detections + adv_fp_detections
-        if total_fp_detections > 0:
-            # Ratio of adversarial FP detections to total FP detections
-            agent_fp_detection_clarity = adv_fp_detections / total_fp_detections
-        else:
-            # No FP detections at all - neutral difficulty
-            agent_fp_detection_clarity = 0.5
+    ego_codetection_count = 0
+    if ('agent', 'co_detection', 'agent') in edge_index_dict:
+        codet_edges = edge_index_dict[('agent', 'co_detection', 'agent')]
+        for i in range(codet_edges.shape[1]):
+            src = codet_edges[0, i].item()
+            if src == EGO_IDX:
+                ego_codetection_count += 1
 
     # ========================================================================
-    # METRIC 3: Track FOV-Only Contrast
+    # COMPUTE DIFFICULTY BASED ON EGO ROBOT'S BEHAVIORAL SIGNATURE
     # ========================================================================
-    # Easy: FP tracks have many in_fov_only edges, GT tracks have few
+    #
+    # For ADVERSARIAL ego robots:
+    #   - Strong signature: many contradicts edges, few co_detection edges → EASY
+    #   - Weak signature: few contradicts edges, many co_detection edges → HARD
+    #
+    # For LEGITIMATE ego robots:
+    #   - Strong signature: many co_detection edges, few contradicts edges → EASY
+    #   - Weak signature: few co_detection edges, many contradicts edges → HARD
+    #
+    # We normalize by number of other agents to make scores comparable across graphs
 
-    if ('agent', 'in_fov_only', 'track') in edge_index_dict:
-        fov_only_edges = edge_index_dict[('agent', 'in_fov_only', 'track')]
+    num_other_agents = max(1, num_agents - 1)  # Exclude ego itself
 
-        # Count in_fov_only per track
-        track_fov_only_count = torch.zeros(num_tracks)
-        for i in range(fov_only_edges.shape[1]):
-            track_idx = fov_only_edges[1, i].item()
-            track_fov_only_count[track_idx] += 1
+    # Normalize edge counts by number of other agents (max possible edges)
+    norm_contradicts = ego_contradiction_count / num_other_agents
+    norm_codetection = ego_codetection_count / num_other_agents
 
-        # Average for GT vs FP
-        # Handle both 1D and 2D label tensors
-        track_labels_flat = track_labels.flatten() if track_labels.dim() > 1 else track_labels
+    if is_ego_adversarial:
+        # For adversarial: High contradicts + low codetection = easy (clear adversarial signature)
+        # We want high contradicts to decrease difficulty, low codetection to decrease difficulty
 
-        gt_mask = track_labels_flat == 1
-        fp_mask = track_labels_flat == 0
+        # Signature strength: high contradicts = good, high codetection = bad
+        signature_strength = norm_contradicts - norm_codetection
 
-        if gt_mask.any() and fp_mask.any():
-            gt_avg_fov_only = track_fov_only_count[gt_mask].mean().item()
-            fp_avg_fov_only = track_fov_only_count[fp_mask].mean().item()
+        # Convert to difficulty: strong signature (high value) → low difficulty
+        # Use sigmoid-like transformation to map to [0, 1] range
+        # Positive signature_strength → low difficulty
+        # Negative signature_strength → high difficulty
+        difficulty_score = 1.0 / (1.0 + np.exp(2.0 * signature_strength))
 
-            # Contrast: higher difference = easier
-            track_fov_only_contrast = abs(fp_avg_fov_only - gt_avg_fov_only) / max(num_tracks, 1)
+    else:
+        # For legitimate: High codetection + low contradicts = easy (clear legitimate signature)
+        # We want high codetection to decrease difficulty, low contradicts to decrease difficulty
 
-    # ========================================================================
-    # METRIC 4: Track Detection Clarity
-    # ========================================================================
-    # Easy: FP tracks have high ratio of in_fov_only to detections
+        # Signature strength: high codetection = good, high contradicts = bad
+        signature_strength = norm_codetection - norm_contradicts
 
-    if ('agent', 'in_fov_and_observed', 'track') in edge_index_dict and \
-       ('agent', 'in_fov_only', 'track') in edge_index_dict:
+        # Convert to difficulty: strong signature → low difficulty
+        difficulty_score = 1.0 / (1.0 + np.exp(2.0 * signature_strength))
 
-        detection_edges = edge_index_dict[('agent', 'in_fov_and_observed', 'track')]
-        fov_only_edges = edge_index_dict[('agent', 'in_fov_only', 'track')]
+    # Store metrics for backward compatibility
+    # agent_contradiction_contrast now stores ego's contradiction count
+    # agent_fp_detection_clarity now stores ego's codetection count
+    agent_contradiction_contrast = float(ego_contradiction_count)
+    agent_fp_detection_clarity = float(ego_codetection_count)
 
-        # Count per track
-        track_detections = torch.zeros(num_tracks)
-        track_fov_only = torch.zeros(num_tracks)
-
-        for i in range(detection_edges.shape[1]):
-            track_idx = detection_edges[1, i].item()
-            track_detections[track_idx] += 1
-
-        for i in range(fov_only_edges.shape[1]):
-            track_idx = fov_only_edges[1, i].item()
-            track_fov_only[track_idx] += 1
-
-        # For FP tracks: ratio of fov_only to detections
-        # High ratio = easy (many agents see but don't detect)
-        # Handle both 1D and 2D label tensors
-        track_labels_flat = track_labels.flatten() if track_labels.dim() > 1 else track_labels
-        fp_mask = track_labels_flat == 0
-        if fp_mask.any():
-            fp_fov_only = track_fov_only[fp_mask]
-            fp_detections = track_detections[fp_mask]
-
-            # Avoid division by zero
-            fp_detections_safe = torch.clamp(fp_detections, min=1.0)
-
-            # Ratio: higher = easier
-            fp_ratios = fp_fov_only / fp_detections_safe
-            track_detection_clarity = fp_ratios.mean().item()
-
-    # ========================================================================
-    # COMPUTE OVERALL DIFFICULTY SCORE
-    # ========================================================================
-    # Combine metrics into single score (lower = easier)
-
-    # Weights for each metric
-    w1 = 0.3  # Agent contradiction contrast
-    w2 = 0.3  # Agent FP detection clarity
-    w3 = 0.2  # Track FOV-only contrast
-    w4 = 0.2  # Track detection clarity
-
-    # Invert clarity metrics (higher clarity = lower difficulty)
-    agent_contra_difficulty = 1.0 / (1.0 + agent_contradiction_contrast)
-    agent_fp_difficulty = 1.0 - agent_fp_detection_clarity  # Already 0-1
-    track_fov_difficulty = 1.0 / (1.0 + track_fov_only_contrast)
-    track_det_difficulty = 1.0 / (1.0 + track_detection_clarity)
-
-    difficulty_score = (
-        w1 * agent_contra_difficulty +
-        w2 * agent_fp_difficulty +
-        w3 * track_fov_difficulty +
-        w4 * track_det_difficulty
-    )
+    # Track metrics set to 0 (not used, kept for backward compatibility)
+    track_fov_only_contrast = 0.0
+    track_detection_clarity = 0.0
 
     return SampleDifficulty(
         sample_idx=sample_idx,
@@ -240,13 +182,20 @@ def compute_sample_difficulty(sample: SupervisedDataSample, sample_idx: int) -> 
 
 def sort_dataset_by_difficulty(dataset: List[SupervisedDataSample]) -> Tuple[List[SupervisedDataSample], List[SampleDifficulty]]:
     """
-    Sort dataset from easiest to hardest samples.
+    Sort dataset from easiest to hardest samples based on ego robot classification difficulty.
+
+    IMPORTANT: Adversarial and legitimate samples are sorted SEPARATELY to maintain
+    class balance during curriculum learning. When sampling for training, samples are
+    drawn equally from both sorted lists.
+
+    Difficulty focuses solely on how easy it is to classify the ego robot correctly.
 
     Args:
-        dataset: List of training samples
+        dataset: List of training samples (each is an ego-centric graph)
 
     Returns:
-        Tuple of (sorted_dataset, difficulty_metrics)
+        Tuple of (interleaved_sorted_dataset, all_difficulty_metrics)
+        The returned dataset interleaves adversarial and legitimate samples to maintain balance.
     """
     print(f"Computing difficulty metrics for {len(dataset)} samples...")
 
@@ -259,18 +208,50 @@ def sort_dataset_by_difficulty(dataset: List[SupervisedDataSample]) -> Tuple[Lis
         difficulty = compute_sample_difficulty(sample, idx)
         difficulties.append(difficulty)
 
-    # Sort by difficulty score (ascending = easy to hard)
-    difficulties.sort(key=lambda d: d.difficulty_score)
+    # Separate into adversarial and legitimate samples
+    adv_difficulties = []
+    leg_difficulties = []
 
-    # Extract sorted samples
-    sorted_dataset = [d.sample for d in difficulties]
+    for d in difficulties:
+        ego_label = d.sample.agent_labels[0].item()
+        if ego_label == 0:  # Adversarial
+            adv_difficulties.append(d)
+        else:  # Legitimate
+            leg_difficulties.append(d)
 
-    print(f"✅ Dataset sorted by difficulty")
-    print(f"   Easiest sample difficulty: {difficulties[0].difficulty_score:.4f}")
-    print(f"   Hardest sample difficulty: {difficulties[-1].difficulty_score:.4f}")
-    print(f"   Median sample difficulty: {difficulties[len(difficulties)//2].difficulty_score:.4f}")
+    # Sort each class separately by difficulty (easy to hard)
+    adv_difficulties.sort(key=lambda d: d.difficulty_score)
+    leg_difficulties.sort(key=lambda d: d.difficulty_score)
 
-    return sorted_dataset, difficulties
+    # Interleave to create balanced sorted dataset
+    # Take samples alternately from adversarial and legitimate lists
+    interleaved_dataset = []
+    interleaved_difficulties = []
+
+    max_len = max(len(adv_difficulties), len(leg_difficulties))
+
+    for i in range(max_len):
+        # Add from adversarial list if available
+        if i < len(adv_difficulties):
+            interleaved_dataset.append(adv_difficulties[i].sample)
+            interleaved_difficulties.append(adv_difficulties[i])
+
+        # Add from legitimate list if available
+        if i < len(leg_difficulties):
+            interleaved_dataset.append(leg_difficulties[i].sample)
+            interleaved_difficulties.append(leg_difficulties[i])
+
+    print(f"✅ Dataset sorted by difficulty (class-balanced)")
+    print(f"   Adversarial samples: {len(adv_difficulties)}")
+    print(f"     Easiest: {adv_difficulties[0].difficulty_score:.4f}")
+    print(f"     Hardest: {adv_difficulties[-1].difficulty_score:.4f}")
+    print(f"     Median:  {adv_difficulties[len(adv_difficulties)//2].difficulty_score:.4f}")
+    print(f"   Legitimate samples: {len(leg_difficulties)}")
+    print(f"     Easiest: {leg_difficulties[0].difficulty_score:.4f}")
+    print(f"     Hardest: {leg_difficulties[-1].difficulty_score:.4f}")
+    print(f"     Median:  {leg_difficulties[len(leg_difficulties)//2].difficulty_score:.4f}")
+
+    return interleaved_dataset, interleaved_difficulties
 
 
 def create_curriculum_schedule(num_samples: int, num_epochs: int, strategy: str = 'performance') -> List[int]:
