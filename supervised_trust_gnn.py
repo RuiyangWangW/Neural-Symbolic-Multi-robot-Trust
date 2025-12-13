@@ -33,7 +33,7 @@ class NodeScores:
 
 class TripletEncoder(nn.Module):
     """
-    Encodes local edge structure around each node as symbolic triplets using Transformer.
+    Encodes local edge structure around each node as symbolic triplets using MLP + Attention Pooling.
 
     For each node, we encode all outgoing edges as triplets:
     τ = (source_type, edge_relation, target_type)
@@ -44,41 +44,31 @@ class TripletEncoder(nn.Module):
     - target_type: 0=agent, 1=track (1-bit)
     Total: 8 dimensions per triplet
 
-    The transformer processes variable-length sequences of triplets and produces
-    fixed-size node embeddings.
+    Key Insight: Edges represent INDEPENDENT behavioral observations (co_detection, contradicts, etc.)
+    The existence of edge A has no relationship with edge B - they're separate facts.
+    Therefore, we don't need Transformer self-attention (which models edge-to-edge dependencies).
+    Instead, we use MLP to embed each edge independently, then attention pooling to learn
+    which edge TYPES are important (e.g., "contradicts" is more important than "in_fov_only").
     """
 
-    def __init__(self, hidden_dim=128, num_heads=4, num_layers=2, dropout=0.1):
+    def __init__(self, hidden_dim=128, num_heads=4, num_layers=1, dropout=0.1):
         super().__init__()
 
         self.hidden_dim = hidden_dim
 
-        # Triplet embedding: 8-dim symbolic representation → hidden_dim
-        self.triplet_embedding = nn.Linear(8, hidden_dim)
-
-        # NOTE: No positional encoding needed!
-        # Edges form an unordered set, not a sequence.
-        # Transformer self-attention is naturally permutation-equivariant,
-        # and SUM pooling makes the output permutation-invariant.
-        # Adding positional encoding would break this property and introduce
-        # spurious correlations based on arbitrary edge ordering.
-
-        # Transformer encoder layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation='relu',
-            batch_first=True,
-            norm_first=False
+        # Edge embedding MLP: Process each edge independently
+        # No need for Transformer because edges are independent observations
+        self.edge_embedding = nn.Sequential(
+            nn.Linear(8, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim)
         )
-        # Disable nested tensor optimization to avoid deprecated API warnings
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
 
-        # Attention pooling: learn which edges are important
-        # This is permutation-invariant because softmax normalizes over the edge dimension
-        # (the attention weights sum to 1 regardless of edge order)
+        # Attention pooling: Learn which edge types are important
+        # This is the KEY component - learns that "contradicts" matters more than "in_fov_only"
+        # Permutation-invariant: attention weights sum to 1 regardless of edge order
         self.edge_attention = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.Tanh(),
@@ -100,18 +90,10 @@ class TripletEncoder(nn.Module):
         Returns:
             [num_nodes, hidden_dim] - node embeddings
         """
-        # Embed triplets
-        x = self.triplet_embedding(triplets)  # [num_nodes, max_edges, hidden_dim]
+        # Embed each edge independently (no edge-to-edge interaction needed)
+        x = self.edge_embedding(triplets)  # [num_nodes, max_edges, hidden_dim]
 
-        # No positional encoding: edges form an unordered set, order doesn't matter
-        # The transformer self-attention is permutation-equivariant, and attention pooling
-        # makes the final output permutation-invariant.
-
-        # Apply transformer
-        # mask: True for positions to ignore
-        x = self.transformer(x, src_key_padding_mask=mask)
-
-        # Attention pooling: learn to weight edges by importance
+        # Attention pooling: Learn which edges are important
         # Compute attention scores for each edge
         attn_scores = self.edge_attention(x)  # [num_nodes, max_edges, 1]
 
@@ -167,22 +149,21 @@ class SupervisedTrustGNN(nn.Module):
         self.agent_triplet_encoder = TripletEncoder(
             hidden_dim=hidden_dim,
             num_heads=4,
-            num_layers=2,
+            num_layers=1,
             dropout=0.1
         )
 
         self.track_triplet_encoder = TripletEncoder(
             hidden_dim=hidden_dim,
             num_heads=4,
-            num_layers=2,
+            num_layers=1,
             dropout=0.1
         )
 
-        # Three layers of heterogeneous convolution (each with independent parameters)
+        # Two layers of heterogeneous convolution (each with independent parameters)
         # FIXED: Create separate conv_dict for each layer to avoid parameter sharing
         self.conv1 = HeteroConv(self._create_conv_dict(), aggr='mean')
         self.conv2 = HeteroConv(self._create_conv_dict(), aggr='mean')
-        self.conv3 = HeteroConv(self._create_conv_dict(), aggr='mean')
 
         # Batch normalization layers
         self.norm1 = nn.ModuleDict({
@@ -190,10 +171,6 @@ class SupervisedTrustGNN(nn.Module):
             'track': nn.BatchNorm1d(hidden_dim)
         })
         self.norm2 = nn.ModuleDict({
-            'agent': nn.BatchNorm1d(hidden_dim),
-            'track': nn.BatchNorm1d(hidden_dim)
-        })
-        self.norm3 = nn.ModuleDict({
             'agent': nn.BatchNorm1d(hidden_dim),
             'track': nn.BatchNorm1d(hidden_dim)
         })
@@ -321,26 +298,10 @@ class SupervisedTrustGNN(nn.Module):
                 x_dict_2[key] = self.norm2[key](x_dict_2[key])
 
         # Add skip connection from first layer
-        x_dict_2 = {
+        x_dict_final = {
             key: x_dict_2[key] + x_dict_1[key] if x_dict_2[key].shape[0] > 0 and x_dict_1[key].shape[0] > 0
             else x_dict_2[key]
             for key in x_dict_2
-        }
-
-        # Third layer with skip connection
-        x_dict_3 = self.conv3(x_dict_2, edge_index_dict)
-        x_dict_3 = {key: F.relu(x) for key, x in x_dict_3.items()}
-
-        # Apply batch normalization
-        for key in x_dict_3:
-            if x_dict_3[key].shape[0] > 1:
-                x_dict_3[key] = self.norm3[key](x_dict_3[key])
-
-        # Add skip connection from second layer
-        x_dict_final = {
-            key: x_dict_3[key] + x_dict_2[key] if x_dict_3[key].shape[0] > 0 and x_dict_2[key].shape[0] > 0
-            else x_dict_3[key]
-            for key in x_dict_3
         }
 
         # Apply classification heads
