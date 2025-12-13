@@ -51,7 +51,12 @@ class SupervisedTrustDataset(Dataset):
             'meaningful_track_indices': sample.meaningful_track_indices,
             'timestep': sample.timestep,
             'episode': sample.episode,
-            'ego_robot_id': sample.ego_robot_id
+            'ego_robot_id': sample.ego_robot_id,
+            # CRITICAL FIX: Include pre-computed triplets to avoid extraction during forward pass
+            'agent_triplets': sample.agent_triplets,
+            'agent_triplet_mask': sample.agent_triplet_mask,
+            'track_triplets': sample.track_triplets,
+            'track_triplet_mask': sample.track_triplet_mask
         }
 
 
