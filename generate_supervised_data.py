@@ -703,13 +703,14 @@ class SupervisedDataGenerator:
                         filtered_no_cross_validation += 1
                         continue
 
-                    # CRITICAL: Skip adversarial ego robots with ZERO contradicts edges
-                    # These samples are nearly impossible to learn (32% of adversarial samples!)
-                    # They behave identically to legitimate robots from ego graph perspective
-                    # Continue to next robot in available pool (resampling)
-                    if not self._check_adversarial_has_contradicts(ego_robot, ego_graph):
-                        filtered_adversarial_no_contradicts += 1
-                        continue
+                    # REMOVED: Filter for adversarial with 0 contradicts
+                    # Reason: Train-test mismatch! During inference, we don't know which robots
+                    # are adversarial, so we can't apply this filter. Model must learn to handle
+                    # adversarial robots with 0 contradicts, even though they're hard to classify.
+                    #
+                    # if not self._check_adversarial_has_contradicts(ego_robot, ego_graph):
+                    #     filtered_adversarial_no_contradicts += 1
+                    #     continue
 
                     # Identify meaningful tracks: ego-detected at current timestep AND have edges to >= 2 robots
                     meaningful_track_indices = self._identify_meaningful_tracks(

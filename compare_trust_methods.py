@@ -21,11 +21,11 @@ from supervised_trust_gnn import SupervisedTrustPredictor
 from robot_track_classes import Robot, Track
 
 # Import trust update components
-from mass_based_trust_update import MassBasedTrustSystem, MassBasedParams, BaselineFixedStepSystem
+from mass_based_trust_update import BaselineFixedStepSystem
 
 
 class TrustMethodComparison:
-    """Compares paper algorithm vs baseline (fixed step) vs mass-based trust methods"""
+    """Compares paper algorithm vs baseline (fixed step) trust methods"""
 
     def __init__(self,
                  supervised_model_path: str = "supervised_trust_model.pth",
@@ -80,13 +80,11 @@ class TrustMethodComparison:
         # Initialize trust methods
         self.paper_algorithm = PaperTrustAlgorithm()
         self.supervised_predictor = None
-        self.mass_based_trust_system = None
         self.baseline_trust_system = None
 
         # Results storage
         self.paper_results = []
         self.supervised_results = []
-        self.mass_results = []  # Renamed from rl_results
         self.baseline_results = []
 
         # Simulation parameters (can be overridden)
@@ -106,47 +104,12 @@ class TrustMethodComparison:
         except Exception as e:
             print(f"⚠️ Failed to initialize supervised predictor: {e}")
 
-        # Initialize mass-based trust system
-        try:
-            self._initialize_mass_based_system()
-            print(f"✅ Mass-based trust system ready")
-        except Exception as e:
-            print(f"⚠️ Failed to initialize mass-based system: {e}")
-
         # Initialize baseline fixed-step system
         try:
             self._initialize_baseline_system()
             print(f"✅ Initialized fixed-step baseline with scale={self.fixed_step_scale:.2f}")
         except Exception as e:
             print(f"⚠️ Failed to initialize fixed-step baseline: {e}")
-
-    def _initialize_mass_based_system(self):
-        """Initialize the mass-based trust update system"""
-        device = 'cpu'  # Use CPU for comparison consistency
-
-        evidence_path = str(self.supervised_model_path) if self.supervised_model_path and self.supervised_model_path.exists() else None
-
-        if self.supervised_model_path and not self.supervised_model_path.exists():
-            print(f"ℹ️ Supervised evidence model '{self.supervised_model_path}' not found. Initializing with fresh weights.")
-
-        # Initialize MassBasedTrustSystem with default parameters
-        params = MassBasedParams(
-            gamma=0.99,
-            c_mass=0.1,
-            mu_kappa=2.0,
-            sigma_kappa=1.0,
-            delta_tau_max=0.1,
-            trust_threshold=0.6
-        )
-
-        self.mass_based_trust_system = MassBasedTrustSystem(
-            evidence_model_path=evidence_path,
-            device=device,
-            params=params,
-            decay_factor=0.99,  # Exponential decay for alpha/beta
-            trust_threshold=0.6,  # Match dataset generation
-            proximal_range=self.proximal_range,  # Match simulation environment
-        )
 
     def _initialize_baseline_system(self):
         """Set up a baseline trust system with fixed step scales and decaying alpha/beta."""
@@ -166,7 +129,7 @@ class TrustMethodComparison:
             proximal_range=self.proximal_range,
         )
 
-    def create_identical_environments(self, count: int = 3) -> List[SimulationEnvironment]:
+    def create_identical_environments(self, count: int = 2) -> List[SimulationEnvironment]:
         """Create identical simulation environments for fair comparison."""
         envs = []
         for _ in range(count):
@@ -259,16 +222,6 @@ class TrustMethodComparison:
         print(f"🚀 Running fixed step-scale simulation (scale={self.fixed_step_scale:.2f})...")
 
         return self._run_trust_simulation(env, self.baseline_trust_system, label="Baseline")
-
-    def run_mass_based_simulation(self, env: SimulationEnvironment) -> List[Dict]:
-        """Run simulation using mass-based trust model"""
-        if self.mass_based_trust_system is None:
-            print("❌ Mass-based model not available, skipping")
-            return []
-
-        print("🚀 Running mass-based model simulation...")
-
-        return self._run_trust_simulation(env, self.mass_based_trust_system, label="Mass")
 
     def _run_trust_simulation(self, env: SimulationEnvironment, trust_system, label: str) -> List[Dict]:
         """Shared simulation loop for trust systems (baseline or mass-based)."""
@@ -438,7 +391,7 @@ class TrustMethodComparison:
         print(f"Random seed: {self.random_seed}")
 
         # Create identical environments for each method
-        paper_env, baseline_env, rl_env = self.create_identical_environments(3)
+        paper_env, baseline_env = self.create_identical_environments(2)
 
         # Run both simulations
         print("\n" + "="*50)
@@ -446,9 +399,6 @@ class TrustMethodComparison:
 
         print("\n" + "="*50)
         self.baseline_results = self.run_baseline_simulation(baseline_env)
-
-        print("\n" + "="*50)
-        self.mass_results = self.run_mass_based_simulation(rl_env)
 
         # Generate comparison results
         comparison_results = {
@@ -461,12 +411,10 @@ class TrustMethodComparison:
                 'derived_num_targets': self.num_targets,
                 'num_timesteps': self.num_timesteps,
                 'random_seed': self.random_seed,
-                'mass_based_params': 'default',
                 'fixed_step_scale': self.fixed_step_scale
             },
             'paper_results': self.paper_results,
             'baseline_results': self.baseline_results,
-            'mass_results': self.mass_results,
             'comparison_metrics': self._compute_comparison_metrics()
         }
 
@@ -474,7 +422,7 @@ class TrustMethodComparison:
 
     def _compute_comparison_metrics(self) -> Dict:
         """Compute comparison metrics across all trust methods"""
-        if not self.paper_results or not self.baseline_results or not self.mass_results:
+        if not self.paper_results or not self.baseline_results:
             print("⚠️ Incomplete results for comparison")
             return {}
 
@@ -488,8 +436,7 @@ class TrustMethodComparison:
 
         method_results = {
             'paper': self.paper_results,
-            'baseline': self.baseline_results,
-            'mass': self.mass_results
+            'baseline': self.baseline_results
         }
 
         robot_ids = list(self.paper_results[0]['robot_trust_values'].keys())
@@ -513,7 +460,6 @@ class TrustMethodComparison:
             correlations = {}
             paper_series = np.array([step['robot_trust_values'][robot_id] for step in self.paper_results])
             baseline_series = np.array([step['robot_trust_values'][robot_id] for step in self.baseline_results])
-            mass_series = np.array([step['robot_trust_values'][robot_id] for step in self.mass_results])
 
             def safe_corr(a, b):
                 if len(a) < 2:
@@ -530,8 +476,6 @@ class TrustMethodComparison:
                     return 0.0
 
             correlations['paper_vs_baseline'] = safe_corr(paper_series, baseline_series)
-            correlations['paper_vs_mass'] = safe_corr(paper_series, mass_series)
-            correlations['baseline_vs_mass'] = safe_corr(baseline_series, mass_series)
 
             metrics['trust_convergence'][robot_id] = {
                 'robot_type': robot_type,
@@ -553,18 +497,17 @@ class TrustMethodComparison:
                 }
             metrics['final_trust_values'][robot_type] = stats
 
-        # Method-wise difference summaries (Mass vs others)
+        # Method-wise difference summaries (Baseline vs Paper)
         diff_stats = {}
-        for method in ['paper', 'baseline']:
-            diffs = []
-            for robot_id in robot_ids:
-                mass_final = metrics['trust_convergence'][robot_id]['methods']['mass']['final']
-                other_final = metrics['trust_convergence'][robot_id]['methods'][method]['final']
-                diffs.append(mass_final - other_final)
-            diff_stats[f'mass_minus_{method}'] = {
-                'mean': float(np.mean(diffs)),
-                'std': float(np.std(diffs))
-            }
+        diffs = []
+        for robot_id in robot_ids:
+            baseline_final = metrics['trust_convergence'][robot_id]['methods']['baseline']['final']
+            paper_final = metrics['trust_convergence'][robot_id]['methods']['paper']['final']
+            diffs.append(baseline_final - paper_final)
+        diff_stats['baseline_minus_paper'] = {
+            'mean': float(np.mean(diffs)),
+            'std': float(np.std(diffs))
+        }
 
         metrics['method_differences'] = diff_stats
 
@@ -582,12 +525,10 @@ class TrustMethodComparison:
                 'num_targets': self.num_targets,
                 'num_timesteps': self.num_timesteps,
                 'random_seed': self.random_seed,
-                'mass_based_params': 'default',
                 'fixed_step_scale': self.fixed_step_scale
             },
             'paper_results': self.paper_results,
             'baseline_results': self.baseline_results,
-            'mass_results': self.mass_results,
             'comparison_metrics': self._compute_comparison_metrics()
         }
 
@@ -615,15 +556,15 @@ class TrustMethodComparison:
         return filename
 
     def visualize_comparison(self, save_path: str = "trust_comparison.png"):
-        """Create visualization comparing paper, baseline, and mass-based methods"""
-        if not (self.paper_results and self.baseline_results and self.mass_results):
+        """Create visualization comparing paper and baseline methods"""
+        if not (self.paper_results and self.baseline_results):
             print("⚠️ Incomplete results available for visualization")
             return
 
         print("📈 Creating comparison visualization...")
 
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        fig.suptitle('Trust Method Comparison: Paper vs Fixed Step vs Mass-Based', fontsize=16, fontweight='bold')
+        fig.suptitle('Trust Method Comparison: Paper vs Baseline', fontsize=16, fontweight='bold')
 
         timesteps = [step['step'] for step in self.paper_results]
         adversarial_robots = self.paper_results[0]['adversarial_robots']
@@ -631,8 +572,7 @@ class TrustMethodComparison:
 
         method_styles = {
             'Paper': {'results': self.paper_results, 'linestyle': '-', 'alpha': 0.7},
-            'Baseline': {'results': self.baseline_results, 'linestyle': '-.', 'alpha': 0.8},
-            'Mass': {'results': self.mass_results, 'linestyle': '--', 'alpha': 0.9}
+            'Baseline': {'results': self.baseline_results, 'linestyle': '-.', 'alpha': 0.8}
         }
 
         # Plot 1: Legitimate robots
@@ -686,7 +626,7 @@ class TrustMethodComparison:
 
         # Plot 4: Final trust comparison
         ax4 = axes[1, 1]
-        method_order = ['Paper', 'Baseline', 'Mass']
+        method_order = ['Paper', 'Baseline']
         categories = []
         means = []
         stds = []
@@ -694,8 +634,7 @@ class TrustMethodComparison:
 
         color_map = {
             'Paper': 'tab:blue',
-            'Baseline': 'tab:orange',
-            'Mass': 'tab:green'
+            'Baseline': 'tab:orange'
         }
 
         for label in method_order:
@@ -736,8 +675,8 @@ class TrustMethodComparison:
 
     def print_summary(self):
         """Print comparison summary"""
-        if not self.mass_results:
-            print("⚠️ No mass-based results available for summary")
+        if not self.baseline_results:
+            print("⚠️ No baseline results available for summary")
             return
 
         print("\n" + "="*60)
@@ -752,7 +691,6 @@ class TrustMethodComparison:
             f"(multiplier {self.target_density_multiplier:.3f}, density {self.target_density:.6f}), "
             f"steps={self.num_timesteps}, seed {self.random_seed}"
         )
-        print(f"Trust Update Method: Mass-Based Controller")
         print(f"Fixed Step Scale: {self.fixed_step_scale:.2f}")
 
         # Final trust values by robot type
@@ -765,7 +703,7 @@ class TrustMethodComparison:
 
         # Method differences summary
         if 'method_differences' in metrics:
-            print("\n🔍 Mass-Based Improvements over Other Methods:")
+            print("\n🔍 Method Differences:")
             for key, stats in metrics['method_differences'].items():
                 print(f"  {key}: {stats['mean']:+.3f} ± {stats['std']:.3f}")
 
@@ -782,8 +720,7 @@ class TrustMethodComparison:
                 print(f"    Robot {robot_id}: "
                       f"Paper={methods['paper']['final']:.3f}, "
                       f"Baseline={methods['baseline']['final']:.3f}, "
-                      f"Mass={methods['mass']['final']:.3f}, "
-                      f"Corr(Mass,B)= {conv['correlations']['baseline_vs_mass']:.3f}")
+                      f"Corr(P,B)={conv['correlations']['paper_vs_baseline']:.3f}")
 
         print("  Adversarial Robots:")
         for robot_id in adversarial_robots:
@@ -793,8 +730,7 @@ class TrustMethodComparison:
                 print(f"    Robot {robot_id}: "
                       f"Paper={methods['paper']['final']:.3f}, "
                       f"Baseline={methods['baseline']['final']:.3f}, "
-                      f"Mass={methods['mass']['final']:.3f}, "
-                      f"Corr(Mass,B)= {conv['correlations']['baseline_vs_mass']:.3f}")
+                      f"Corr(P,B)={conv['correlations']['paper_vs_baseline']:.3f}")
 
         print("\n✨ Comparison completed successfully!")
 

@@ -279,8 +279,8 @@ def main():
                        help='Percentage increase when advancing curriculum (default: 0.10 = 10%%)')
     parser.add_argument('--min-batch-size', type=int, default=32,
                        help='Minimum batch size for early curriculum stages (default: 32)')
-    parser.add_argument('--weight-decay', type=float, default=0.0,
-                       help='Weight decay for regularization (default: 0.0 for curriculum, use 1e-4 for no-curriculum)')
+    parser.add_argument('--weight-decay', type=float, default=1e-4,
+                       help='Weight decay for regularization (default: 1e-4, set to 0.0 to disable)')
     parser.add_argument('--curriculum-lr-boost', type=float, default=2.0,
                        help='Learning rate multiplier for early curriculum stages (default: 2.0)')
 
@@ -373,6 +373,7 @@ def main():
 
     # Create trainer with loss weighting
     log_print(f"⚖️  Loss weights: Agent={args.agent_loss_weight}, Track={args.track_loss_weight}")
+    log_print(f"🔧 Regularization: Weight decay={args.weight_decay}")
     trainer = SupervisedTrustTrainer(
         model,
         device=device,
