@@ -890,11 +890,6 @@ class SupervisedDataGenerator:
         log_print(f"  Total samples: {len(all_data)} (was {len(adversarial_samples) + num_legitimate})")
         log_print(f"  Adversarial: {len(adversarial_samples)} ({100*len(adversarial_samples)/len(all_data):.1f}%)")
         log_print(f"  Legitimate:  {len(legitimate_samples)} ({100*len(legitimate_samples)/len(all_data):.1f}%)")
-        log_print("")
-        log_print(f"⚠️  CRITICAL FILTERING APPLIED:")
-        log_print(f"  Adversarial robots with ZERO contradicts edges were filtered out during generation.")
-        log_print(f"  These samples are nearly impossible to distinguish from legitimate robots")
-        log_print(f"  using only ego graph edges. See episode logs for counts.")
         log_print("="*80)
 
         # Calculate statistics

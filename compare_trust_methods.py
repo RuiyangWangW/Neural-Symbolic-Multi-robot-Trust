@@ -101,7 +101,7 @@ class TrustMethodComparison:
         except Exception as e:
             print(f"⚠️ Failed to initialize supervised predictor: {e}")
 
-    def create_identical_environments(self, count: int = 1) -> List[SimulationEnvironment]:
+    def create_identical_environments(self, count: int = 2) -> List[SimulationEnvironment]:
         """Create identical simulation environments."""
         envs = []
         for _ in range(count):
@@ -184,6 +184,147 @@ class TrustMethodComparison:
 
         print("✅ Paper algorithm simulation completed")
         return results
+
+    def run_supervised_model_simulation(self, env: SimulationEnvironment) -> List[Dict]:
+        """Run simulation using supervised trust model"""
+        if self.supervised_predictor is None:
+            print("❌ Supervised model not available, skipping")
+            return []
+
+        print("🚀 Running supervised model simulation...")
+
+        results = []
+
+        for step in range(self.num_timesteps):
+            # CRITICAL: Reset random seed for each step to ensure identical randomness
+            step_seed = self.random_seed + step
+            np.random.seed(step_seed)
+            random.seed(step_seed)
+
+            # Step the simulation
+            frame_data = env.step()
+
+            # Update current timestep tracks for all robots
+            for robot in env.robots:
+                robot.update_current_timestep_tracks()
+
+            # Apply supervised model predictions for each robot's ego graph
+            for ego_robot in env.robots:
+                try:
+                    # Get predictions from supervised model
+                    result = self.supervised_predictor.predict_from_robots_tracks(
+                        ego_robot, env.robots, threshold=0.5
+                    )
+
+                    # Check if result is None (no cross-validation or meaningful tracks)
+                    if result is None:
+                        continue
+
+                    # Update alpha/beta values based on model predictions
+                    self._update_trust_from_predictions(result['predictions'], result['graph_data'])
+
+                except Exception as e:
+                    print(f"⚠️ Supervised model error for robot {ego_robot.id} at step {step}: {e}")
+
+            # Collect results (same structure as paper algorithm)
+            step_result = {
+                'step': step,
+                'time': env.time,
+                'robot_trust_values': {
+                    robot.id: robot.trust_value for robot in env.robots
+                },
+                'robot_alpha_beta': {
+                    robot.id: {'alpha': robot.trust_alpha, 'beta': robot.trust_beta}
+                    for robot in env.robots
+                },
+                'track_trust_values': {},
+                'adversarial_robots': [r.id for r in env.robots if r.is_adversarial],
+                'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial]
+            }
+
+            # Collect track trust values
+            for robot in env.robots:
+                step_result['track_trust_values'][robot.id] = {
+                    track.track_id: {
+                        'trust_value': track.trust_value,
+                        'alpha': track.trust_alpha,
+                        'beta': track.trust_beta,
+                        'object_id': track.object_id
+                    }
+                    for track in robot.get_all_tracks()
+                }
+
+            results.append(step_result)
+
+            if step % 100 == 0:
+                print(f"  Supervised model step {step}/{self.num_timesteps}")
+
+        print("✅ Supervised model simulation completed")
+        return results
+
+    def _update_trust_from_predictions(self, predictions: Dict, graph_data):
+        """
+        Update alpha/beta values based on supervised model predictions using correct node mappings
+
+        Args:
+            predictions: Model predictions containing trust probabilities
+            graph_data: Graph data with node mappings (agent_nodes, track_nodes)
+        """
+
+        # Update agent (robot) trust values using correct mappings
+        if 'agent' in predictions and hasattr(graph_data, 'agent_nodes'):
+            agent_probs = predictions['agent']['probabilities']
+
+            # Use the exact node mapping from graph_data
+            for robot_id, node_idx in graph_data.agent_nodes.items():
+                if node_idx < len(agent_probs):
+                    p = agent_probs[node_idx][0]  # Extract probability from array
+
+                    # Convert probability to alpha/beta update
+                    if p >= 0.5:
+                        # High trust prediction - increase alpha
+                        delta_alpha = p
+                        delta_beta = 0.0
+                    else:
+                        # Low trust prediction - increase beta
+                        delta_alpha = 0.0
+                        delta_beta = (1 - p)
+
+                    # Find the robot object and apply update
+                    for robot in graph_data._proximal_robots:
+                        if robot.id == robot_id:
+                            # Apply update with small step size to prevent rapid changes
+                            step_size = 0.1
+                            robot.update_trust(delta_alpha * step_size, delta_beta * step_size)
+                            break
+
+        # Update track trust values using correct mappings
+        if 'track' in predictions and hasattr(graph_data, 'track_nodes'):
+            track_probs = predictions['track']['probabilities']
+
+            # Use the exact node mapping from graph_data
+            for track_id, node_idx in graph_data.track_nodes.items():
+                if node_idx < len(track_probs):
+                    p = track_probs[node_idx][0]  # Extract probability from array
+
+                    # Convert probability to alpha/beta update
+                    if p >= 0.5:
+                        # High trust prediction - increase alpha
+                        delta_alpha = p
+                        delta_beta = 0.0
+                    else:
+                        # Low trust prediction - increase beta
+                        delta_alpha = 0.0
+                        delta_beta = (1 - p)
+
+                    # Find the track object and apply update
+                    for robot in graph_data._proximal_robots:
+                        for track in robot.get_all_tracks():
+                            if track.track_id == track_id:
+                                # Apply update with small step size
+                                step_size = 0.1
+                                track.update_trust(delta_alpha * step_size, delta_beta * step_size)
+                                break
 
     def _run_trust_simulation(self, env: SimulationEnvironment, trust_system, label: str) -> List[Dict]:
         """Shared simulation loop for trust systems (baseline or mass-based)."""
@@ -342,7 +483,7 @@ class TrustMethodComparison:
         return results
 
     def run_comparison(self) -> Dict:
-        """Run complete comparison between both methods"""
+        """Run complete comparison between paper algorithm and supervised model"""
         print("🔄 Starting trust method comparison...")
         print(
             f"Configuration: world={self.world_size}m, robots={self.num_robots} "
@@ -352,14 +493,17 @@ class TrustMethodComparison:
         )
         print(f"Random seed: {self.random_seed}")
 
-        # Create environment for paper algorithm
-        paper_env = self.create_identical_environments(1)[0]
+        # Create identical environments for both methods
+        paper_env, supervised_env = self.create_identical_environments(2)
 
-        # Run paper algorithm simulation
+        # Run both simulations
         print("\n" + "="*50)
         self.paper_results = self.run_paper_algorithm_simulation(paper_env)
 
-        # Generate results
+        print("\n" + "="*50)
+        self.supervised_results = self.run_supervised_model_simulation(supervised_env)
+
+        # Generate comparison results
         comparison_results = {
             'configuration': {
                 'world_size': self.world_size,
@@ -371,55 +515,87 @@ class TrustMethodComparison:
                 'num_timesteps': self.num_timesteps,
                 'random_seed': self.random_seed
             },
-            'paper_results': self.paper_results
+            'paper_results': self.paper_results,
+            'supervised_results': self.supervised_results,
+            'comparison_metrics': self._compute_comparison_metrics()
         }
 
         return comparison_results
 
-    def _compute_paper_metrics(self) -> Dict:
-        """Compute metrics for paper algorithm"""
-        if not self.paper_results:
-            print("⚠️ No paper results for metrics")
+    def _compute_comparison_metrics(self) -> Dict:
+        """Compute comparison metrics between paper algorithm and supervised model"""
+        if not self.paper_results or not self.supervised_results:
+            print("⚠️ Incomplete results for comparison metrics")
             return {}
 
-        print("📊 Computing paper algorithm metrics...")
+        print("📊 Computing comparison metrics...")
 
         metrics = {
             'trust_convergence': {},
-            'final_trust_values': {}
+            'final_trust_values': {},
+            'method_differences': {}
+        }
+
+        method_results = {
+            'paper': self.paper_results,
+            'supervised': self.supervised_results
         }
 
         robot_ids = list(self.paper_results[0]['robot_trust_values'].keys())
         adversarial_ids = set(self.paper_results[0]['adversarial_robots'])
         legitimate_ids = set(self.paper_results[0]['legitimate_robots'])
 
+        # Compute per-robot metrics for each method
         for robot_id in robot_ids:
             robot_type = 'adversarial' if robot_id in adversarial_ids else 'legitimate'
-            series = [step['robot_trust_values'][robot_id] for step in self.paper_results]
-            values = np.array(series)
+            method_stats = {}
+
+            for method, results in method_results.items():
+                series = [step['robot_trust_values'][robot_id] for step in results]
+                values = np.array(series)
+                method_stats[method] = {
+                    'final': float(values[-1]),
+                    'mean': float(np.mean(values)),
+                    'std': float(np.std(values))
+                }
 
             metrics['trust_convergence'][robot_id] = {
                 'robot_type': robot_type,
-                'final': float(values[-1]),
-                'mean': float(np.mean(values)),
-                'std': float(np.std(values))
+                **method_stats
             }
 
-        # Aggregate metrics by robot type
+        # Aggregate metrics by robot type and method
         for robot_type, id_set in [('legitimate', legitimate_ids), ('adversarial', adversarial_ids)]:
             if not id_set:
                 continue
-            finals = [metrics['trust_convergence'][rid]['final'] for rid in id_set]
-            metrics['final_trust_values'][robot_type] = {
-                'mean': float(np.mean(finals)),
-                'std': float(np.std(finals))
-            }
 
-        print("✅ Metrics computed")
+            metrics['final_trust_values'][robot_type] = {}
+
+            for method in ['paper', 'supervised']:
+                finals = [metrics['trust_convergence'][rid][method]['final'] for rid in id_set]
+                metrics['final_trust_values'][robot_type][method] = {
+                    'mean': float(np.mean(finals)),
+                    'std': float(np.std(finals))
+                }
+
+        # Compute method differences
+        all_paper_finals = []
+        all_supervised_finals = []
+        for robot_id in robot_ids:
+            all_paper_finals.append(metrics['trust_convergence'][robot_id]['paper']['final'])
+            all_supervised_finals.append(metrics['trust_convergence'][robot_id]['supervised']['final'])
+
+        differences = np.array(all_supervised_finals) - np.array(all_paper_finals)
+        metrics['method_differences']['supervised_minus_paper'] = {
+            'mean': float(np.mean(differences)),
+            'std': float(np.std(differences))
+        }
+
+        print("✅ Comparison metrics computed")
         return metrics
 
-    def save_results(self, filename: str = "paper_algorithm_results.json"):
-        """Save paper algorithm results to file"""
+    def save_results(self, filename: str = "trust_comparison_results.json"):
+        """Save comparison results to file"""
         results = {
             'configuration': {
                 'robot_density': self.robot_density,
@@ -431,7 +607,8 @@ class TrustMethodComparison:
                 'random_seed': self.random_seed
             },
             'paper_results': self.paper_results,
-            'metrics': self._compute_paper_metrics()
+            'supervised_results': self.supervised_results,
+            'metrics': self._compute_comparison_metrics()
         }
 
         # Convert numpy types to Python native types for JSON serialization
@@ -457,38 +634,42 @@ class TrustMethodComparison:
         print(f"📁 Results saved to {filename}")
         return filename
 
-    def visualize_results(self, save_path: str = "paper_algorithm_results.png"):
-        """Create visualization of paper algorithm results"""
-        if not self.paper_results:
-            print("⚠️ No results available for visualization")
+    def visualize_results(self, save_path: str = "trust_comparison_results.png"):
+        """Create visualization comparing paper algorithm and supervised model"""
+        if not self.paper_results or not self.supervised_results:
+            print("⚠️ Incomplete results for visualization")
             return
 
-        print("📈 Creating visualization...")
+        print("📈 Creating comparison visualization...")
 
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        fig.suptitle('Paper Trust Algorithm Results', fontsize=16, fontweight='bold')
+        fig.suptitle('Trust Method Comparison: Paper Algorithm vs Supervised Model', fontsize=16, fontweight='bold')
 
         timesteps = [step['step'] for step in self.paper_results]
         adversarial_robots = self.paper_results[0]['adversarial_robots']
         legitimate_robots = self.paper_results[0]['legitimate_robots']
 
-        # Plot 1: Legitimate robots
+        # Plot 1: Legitimate robots comparison
         ax1 = axes[0, 0]
-        for robot_id in legitimate_robots:
-            trust_values = [step['robot_trust_values'][robot_id] for step in self.paper_results]
-            ax1.plot(timesteps, trust_values, label=f'Robot {robot_id}')
+        for robot_id in legitimate_robots[:3]:  # Limit to 3 robots for clarity
+            paper_trust = [step['robot_trust_values'][robot_id] for step in self.paper_results]
+            supervised_trust = [step['robot_trust_values'][robot_id] for step in self.supervised_results]
+            ax1.plot(timesteps, paper_trust, label=f'Paper R{robot_id}', linestyle='-', alpha=0.7)
+            ax1.plot(timesteps, supervised_trust, label=f'Supervised R{robot_id}', linestyle='--', alpha=0.7)
         ax1.set_title('Legitimate Robots Trust Evolution')
         ax1.set_xlabel('Simulation Step')
         ax1.set_ylabel('Trust Value')
-        ax1.legend()
+        ax1.legend(fontsize=8)
         ax1.grid(True, alpha=0.3)
 
-        # Plot 2: Adversarial robots
+        # Plot 2: Adversarial robots comparison
         ax2 = axes[0, 1]
         if adversarial_robots:
-            for robot_id in adversarial_robots:
-                trust_values = [step['robot_trust_values'][robot_id] for step in self.paper_results]
-                ax2.plot(timesteps, trust_values, label=f'Robot {robot_id}')
+            for robot_id in adversarial_robots[:3]:  # Limit to 3 robots for clarity
+                paper_trust = [step['robot_trust_values'][robot_id] for step in self.paper_results]
+                supervised_trust = [step['robot_trust_values'][robot_id] for step in self.supervised_results]
+                ax2.plot(timesteps, paper_trust, label=f'Paper R{robot_id}', linestyle='-', alpha=0.7)
+                ax2.plot(timesteps, supervised_trust, label=f'Supervised R{robot_id}', linestyle='--', alpha=0.7)
         else:
             ax2.text(0.5, 0.5, 'No Adversarial Robots\nin this Scenario',
                      horizontalalignment='center', verticalalignment='center',
@@ -496,76 +677,85 @@ class TrustMethodComparison:
         ax2.set_title('Adversarial Robots Trust Evolution')
         ax2.set_xlabel('Simulation Step')
         ax2.set_ylabel('Trust Value')
-        ax2.legend()
+        ax2.legend(fontsize=8)
         ax2.grid(True, alpha=0.3)
 
-        # Plot 3: Average trust over time
+        # Plot 3: Average trust by robot type
         ax3 = axes[1, 0]
-        leg_avg = np.mean([[step['robot_trust_values'][rid] for rid in legitimate_robots]
-                           for step in self.paper_results], axis=1)
-        ax3.plot(timesteps, leg_avg, label='Legitimate', linewidth=2, color='tab:green')
+        paper_leg_avg = np.mean([[step['robot_trust_values'][rid] for rid in legitimate_robots]
+                                 for step in self.paper_results], axis=1)
+        supervised_leg_avg = np.mean([[step['robot_trust_values'][rid] for rid in legitimate_robots]
+                                      for step in self.supervised_results], axis=1)
+        ax3.plot(timesteps, paper_leg_avg, label='Paper - Legitimate', color='green', linestyle='-', linewidth=2)
+        ax3.plot(timesteps, supervised_leg_avg, label='Supervised - Legitimate', color='green', linestyle='--', linewidth=2)
+
         if adversarial_robots:
-            adv_avg = np.mean([[step['robot_trust_values'][rid] for rid in adversarial_robots]
-                               for step in self.paper_results], axis=1)
-            ax3.plot(timesteps, adv_avg, label='Adversarial', linewidth=2, color='tab:red')
-        ax3.set_title('Average Trust by Robot Type')
+            paper_adv_avg = np.mean([[step['robot_trust_values'][rid] for rid in adversarial_robots]
+                                     for step in self.paper_results], axis=1)
+            supervised_adv_avg = np.mean([[step['robot_trust_values'][rid] for rid in adversarial_robots]
+                                          for step in self.supervised_results], axis=1)
+            ax3.plot(timesteps, paper_adv_avg, label='Paper - Adversarial', color='red', linestyle='-', linewidth=2)
+            ax3.plot(timesteps, supervised_adv_avg, label='Supervised - Adversarial', color='red', linestyle='--', linewidth=2)
+
+        ax3.set_title('Average Trust by Robot Type and Method')
         ax3.set_xlabel('Simulation Step')
         ax3.set_ylabel('Average Trust Value')
         ax3.legend()
         ax3.grid(True, alpha=0.3)
 
-        # Plot 4: Final trust values by robot type
+        # Plot 4: Final trust comparison
         ax4 = axes[1, 1]
+        final_paper_leg = [self.paper_results[-1]['robot_trust_values'][rid] for rid in legitimate_robots]
+        final_supervised_leg = [self.supervised_results[-1]['robot_trust_values'][rid] for rid in legitimate_robots]
+        final_paper_adv = [self.paper_results[-1]['robot_trust_values'][rid] for rid in adversarial_robots] if adversarial_robots else []
+        final_supervised_adv = [self.supervised_results[-1]['robot_trust_values'][rid] for rid in adversarial_robots] if adversarial_robots else []
+
         categories = []
         means = []
         stds = []
         colors = []
 
-        # Legitimate robots
-        final_leg = [self.paper_results[-1]['robot_trust_values'][rid] for rid in legitimate_robots]
-        categories.append('Legitimate')
-        means.append(np.mean(final_leg))
-        stds.append(np.std(final_leg))
-        colors.append('tab:green')
+        categories.extend(['Paper\nLegitimate', 'Supervised\nLegitimate'])
+        means.extend([np.mean(final_paper_leg), np.mean(final_supervised_leg)])
+        stds.extend([np.std(final_paper_leg), np.std(final_supervised_leg)])
+        colors.extend(['lightgreen', 'darkgreen'])
 
-        # Adversarial robots
         if adversarial_robots:
-            final_adv = [self.paper_results[-1]['robot_trust_values'][rid] for rid in adversarial_robots]
-            categories.append('Adversarial')
-            means.append(np.mean(final_adv))
-            stds.append(np.std(final_adv))
-            colors.append('tab:red')
+            categories.extend(['Paper\nAdversarial', 'Supervised\nAdversarial'])
+            means.extend([np.mean(final_paper_adv), np.mean(final_supervised_adv)])
+            stds.extend([np.std(final_paper_adv), np.std(final_supervised_adv)])
+            colors.extend(['lightcoral', 'darkred'])
 
         x_pos = np.arange(len(categories))
-        bars = ax4.bar(x_pos, means, yerr=stds, capsize=5, color=colors, alpha=0.8)
-        ax4.set_title('Final Trust Values by Robot Type')
+        bars = ax4.bar(x_pos, means, yerr=stds, capsize=5, color=colors, alpha=0.7)
+        ax4.set_title('Final Trust Values Comparison')
         ax4.set_ylabel('Final Trust Value')
         ax4.set_xticks(x_pos)
-        ax4.set_xticklabels(categories)
+        ax4.set_xticklabels(categories, fontsize=9)
         ax4.grid(True, alpha=0.3, axis='y')
 
         for bar, mean in zip(bars, means):
             height = bar.get_height()
             ax4.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                     f'{mean:.3f}', ha='center', va='bottom', fontweight='bold')
+                     f'{mean:.3f}', ha='center', va='bottom', fontweight='bold', fontsize=8)
 
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        plt.show()
+        plt.close()
 
         print(f"📊 Visualization saved to {save_path}")
 
     def print_summary(self):
-        """Print simulation summary"""
-        if not self.paper_results:
-            print("⚠️ No paper algorithm results available for summary")
+        """Print comparison summary"""
+        if not self.paper_results or not self.supervised_results:
+            print("⚠️ Incomplete results for summary")
             return
 
-        print("\n" + "="*60)
-        print("🎯 PAPER ALGORITHM SIMULATION SUMMARY")
-        print("="*60)
+        print("\n" + "="*70)
+        print("🎯 TRUST METHOD COMPARISON SUMMARY")
+        print("="*70)
 
-        metrics = self._compute_paper_metrics()
+        metrics = self._compute_comparison_metrics()
 
         print(
             f"Configuration: world={self.world_size}m, robots≈{self.num_robots} "
@@ -574,33 +764,23 @@ class TrustMethodComparison:
             f"steps={self.num_timesteps}, seed {self.random_seed}"
         )
 
-        # Final trust values by robot type
+        # Final trust values by robot type and method
         if 'final_trust_values' in metrics:
-            print("\n📊 Final Trust Values:")
-            for robot_type, stats in metrics['final_trust_values'].items():
-                print(f"  {robot_type.title()} Robots: {stats['mean']:.3f} ± {stats['std']:.3f}")
+            print("\n📊 Final Trust Values Comparison:")
+            for robot_type in ['legitimate', 'adversarial']:
+                if robot_type in metrics['final_trust_values']:
+                    print(f"\n  {robot_type.title()} Robots:")
+                    for method in ['paper', 'supervised']:
+                        if method in metrics['final_trust_values'][robot_type]:
+                            stats = metrics['final_trust_values'][robot_type][method]
+                            print(f"    {method.title()}: {stats['mean']:.3f} ± {stats['std']:.3f}")
 
-        # Individual robot results
-        print("\n🤖 Individual Robot Results:")
-        legitimate_robots = self.paper_results[0]['legitimate_robots']
-        adversarial_robots = self.paper_results[0]['adversarial_robots']
+        # Method differences
+        if 'method_differences' in metrics:
+            diff = metrics['method_differences']['supervised_minus_paper']
+            print(f"\n📈 Supervised vs Paper Difference: {diff['mean']:+.3f} ± {diff['std']:.3f}")
 
-        print("  Legitimate Robots:")
-        for robot_id in legitimate_robots:
-            if robot_id in metrics['trust_convergence']:
-                conv = metrics['trust_convergence'][robot_id]
-                print(f"    Robot {robot_id}: Final={conv['final']:.3f}, "
-                      f"Mean={conv['mean']:.3f}, Std={conv['std']:.3f}")
-
-        if adversarial_robots:
-            print("  Adversarial Robots:")
-            for robot_id in adversarial_robots:
-                if robot_id in metrics['trust_convergence']:
-                    conv = metrics['trust_convergence'][robot_id]
-                    print(f"    Robot {robot_id}: Final={conv['final']:.3f}, "
-                          f"Mean={conv['mean']:.3f}, Std={conv['std']:.3f}")
-
-        print("\n✨ Simulation completed successfully!")
+        print("\n✨ Comparison completed successfully!")
 
 
 def main():
@@ -707,7 +887,7 @@ def main():
 
             # Create visualization
             viz_file = f"trust_comparison_{scenario['name']}.png"
-            comparison.visualize_comparison(viz_file)
+            comparison.visualize_results(viz_file)
 
             # Extract summary statistics
             metrics = results['comparison_metrics']
@@ -720,16 +900,12 @@ def main():
                     'scenario': scenario['name'],
                     'false_positive_rate': scenario['false_positive_rate'],
                     'false_negative_rate': scenario['false_negative_rate'],
-                    'fixed_step_scale': comparison.fixed_step_scale,
                     'target_density_multiplier': comparison.target_density_multiplier,
                     'legitimate_paper': legit_stats.get('paper', {}).get('mean', 0),
-                    'legitimate_baseline': legit_stats.get('baseline', {}).get('mean', 0),
-                    'legitimate_mass': legit_stats.get('mass', {}).get('mean', 0),
+                    'legitimate_supervised': legit_stats.get('supervised', {}).get('mean', 0),
                     'adversarial_paper': adv_stats.get('paper', {}).get('mean', 0),
-                    'adversarial_baseline': adv_stats.get('baseline', {}).get('mean', 0),
-                    'adversarial_mass': adv_stats.get('mass', {}).get('mean', 0),
-                    'mass_minus_paper': diff_stats.get('mass_minus_paper', {}).get('mean', 0),
-                    'mass_minus_baseline': diff_stats.get('mass_minus_baseline', {}).get('mean', 0)
+                    'adversarial_supervised': adv_stats.get('supervised', {}).get('mean', 0),
+                    'supervised_minus_paper': diff_stats.get('supervised_minus_paper', {}).get('mean', 0),
                 }
                 summary_stats.append(scenario_summary)
 
@@ -751,34 +927,48 @@ def main():
 
     if summary_stats:
         print("\n📊 Performance Summary:")
-        header = "Scenario Name               | FP Rate | FN Rate | Leg (P/B/M)        | Adv (P/B/M)        | M-P Δ   | M-B Δ"
+        header = "Scenario Name               | FP Rate | FN Rate | Leg (P/S)      | Adv (P/S)      | S-P Δ"
         print(header)
         print("-" * len(header))
 
         for stat in summary_stats:
             print(f"{stat['scenario']:<26} | "
-                  f"{stat['false_positive_rate']:<7} | "
-                  f"{stat['false_negative_rate']:<7} | "
-                  f"{stat['legitimate_paper']:.3f}/{stat['legitimate_baseline']:.3f}/{stat['legitimate_mass']:.3f} | "
-                  f"{stat['adversarial_paper']:.3f}/{stat['adversarial_baseline']:.3f}/{stat['adversarial_mass']:.3f} | "
-                  f"{stat['mass_minus_paper']:+.3f} | {stat['mass_minus_baseline']:+.3f}")
+                  f"{stat['false_positive_rate']:<7.1f} | "
+                  f"{stat['false_negative_rate']:<7.1f} | "
+                  f"{stat['legitimate_paper']:.3f}/{stat['legitimate_supervised']:.3f} | "
+                  f"{stat['adversarial_paper']:.3f}/{stat['adversarial_supervised']:.3f} | "
+                  f"{stat['supervised_minus_paper']:+.3f}")
 
-        avg_mass_minus_paper = np.mean([s['mass_minus_paper'] for s in summary_stats])
-        avg_mass_minus_baseline = np.mean([s['mass_minus_baseline'] for s in summary_stats])
+        avg_leg_paper = np.mean([s['legitimate_paper'] for s in summary_stats])
+        avg_leg_supervised = np.mean([s['legitimate_supervised'] for s in summary_stats])
+        avg_adv_paper = np.mean([s['adversarial_paper'] for s in summary_stats])
+        avg_adv_supervised = np.mean([s['adversarial_supervised'] for s in summary_stats])
+        avg_diff = np.mean([s['supervised_minus_paper'] for s in summary_stats])
 
         print("-" * len(header))
-        print(f"{'AVERAGE':<26} | {'':>7} | {'':>7} | {'':>18} | {'':>18} | {avg_mass_minus_paper:+.3f} | {avg_mass_minus_baseline:+.3f}")
+        print(f"{'AVERAGE':<26} | {'':>7} | {'':>7} | "
+              f"{avg_leg_paper:.3f}/{avg_leg_supervised:.3f} | "
+              f"{avg_adv_paper:.3f}/{avg_adv_supervised:.3f} | "
+              f"{avg_diff:+.3f}")
 
         print(f"\n🔍 Key Findings:")
-        print(f"   • Average Mass-Based vs Paper final trust difference: {avg_mass_minus_paper:+.3f}")
-        print(f"   • Average Mass-Based vs Baseline final trust difference: {avg_mass_minus_baseline:+.3f}")
+        print(f"   • Paper Algorithm:")
+        print(f"     - Legitimate: {avg_leg_paper:.3f}")
+        print(f"     - Adversarial: {avg_adv_paper:.3f}")
+        print(f"     - Gap: {avg_leg_paper - avg_adv_paper:+.3f}")
+        print(f"   • Supervised Model:")
+        print(f"     - Legitimate: {avg_leg_supervised:.3f}")
+        print(f"     - Adversarial: {avg_adv_supervised:.3f}")
+        print(f"     - Gap: {avg_leg_supervised - avg_adv_supervised:+.3f}")
+        print(f"   • Average Supervised vs Paper Difference: {avg_diff:+.3f}")
 
         print(f"\n📈 Scenario Analysis:")
         for stat in summary_stats:
             print(f"   • {stat['scenario']}:")
             print(f"     - FP/FN rates: {stat['false_positive_rate']:.1f}/{stat['false_negative_rate']:.1f}")
-            print(f"     - Mass vs Paper: {stat['mass_minus_paper']:+.3f}")
-            print(f"     - Mass vs Baseline: {stat['mass_minus_baseline']:+.3f}")
+            print(f"     - Paper:      Leg={stat['legitimate_paper']:.3f}, Adv={stat['adversarial_paper']:.3f}")
+            print(f"     - Supervised: Leg={stat['legitimate_supervised']:.3f}, Adv={stat['adversarial_supervised']:.3f}")
+            print(f"     - Difference: {stat['supervised_minus_paper']:+.3f}")
 
     # Save comprehensive results using centralized parameters
     comprehensive_results = {
@@ -797,8 +987,7 @@ def main():
             'fov_angle': 'π/3',
             'num_timesteps': NUM_TIMESTEPS,
             'random_seed': RANDOM_SEED,
-            'trust_update_method': 'mass_based',
-            'fixed_step_scale': summary_stats[0]['fixed_step_scale'] if summary_stats else 0.5
+            'trust_update_method': 'paper_algorithm'
         }
     }
 
