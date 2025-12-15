@@ -235,30 +235,30 @@ class SupervisedDataGenerator:
         num_robots = max(1, int(round(robot_density * area)))
         num_targets = max(1, int(round(target_density * area)))
 
-        # Sample adversarial_ratio with increment of 0.1
+        # Sample adversarial_ratio with increment of 0.05
         min_adv, max_adv = self.adversarial_ratio_range
-        adv_steps = int((max_adv - min_adv) / 0.1)
+        adv_steps = int((max_adv - min_adv) / 0.05)
         if adv_steps > 0:
             adv_step = random.randint(0, adv_steps)
-            adversarial_ratio = round(min_adv + (adv_step * 0.1), 1)
+            adversarial_ratio = round(min_adv + (adv_step * 0.05), 2)
         else:
             adversarial_ratio = min_adv
 
-        # Sample false_positive_rate with increment of 0.1
+        # Sample false_positive_rate with increment of 0.05
         min_fp, max_fp = self.false_positive_rate_range
-        fp_steps = int((max_fp - min_fp) / 0.1)
+        fp_steps = int((max_fp - min_fp) / 0.05)
         if fp_steps > 0:
             fp_step = random.randint(0, fp_steps)
-            false_positive_rate = round(min_fp + (fp_step * 0.1), 1)
+            false_positive_rate = round(min_fp + (fp_step * 0.05), 2)
         else:
             false_positive_rate = min_fp
 
-        # Sample false_negative_rate with increment of 0.1
+        # Sample false_negative_rate with increment of 0.05
         min_fn, max_fn = self.false_negative_rate_range
-        fn_steps = int((max_fn - min_fn) / 0.1)
+        fn_steps = int((max_fn - min_fn) / 0.05)
         if fn_steps > 0:
             fn_step = random.randint(0, fn_steps)
-            false_negative_rate = round(min_fn + (fn_step * 0.1), 1)
+            false_negative_rate = round(min_fn + (fn_step * 0.05), 2)
         else:
             false_negative_rate = min_fn
 
@@ -296,42 +296,6 @@ class SupervisedDataGenerator:
 
         # Update ego graph builder with fixed proximal range
         self.ego_graph_builder = EgoGraphBuilder(proximal_range=params['proximal_range'])
-
-    def _check_adversarial_has_contradicts(self, ego_robot, ego_graph: HeteroData) -> bool:
-        """
-        Check if adversarial ego robot has at least one contradicts edge.
-
-        Adversarial robots with ZERO contradicts edges are nearly impossible to distinguish
-        from legitimate robots using only ego graph edges. We filter these out during
-        data generation.
-
-        Args:
-            ego_robot: The ego robot object
-            ego_graph: Ego graph with edge_index_dict
-
-        Returns:
-            True if ego robot is legitimate OR (ego robot is adversarial AND has contradicts edges)
-            False if ego robot is adversarial AND has ZERO contradicts edges
-        """
-        # If ego robot is legitimate, always return True (no filtering needed)
-        if not ego_robot.is_adversarial:
-            return True
-
-        # Ego robot is adversarial - check if it has contradicts edges
-        edge_index_dict = ego_graph.edge_index_dict
-        EGO_IDX = 0
-
-        # Check for contradicts edges where ego robot is the SOURCE
-        if ('agent', 'contradicts', 'agent') in edge_index_dict:
-            contradicts_edges = edge_index_dict[('agent', 'contradicts', 'agent')]
-            if contradicts_edges.numel() > 0:
-                # Count contradicts edges where ego (index 0) is the source
-                ego_contradicts_count = (contradicts_edges[0, :] == EGO_IDX).sum().item()
-                if ego_contradicts_count > 0:
-                    return True  # Adversarial with at least 1 contradicts edge - KEEP
-
-        # Adversarial robot with ZERO contradicts edges - REJECT
-        return False
 
     def _check_ego_cross_validation(self, ego_graph: HeteroData) -> bool:
         """
@@ -644,7 +608,6 @@ class SupervisedDataGenerator:
 
         # Track filtering statistics
         filtered_no_cross_validation = 0
-        filtered_adversarial_no_contradicts = 0
         filtered_no_meaningful_tracks = 0
 
         for step in range(self.max_steps_per_episode):
@@ -764,13 +727,11 @@ class SupervisedDataGenerator:
 
         # Report filtering statistics
         total_filtered = (filtered_no_cross_validation +
-                         filtered_adversarial_no_contradicts +
                          filtered_no_meaningful_tracks)
         print(f"Generated {len(episode_data)} samples for episode {episode_idx}")
         if total_filtered > 0:
             print(f"  Filtered out {total_filtered} samples:")
             print(f"    - No cross-validation: {filtered_no_cross_validation}")
-            print(f"    - Adversarial with 0 contradicts: {filtered_adversarial_no_contradicts} ⚠️")
             print(f"    - No meaningful tracks: {filtered_no_meaningful_tracks}")
         return episode_data, episode_params
 
@@ -1083,12 +1044,12 @@ def main():
                        help='Robot density range in robots per square unit (default: 0.0005,0.0020)')
     parser.add_argument('--target-density-multiplier', type=str, default='2.0',
                        help='Target density multiplier applied to sampled robot density (default: 2.0)')
-    parser.add_argument('--adversarial-ratio', type=str, default='0.0,0.5',
-                       help='Adversarial robot ratio: single value or range "min,max" (default: 0.0,0.5)')
-    parser.add_argument('--false-positive-rate', type=str, default='0.0,0.5',
-                       help='False positive rate: single value or range "min,max" (default: 0.0,0.5)')
-    parser.add_argument('--false-negative-rate', type=str, default='0.0,0.5',
-                       help='False negative rate: single value or range "min,max" (default: 0.0,0.5)')
+    parser.add_argument('--adversarial-ratio', type=str, default='0.1,0.3',
+                       help='Adversarial robot ratio: single value or range "min,max" (default: 0.1,0.3)')
+    parser.add_argument('--false-positive-rate', type=str, default='0.1,0.3',
+                       help='False positive rate: single value or range "min,max" (default: 0.1,0.3)')
+    parser.add_argument('--false-negative-rate', type=str, default='0.0,0.3',
+                       help='False negative rate: single value or range "min,max" (default: 0.0,0.3)')
     parser.add_argument('--world-size', type=float, default=100.0,
                        help='Side length of the square world (fixed, default: 100.0)')
     parser.add_argument('--proximal-range', type=float, default=50.0,
