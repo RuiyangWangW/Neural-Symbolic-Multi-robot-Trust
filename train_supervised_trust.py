@@ -283,8 +283,9 @@ class SupervisedTrustTrainer:
             self.optimizer, mode='min', factor=0.7, patience=10
         )
 
-        # Binary cross-entropy loss for classification with mean reduction
-        self.criterion = nn.BCELoss(reduction='mean')
+        # Binary cross-entropy loss for classification with sum reduction
+        # Using 'sum' allows proper normalization by total component count across variable-sized graphs
+        self.criterion = nn.BCELoss(reduction='sum')
 
         # Training history
         self.train_losses = []
@@ -440,6 +441,14 @@ class SupervisedTrustTrainer:
                     track_loss_value = track_loss.item()
                     track_loss_count = len(meaningful_track_indices)
 
+        # Normalize by total component count (agents + tracks) for proper gradient scaling
+        # This ensures each component contributes equally regardless of graph size
+        total_components = agent_loss_count + track_loss_count
+        if total_components > 0:
+            normalized_loss = loss / total_components
+        else:
+            normalized_loss = 0.0
+
         loss_components = {
             'agent_loss': agent_loss_value,
             'track_loss': track_loss_value,
@@ -447,7 +456,7 @@ class SupervisedTrustTrainer:
             'track_count': track_loss_count,
         }
 
-        return loss, loss_components
+        return normalized_loss, loss_components
 
     def _compute_metrics(self, predictions: Dict, labels: Dict) -> Dict:
         """
@@ -780,6 +789,14 @@ class SupervisedTrustTrainer:
 
             total_loss += graph_loss
 
+        # Normalize by total component count (agents + tracks) for proper gradient scaling
+        # This ensures each component contributes equally regardless of graph size
+        total_components = total_agent_count + total_track_count
+        if total_components > 0:
+            normalized_loss = total_loss / total_components
+        else:
+            normalized_loss = torch.tensor(0.0, device=self.device)
+
         loss_components = {
             'agent_loss': total_agent_loss,
             'track_loss': total_track_loss,
@@ -787,7 +804,7 @@ class SupervisedTrustTrainer:
             'track_count': total_track_count,
         }
 
-        return total_loss, loss_components
+        return normalized_loss, loss_components
 
     def _compute_batched_metrics(self, predictions: Dict, agent_labels: torch.Tensor,
                                   track_labels: torch.Tensor, ego_robot_indices: List[int],
@@ -885,10 +902,9 @@ class SupervisedTrustTrainer:
                     current_batch_size = batch_data['batch_size']
 
                     if loss > 0:
-                        # Normalize loss by batch size before backward to prevent exploding gradients
-                        # (batched loss is sum of per-sample losses, so gradients scale with batch size)
-                        normalized_loss = loss / current_batch_size
-                        normalized_loss.backward()
+                        # Loss is already normalized by total component count in compute_loss_batched
+                        # This ensures proper gradient scaling regardless of graph sizes
+                        loss.backward()
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                         self.optimizer.step()
 

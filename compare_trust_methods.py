@@ -221,7 +221,12 @@ class TrustMethodComparison:
                         continue
 
                     # Update alpha/beta values based on model predictions
-                    self._update_trust_from_predictions(result['predictions'], result['graph_data'])
+                    # Only updates: (1) ego robot, (2) meaningful tracks
+                    self._update_trust_from_predictions(
+                        result['predictions'],
+                        result['graph_data'],
+                        result['meaningful_track_indices']
+                    )
 
                 except Exception as e:
                     print(f"⚠️ Supervised model error for robot {ego_robot.id} at step {step}: {e}")
@@ -262,50 +267,54 @@ class TrustMethodComparison:
         print("✅ Supervised model simulation completed")
         return results
 
-    def _update_trust_from_predictions(self, predictions: Dict, graph_data):
+    def _update_trust_from_predictions(self, predictions: Dict, graph_data, meaningful_track_indices: List[int]):
         """
-        Update alpha/beta values based on supervised model predictions using correct node mappings
+        Update alpha/beta values based on supervised model predictions
+
+        IMPORTANT: Only updates:
+        1. Ego robot (index 0 in the graph)
+        2. Meaningful tracks (those in meaningful_track_indices)
 
         Args:
             predictions: Model predictions containing trust probabilities
             graph_data: Graph data with node mappings (agent_nodes, track_nodes)
+            meaningful_track_indices: List of track indices that pass cross-validation
         """
 
-        # Update agent (robot) trust values using correct mappings
+        # Update ONLY ego robot (index 0 in the graph)
         if 'agent' in predictions and hasattr(graph_data, 'agent_nodes'):
             agent_probs = predictions['agent']['probabilities']
 
-            # Use the exact node mapping from graph_data
-            for robot_id, node_idx in graph_data.agent_nodes.items():
-                if node_idx < len(agent_probs):
-                    p = agent_probs[node_idx][0]  # Extract probability from array
+            # Ego robot is always at index 0
+            ego_idx = 0
+            if ego_idx < len(agent_probs):
+                p = agent_probs[ego_idx][0]  # Extract probability from array
 
-                    # Convert probability to alpha/beta update
-                    if p >= 0.5:
-                        # High trust prediction - increase alpha
-                        delta_alpha = p
-                        delta_beta = 0.0
-                    else:
-                        # Low trust prediction - increase beta
-                        delta_alpha = 0.0
-                        delta_beta = (1 - p)
+                # Convert probability to alpha/beta update
+                if p >= 0.5:
+                    # High trust prediction - increase alpha
+                    delta_alpha = p
+                    delta_beta = 0.0
+                else:
+                    # Low trust prediction - increase beta
+                    delta_alpha = 0.0
+                    delta_beta = (1 - p)
 
-                    # Find the robot object and apply update
-                    for robot in graph_data._proximal_robots:
-                        if robot.id == robot_id:
-                            # Apply update with small step size to prevent rapid changes
-                            step_size = 0.1
-                            robot.update_trust(delta_alpha * step_size, delta_beta * step_size)
-                            break
+                # Find ego robot object (first robot in proximal_robots list)
+                ego_robot = graph_data._proximal_robots[0]
+                ego_robot.update_trust(delta_alpha, delta_beta)
 
-        # Update track trust values using correct mappings
-        if 'track' in predictions and hasattr(graph_data, 'track_nodes'):
+        # Update ONLY meaningful tracks (those that pass cross-validation)
+        if 'track' in predictions and hasattr(graph_data, 'track_nodes') and meaningful_track_indices:
             track_probs = predictions['track']['probabilities']
 
-            # Use the exact node mapping from graph_data
-            for track_id, node_idx in graph_data.track_nodes.items():
-                if node_idx < len(track_probs):
-                    p = track_probs[node_idx][0]  # Extract probability from array
+            # Get reverse mapping: graph_index -> track_id
+            index_to_track_id = {node_idx: track_id for track_id, node_idx in graph_data.track_nodes.items()}
+
+            # Update only meaningful tracks
+            for track_idx in meaningful_track_indices:
+                if track_idx < len(track_probs):
+                    p = track_probs[track_idx][0]  # Extract probability from array
 
                     # Convert probability to alpha/beta update
                     if p >= 0.5:
@@ -317,14 +326,15 @@ class TrustMethodComparison:
                         delta_alpha = 0.0
                         delta_beta = (1 - p)
 
-                    # Find the track object and apply update
-                    for robot in graph_data._proximal_robots:
-                        for track in robot.get_all_tracks():
-                            if track.track_id == track_id:
-                                # Apply update with small step size
-                                step_size = 0.1
-                                track.update_trust(delta_alpha * step_size, delta_beta * step_size)
-                                break
+                    # Find the track object using the mapping
+                    track_id = index_to_track_id.get(track_idx)
+                    if track_id:
+                        # Find track in proximal robots' track lists
+                        for robot in graph_data._proximal_robots:
+                            for track in robot.get_all_tracks():
+                                if track.track_id == track_id:
+                                    track.update_trust(delta_alpha, delta_beta)
+                                    break
 
     def _run_trust_simulation(self, env: SimulationEnvironment, trust_system, label: str) -> List[Dict]:
         """Shared simulation loop for trust systems (baseline or mass-based)."""
