@@ -17,10 +17,8 @@ from typing import Dict, List, Tuple, Optional
 # Import required modules
 from simulation_environment import SimulationEnvironment
 from paper_trust_algorithm import PaperTrustAlgorithm
-from supervised_trust_gnn import SupervisedTrustPredictor
+from supervised_trust_algorithm import SupervisedTrustAlgorithm
 from robot_track_classes import Robot, Track
-
-# Trust update components removed - using only paper algorithm
 
 
 class TrustMethodComparison:
@@ -78,7 +76,7 @@ class TrustMethodComparison:
 
         # Initialize trust methods
         self.paper_algorithm = PaperTrustAlgorithm()
-        self.supervised_predictor = None
+        self.supervised_algorithm = None
 
         # Results storage
         self.paper_results = []
@@ -93,13 +91,16 @@ class TrustMethodComparison:
         # Try to load supervised model after proximal_range is set
         try:
             gnn_path_str = str(self.supervised_model_path) if self.supervised_model_path else None
-            self.supervised_predictor = SupervisedTrustPredictor(gnn_path_str, proximal_range=self.proximal_range)
+            self.supervised_algorithm = SupervisedTrustAlgorithm(
+                model_path=gnn_path_str,
+                proximal_range=self.proximal_range
+            )
             if self.supervised_model_path and self.supervised_model_path.exists():
-                print(f"✅ Supervised trust predictor ready ({gnn_path_str})")
+                print(f"✅ Supervised trust algorithm ready ({gnn_path_str})")
             else:
-                print("ℹ️ Supervised trust predictor initialized with fresh weights")
+                print("ℹ️ Supervised trust algorithm initialized with fresh weights")
         except Exception as e:
-            print(f"⚠️ Failed to initialize supervised predictor: {e}")
+            print(f"⚠️ Failed to initialize supervised algorithm: {e}")
 
     def create_identical_environments(self, count: int = 2) -> List[SimulationEnvironment]:
         """Create identical simulation environments."""
@@ -186,9 +187,9 @@ class TrustMethodComparison:
         return results
 
     def run_supervised_model_simulation(self, env: SimulationEnvironment) -> List[Dict]:
-        """Run simulation using supervised trust model"""
-        if self.supervised_predictor is None:
-            print("❌ Supervised model not available, skipping")
+        """Run simulation using supervised trust algorithm"""
+        if self.supervised_algorithm is None:
+            print("❌ Supervised algorithm not available, skipping")
             return []
 
         print("🚀 Running supervised model simulation...")
@@ -208,28 +209,13 @@ class TrustMethodComparison:
             for robot in env.robots:
                 robot.update_current_timestep_tracks()
 
-            # Apply supervised model predictions for each robot's ego graph
-            for ego_robot in env.robots:
-                try:
-                    # Get predictions from supervised model
-                    result = self.supervised_predictor.predict_from_robots_tracks(
-                        ego_robot, env.robots, threshold=0.5
-                    )
-
-                    # Check if result is None (no cross-validation or meaningful tracks)
-                    if result is None:
-                        continue
-
-                    # Update alpha/beta values based on model predictions
-                    # Only updates: (1) ego robot, (2) meaningful tracks
-                    self._update_trust_from_predictions(
-                        result['predictions'],
-                        result['graph_data'],
-                        result['meaningful_track_indices']
-                    )
-
-                except Exception as e:
-                    print(f"⚠️ Supervised model error for robot {ego_robot.id} at step {step}: {e}")
+            # Apply supervised trust algorithm
+            # This internally loops over all robots as ego and updates their trust
+            try:
+                trust_updates = self.supervised_algorithm.update_trust(env.robots, env)
+            except Exception as e:
+                print(f"⚠️ Supervised algorithm error at step {step}: {e}")
+                trust_updates = {}
 
             # Collect results (same structure as paper algorithm)
             step_result = {
@@ -266,75 +252,6 @@ class TrustMethodComparison:
 
         print("✅ Supervised model simulation completed")
         return results
-
-    def _update_trust_from_predictions(self, predictions: Dict, graph_data, meaningful_track_indices: List[int]):
-        """
-        Update alpha/beta values based on supervised model predictions
-
-        IMPORTANT: Only updates:
-        1. Ego robot (index 0 in the graph)
-        2. Meaningful tracks (those in meaningful_track_indices)
-
-        Args:
-            predictions: Model predictions containing trust probabilities
-            graph_data: Graph data with node mappings (agent_nodes, track_nodes)
-            meaningful_track_indices: List of track indices that pass cross-validation
-        """
-
-        # Update ONLY ego robot (index 0 in the graph)
-        if 'agent' in predictions and hasattr(graph_data, 'agent_nodes'):
-            agent_probs = predictions['agent']['probabilities']
-
-            # Ego robot is always at index 0
-            ego_idx = 0
-            if ego_idx < len(agent_probs):
-                p = agent_probs[ego_idx][0]  # Extract probability from array
-
-                # Convert probability to alpha/beta update
-                if p >= 0.5:
-                    # High trust prediction - increase alpha
-                    delta_alpha = p
-                    delta_beta = 0.0
-                else:
-                    # Low trust prediction - increase beta
-                    delta_alpha = 0.0
-                    delta_beta = (1 - p)
-
-                # Find ego robot object (first robot in proximal_robots list)
-                ego_robot = graph_data._proximal_robots[0]
-                ego_robot.update_trust(delta_alpha, delta_beta)
-
-        # Update ONLY meaningful tracks (those that pass cross-validation)
-        if 'track' in predictions and hasattr(graph_data, 'track_nodes') and meaningful_track_indices:
-            track_probs = predictions['track']['probabilities']
-
-            # Get reverse mapping: graph_index -> track_id
-            index_to_track_id = {node_idx: track_id for track_id, node_idx in graph_data.track_nodes.items()}
-
-            # Update only meaningful tracks
-            for track_idx in meaningful_track_indices:
-                if track_idx < len(track_probs):
-                    p = track_probs[track_idx][0]  # Extract probability from array
-
-                    # Convert probability to alpha/beta update
-                    if p >= 0.5:
-                        # High trust prediction - increase alpha
-                        delta_alpha = p
-                        delta_beta = 0.0
-                    else:
-                        # Low trust prediction - increase beta
-                        delta_alpha = 0.0
-                        delta_beta = (1 - p)
-
-                    # Find the track object using the mapping
-                    track_id = index_to_track_id.get(track_idx)
-                    if track_id:
-                        # Find track in proximal robots' track lists
-                        for robot in graph_data._proximal_robots:
-                            for track in robot.get_all_tracks():
-                                if track.track_id == track_id:
-                                    track.update_trust(delta_alpha, delta_beta)
-                                    break
 
     def _run_trust_simulation(self, env: SimulationEnvironment, trust_system, label: str) -> List[Dict]:
         """Shared simulation loop for trust systems (baseline or mass-based)."""
@@ -805,7 +722,7 @@ def main():
     ROBOT_DENSITY = 0.0010  # ≈10 robots in 100x100 world
     TARGET_DENSITY_MULTIPLIER = 2.0  # Targets are twice robot density
     NUM_TIMESTEPS = 100
-    RANDOM_SEED = 12
+    RANDOM_SEED = 8
 
     # Environment Parameters
     WORLD_SIZE = 100.0
