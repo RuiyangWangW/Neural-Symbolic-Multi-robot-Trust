@@ -124,6 +124,12 @@ class SupervisedTrustGNN(nn.Module):
     - Transformer: Processes variable-length sequences of triplets per node
     - Rich initial features: Nodes start with meaningful embeddings from local structure
     - Edge types: 6 heterogeneous relations define the graph topology
+
+    ARCHITECTURE:
+    - 3 layers of heterogeneous graph convolution with GAT attention
+    - Skip connections between consecutive layers for gradient flow
+    - Batch normalization after each layer
+    - Binary classification heads for agent and track trust prediction
     """
 
     def __init__(self, hidden_dim: int = 128):
@@ -160,10 +166,11 @@ class SupervisedTrustGNN(nn.Module):
             dropout=0.1
         )
 
-        # Two layers of heterogeneous convolution (each with independent parameters)
+        # Three layers of heterogeneous convolution (each with independent parameters)
         # FIXED: Create separate conv_dict for each layer to avoid parameter sharing
         self.conv1 = HeteroConv(self._create_conv_dict(), aggr='mean')
         self.conv2 = HeteroConv(self._create_conv_dict(), aggr='mean')
+        self.conv3 = HeteroConv(self._create_conv_dict(), aggr='mean')
 
         # Batch normalization layers
         self.norm1 = nn.ModuleDict({
@@ -171,6 +178,10 @@ class SupervisedTrustGNN(nn.Module):
             'track': nn.BatchNorm1d(hidden_dim)
         })
         self.norm2 = nn.ModuleDict({
+            'agent': nn.BatchNorm1d(hidden_dim),
+            'track': nn.BatchNorm1d(hidden_dim)
+        })
+        self.norm3 = nn.ModuleDict({
             'agent': nn.BatchNorm1d(hidden_dim),
             'track': nn.BatchNorm1d(hidden_dim)
         })
@@ -298,10 +309,26 @@ class SupervisedTrustGNN(nn.Module):
                 x_dict_2[key] = self.norm2[key](x_dict_2[key])
 
         # Add skip connection from first layer
-        x_dict_final = {
+        x_dict_2 = {
             key: x_dict_2[key] + x_dict_1[key] if x_dict_2[key].shape[0] > 0 and x_dict_1[key].shape[0] > 0
             else x_dict_2[key]
             for key in x_dict_2
+        }
+
+        # Third layer with skip connection
+        x_dict_3 = self.conv3(x_dict_2, edge_index_dict)
+        x_dict_3 = {key: F.relu(x) for key, x in x_dict_3.items()}
+
+        # Apply batch normalization
+        for key in x_dict_3:
+            if x_dict_3[key].shape[0] > 1:
+                x_dict_3[key] = self.norm3[key](x_dict_3[key])
+
+        # Add skip connection from second layer
+        x_dict_final = {
+            key: x_dict_3[key] + x_dict_2[key] if x_dict_3[key].shape[0] > 0 and x_dict_2[key].shape[0] > 0
+            else x_dict_3[key]
+            for key in x_dict_3
         }
 
         # Apply classification heads

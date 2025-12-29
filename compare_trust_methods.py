@@ -18,6 +18,7 @@ from typing import Dict, List, Tuple, Optional
 from simulation_environment import SimulationEnvironment
 from paper_trust_algorithm import PaperTrustAlgorithm
 from supervised_trust_algorithm import SupervisedTrustAlgorithm
+from bayesian_ego_graph_trust import BayesianEgoGraphTrust
 from robot_track_classes import Robot, Track
 
 
@@ -77,10 +78,12 @@ class TrustMethodComparison:
         # Initialize trust methods
         self.paper_algorithm = PaperTrustAlgorithm()
         self.supervised_algorithm = None
+        self.bayesian_algorithm = None
 
         # Results storage
         self.paper_results = []
         self.supervised_results = []
+        self.bayesian_results = []
 
         # Simulation parameters (can be overridden)
         self.adversarial_ratio = 0.3
@@ -102,7 +105,16 @@ class TrustMethodComparison:
         except Exception as e:
             print(f"⚠️ Failed to initialize supervised algorithm: {e}")
 
-    def create_identical_environments(self, count: int = 2) -> List[SimulationEnvironment]:
+        # Initialize Bayesian ego graph trust algorithm
+        try:
+            self.bayesian_algorithm = BayesianEgoGraphTrust(
+                proximity_radius=self.proximal_range
+            )
+            print("✅ Bayesian ego graph trust algorithm ready")
+        except Exception as e:
+            print(f"⚠️ Failed to initialize Bayesian algorithm: {e}")
+
+    def create_identical_environments(self, count: int = 3) -> List[SimulationEnvironment]:
         """Create identical simulation environments."""
         envs = []
         for _ in range(count):
@@ -178,6 +190,44 @@ class TrustMethodComparison:
                     for track in robot.get_all_tracks()
                 }
 
+            # Add frame state for visualization
+            def classify_track_object(object_id: str) -> str:
+                if object_id.startswith("gt_"):
+                    return "ground_truth"
+                if object_id.startswith("fp_"):
+                    return "false_positive"
+                return "unknown"
+
+            robot_states = []
+            robot_detections = {}
+            for robot in env.robots:
+                robot_states.append({
+                    'id': robot.id,
+                    'position': robot.position[:2].tolist() if hasattr(robot.position, '__iter__') else [float(robot.position)],
+                    'orientation': float(getattr(robot, 'orientation', 0.0)),
+                    'trust_value': float(robot.trust_value),
+                    'is_adversarial': bool(robot.is_adversarial),
+                    'fov_range': float(robot.fov_range),
+                    'fov_angle': float(robot.fov_angle),
+                })
+
+                detections = []
+                for track in robot.get_current_timestep_tracks():
+                    detections.append({
+                        'track_id': track.track_id,
+                        'object_id': track.object_id,
+                        'position': track.position[:2].tolist() if hasattr(track.position, '__iter__') else [float(track.position)],
+                        'type': classify_track_object(track.object_id),
+                        'trust_value': float(track.trust_value),
+                    })
+                robot_detections[str(robot.id)] = detections
+
+            step_result['frame_state'] = {
+                'world_size': list(env.world_size),
+                'robots': robot_states,
+                'detections': robot_detections,
+            }
+
             results.append(step_result)
 
             if step % 100 == 0:
@@ -245,12 +295,154 @@ class TrustMethodComparison:
                     for track in robot.get_all_tracks()
                 }
 
+            # Add frame state for visualization
+            def classify_track_object(object_id: str) -> str:
+                if object_id.startswith("gt_"):
+                    return "ground_truth"
+                if object_id.startswith("fp_"):
+                    return "false_positive"
+                return "unknown"
+
+            robot_states = []
+            robot_detections = {}
+            for robot in env.robots:
+                robot_states.append({
+                    'id': robot.id,
+                    'position': robot.position[:2].tolist() if hasattr(robot.position, '__iter__') else [float(robot.position)],
+                    'orientation': float(getattr(robot, 'orientation', 0.0)),
+                    'trust_value': float(robot.trust_value),
+                    'is_adversarial': bool(robot.is_adversarial),
+                    'fov_range': float(robot.fov_range),
+                    'fov_angle': float(robot.fov_angle),
+                })
+
+                detections = []
+                for track in robot.get_current_timestep_tracks():
+                    detections.append({
+                        'track_id': track.track_id,
+                        'object_id': track.object_id,
+                        'position': track.position[:2].tolist() if hasattr(track.position, '__iter__') else [float(track.position)],
+                        'type': classify_track_object(track.object_id),
+                        'trust_value': float(track.trust_value),
+                    })
+                robot_detections[str(robot.id)] = detections
+
+            step_result['frame_state'] = {
+                'world_size': list(env.world_size),
+                'robots': robot_states,
+                'detections': robot_detections,
+            }
+
             results.append(step_result)
 
             if step % 100 == 0:
                 print(f"  Supervised model step {step}/{self.num_timesteps}")
 
         print("✅ Supervised model simulation completed")
+        return results
+
+    def run_bayesian_simulation(self, env: SimulationEnvironment) -> List[Dict]:
+        """Run simulation using Bayesian ego graph trust algorithm"""
+        if self.bayesian_algorithm is None:
+            print("❌ Bayesian algorithm not available, skipping")
+            return []
+
+        print("🚀 Running Bayesian ego graph simulation...")
+
+        results = []
+
+        for step in range(self.num_timesteps):
+            # CRITICAL: Reset random seed for each step to ensure identical randomness
+            step_seed = self.random_seed + step
+            np.random.seed(step_seed)
+            random.seed(step_seed)
+
+            # Step the simulation
+            frame_data = env.step()
+
+            # Update current timestep tracks for all robots
+            for robot in env.robots:
+                robot.update_current_timestep_tracks()
+
+            # Apply Bayesian trust algorithm
+            try:
+                trust_updates = self.bayesian_algorithm.update_trust(env.robots, env)
+            except Exception as e:
+                print(f"⚠️ Bayesian algorithm error at step {step}: {e}")
+                trust_updates = {}
+
+            # Collect results (same structure as other algorithms)
+            step_result = {
+                'step': step,
+                'time': env.time,
+                'robot_trust_values': {
+                    robot.id: robot.trust_value for robot in env.robots
+                },
+                'robot_alpha_beta': {
+                    robot.id: {'alpha': robot.trust_alpha, 'beta': robot.trust_beta}
+                    for robot in env.robots
+                },
+                'track_trust_values': {},
+                'adversarial_robots': [r.id for r in env.robots if r.is_adversarial],
+                'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial]
+            }
+
+            # Collect track trust values
+            for robot in env.robots:
+                step_result['track_trust_values'][robot.id] = {
+                    track.track_id: {
+                        'trust_value': track.trust_value,
+                        'alpha': track.trust_alpha,
+                        'beta': track.trust_beta,
+                        'object_id': track.object_id
+                    }
+                    for track in robot.get_all_tracks()
+                }
+
+            # Add frame state for visualization
+            def classify_track_object(object_id: str) -> str:
+                if object_id.startswith("gt_"):
+                    return "ground_truth"
+                if object_id.startswith("fp_"):
+                    return "false_positive"
+                return "unknown"
+
+            robot_states = []
+            robot_detections = {}
+            for robot in env.robots:
+                robot_states.append({
+                    'id': robot.id,
+                    'position': robot.position[:2].tolist() if hasattr(robot.position, '__iter__') else [float(robot.position)],
+                    'orientation': float(getattr(robot, 'orientation', 0.0)),
+                    'trust_value': float(robot.trust_value),
+                    'is_adversarial': bool(robot.is_adversarial),
+                    'fov_range': float(robot.fov_range),
+                    'fov_angle': float(robot.fov_angle),
+                })
+
+                detections = []
+                for track in robot.get_current_timestep_tracks():
+                    detections.append({
+                        'track_id': track.track_id,
+                        'object_id': track.object_id,
+                        'position': track.position[:2].tolist() if hasattr(track.position, '__iter__') else [float(track.position)],
+                        'type': classify_track_object(track.object_id),
+                        'trust_value': float(track.trust_value),
+                    })
+                robot_detections[str(robot.id)] = detections
+
+            step_result['frame_state'] = {
+                'world_size': list(env.world_size),
+                'robots': robot_states,
+                'detections': robot_detections,
+            }
+
+            results.append(step_result)
+
+            if step % 100 == 0:
+                print(f"  Bayesian model step {step}/{self.num_timesteps}")
+
+        print("✅ Bayesian model simulation completed")
         return results
 
     def _run_trust_simulation(self, env: SimulationEnvironment, trust_system, label: str) -> List[Dict]:
@@ -410,7 +602,7 @@ class TrustMethodComparison:
         return results
 
     def run_comparison(self) -> Dict:
-        """Run complete comparison between paper algorithm and supervised model"""
+        """Run complete comparison between paper algorithm, supervised model, and Bayesian method"""
         print("🔄 Starting trust method comparison...")
         print(
             f"Configuration: world={self.world_size}m, robots={self.num_robots} "
@@ -420,15 +612,18 @@ class TrustMethodComparison:
         )
         print(f"Random seed: {self.random_seed}")
 
-        # Create identical environments for both methods
-        paper_env, supervised_env = self.create_identical_environments(2)
+        # Create identical environments for all three methods
+        paper_env, supervised_env, bayesian_env = self.create_identical_environments(3)
 
-        # Run both simulations
+        # Run all three simulations
         print("\n" + "="*50)
         self.paper_results = self.run_paper_algorithm_simulation(paper_env)
 
         print("\n" + "="*50)
         self.supervised_results = self.run_supervised_model_simulation(supervised_env)
+
+        print("\n" + "="*50)
+        self.bayesian_results = self.run_bayesian_simulation(bayesian_env)
 
         # Generate comparison results
         comparison_results = {
@@ -444,14 +639,15 @@ class TrustMethodComparison:
             },
             'paper_results': self.paper_results,
             'supervised_results': self.supervised_results,
+            'bayesian_results': self.bayesian_results,
             'comparison_metrics': self._compute_comparison_metrics()
         }
 
         return comparison_results
 
     def _compute_comparison_metrics(self) -> Dict:
-        """Compute comparison metrics between paper algorithm and supervised model"""
-        if not self.paper_results or not self.supervised_results:
+        """Compute comparison metrics between paper algorithm, supervised model, and Bayesian method"""
+        if not self.paper_results or not self.supervised_results or not self.bayesian_results:
             print("⚠️ Incomplete results for comparison metrics")
             return {}
 
@@ -465,7 +661,8 @@ class TrustMethodComparison:
 
         method_results = {
             'paper': self.paper_results,
-            'supervised': self.supervised_results
+            'supervised': self.supervised_results,
+            'bayesian': self.bayesian_results
         }
 
         robot_ids = list(self.paper_results[0]['robot_trust_values'].keys())
@@ -498,7 +695,7 @@ class TrustMethodComparison:
 
             metrics['final_trust_values'][robot_type] = {}
 
-            for method in ['paper', 'supervised']:
+            for method in ['paper', 'supervised', 'bayesian']:
                 finals = [metrics['trust_convergence'][rid][method]['final'] for rid in id_set]
                 metrics['final_trust_values'][robot_type][method] = {
                     'mean': float(np.mean(finals)),
@@ -508,14 +705,27 @@ class TrustMethodComparison:
         # Compute method differences
         all_paper_finals = []
         all_supervised_finals = []
+        all_bayesian_finals = []
         for robot_id in robot_ids:
             all_paper_finals.append(metrics['trust_convergence'][robot_id]['paper']['final'])
             all_supervised_finals.append(metrics['trust_convergence'][robot_id]['supervised']['final'])
+            all_bayesian_finals.append(metrics['trust_convergence'][robot_id]['bayesian']['final'])
 
-        differences = np.array(all_supervised_finals) - np.array(all_paper_finals)
+        diff_supervised_paper = np.array(all_supervised_finals) - np.array(all_paper_finals)
+        diff_bayesian_paper = np.array(all_bayesian_finals) - np.array(all_paper_finals)
+        diff_bayesian_supervised = np.array(all_bayesian_finals) - np.array(all_supervised_finals)
+
         metrics['method_differences']['supervised_minus_paper'] = {
-            'mean': float(np.mean(differences)),
-            'std': float(np.std(differences))
+            'mean': float(np.mean(diff_supervised_paper)),
+            'std': float(np.std(diff_supervised_paper))
+        }
+        metrics['method_differences']['bayesian_minus_paper'] = {
+            'mean': float(np.mean(diff_bayesian_paper)),
+            'std': float(np.std(diff_bayesian_paper))
+        }
+        metrics['method_differences']['bayesian_minus_supervised'] = {
+            'mean': float(np.mean(diff_bayesian_supervised)),
+            'std': float(np.std(diff_bayesian_supervised))
         }
 
         print("✅ Comparison metrics computed")
@@ -535,6 +745,7 @@ class TrustMethodComparison:
             },
             'paper_results': self.paper_results,
             'supervised_results': self.supervised_results,
+            'bayesian_results': self.bayesian_results,
             'metrics': self._compute_comparison_metrics()
         }
 
@@ -562,41 +773,61 @@ class TrustMethodComparison:
         return filename
 
     def visualize_results(self, save_path: str = "trust_comparison_results.png"):
-        """Create visualization comparing paper algorithm and supervised model"""
-        if not self.paper_results or not self.supervised_results:
+        """Create visualization comparing paper algorithm, supervised model, and Bayesian method"""
+        if not self.paper_results or not self.supervised_results or not self.bayesian_results:
             print("⚠️ Incomplete results for visualization")
             return
 
         print("📈 Creating comparison visualization...")
 
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        fig.suptitle('Trust Method Comparison: Paper Algorithm vs Supervised Model', fontsize=16, fontweight='bold')
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig.suptitle('Trust Method Comparison: Paper vs Supervised vs Bayesian', fontsize=16, fontweight='bold')
 
         timesteps = [step['step'] for step in self.paper_results]
         adversarial_robots = self.paper_results[0]['adversarial_robots']
         legitimate_robots = self.paper_results[0]['legitimate_robots']
 
-        # Plot 1: Legitimate robots comparison
+        # Define colors for each method
+        method_colors = {
+            'paper': '#1f77b4',      # Blue
+            'supervised': '#ff7f0e', # Orange
+            'bayesian': '#2ca02c'    # Green
+        }
+
+        # Plot 1: Legitimate robots comparison (show first 2 robots for clarity)
         ax1 = axes[0, 0]
-        for robot_id in legitimate_robots[:3]:  # Limit to 3 robots for clarity
+        for robot_id in legitimate_robots[:2]:  # Limit to 2 robots for clarity with 3 methods
             paper_trust = [step['robot_trust_values'][robot_id] for step in self.paper_results]
             supervised_trust = [step['robot_trust_values'][robot_id] for step in self.supervised_results]
-            ax1.plot(timesteps, paper_trust, label=f'Paper R{robot_id}', linestyle='-', alpha=0.7)
-            ax1.plot(timesteps, supervised_trust, label=f'Supervised R{robot_id}', linestyle='--', alpha=0.7)
+            bayesian_trust = [step['robot_trust_values'][robot_id] for step in self.bayesian_results]
+
+            ax1.plot(timesteps, paper_trust, label=f'Paper R{robot_id}',
+                    color=method_colors['paper'], linestyle='-', alpha=0.7, linewidth=1.5)
+            ax1.plot(timesteps, supervised_trust, label=f'Supervised R{robot_id}',
+                    color=method_colors['supervised'], linestyle='--', alpha=0.7, linewidth=1.5)
+            ax1.plot(timesteps, bayesian_trust, label=f'Bayesian R{robot_id}',
+                    color=method_colors['bayesian'], linestyle=':', alpha=0.7, linewidth=1.5)
         ax1.set_title('Legitimate Robots Trust Evolution')
         ax1.set_xlabel('Simulation Step')
         ax1.set_ylabel('Trust Value')
-        ax1.legend(fontsize=8)
+        ax1.legend(fontsize=7, ncol=2)
         ax1.grid(True, alpha=0.3)
 
         # Plot 2: Adversarial robots comparison
         ax2 = axes[0, 1]
         if adversarial_robots:
-            for robot_id in adversarial_robots[:3]:  # Limit to 3 robots for clarity
+            for robot_id in adversarial_robots[:2]:  # Limit to 2 robots for clarity with 3 methods
                 paper_trust = [step['robot_trust_values'][robot_id] for step in self.paper_results]
                 supervised_trust = [step['robot_trust_values'][robot_id] for step in self.supervised_results]
-                ax2.plot(timesteps, paper_trust, label=f'Paper R{robot_id}', linestyle='-', alpha=0.7)
-                ax2.plot(timesteps, supervised_trust, label=f'Supervised R{robot_id}', linestyle='--', alpha=0.7)
+                bayesian_trust = [step['robot_trust_values'][robot_id] for step in self.bayesian_results]
+
+                ax2.plot(timesteps, paper_trust, label=f'Paper R{robot_id}',
+                        color=method_colors['paper'], linestyle='-', alpha=0.7, linewidth=1.5)
+                ax2.plot(timesteps, supervised_trust, label=f'Supervised R{robot_id}',
+                        color=method_colors['supervised'], linestyle='--', alpha=0.7, linewidth=1.5)
+                ax2.plot(timesteps, bayesian_trust, label=f'Bayesian R{robot_id}',
+                        color=method_colors['bayesian'], linestyle=':', alpha=0.7, linewidth=1.5)
+            ax2.legend(fontsize=7, ncol=2)
         else:
             ax2.text(0.5, 0.5, 'No Adversarial Robots\nin this Scenario',
                      horizontalalignment='center', verticalalignment='center',
@@ -604,67 +835,86 @@ class TrustMethodComparison:
         ax2.set_title('Adversarial Robots Trust Evolution')
         ax2.set_xlabel('Simulation Step')
         ax2.set_ylabel('Trust Value')
-        ax2.legend(fontsize=8)
         ax2.grid(True, alpha=0.3)
 
-        # Plot 3: Average trust by robot type
+        # Plot 3: Average trust by robot type and method
         ax3 = axes[1, 0]
         paper_leg_avg = np.mean([[step['robot_trust_values'][rid] for rid in legitimate_robots]
                                  for step in self.paper_results], axis=1)
         supervised_leg_avg = np.mean([[step['robot_trust_values'][rid] for rid in legitimate_robots]
                                       for step in self.supervised_results], axis=1)
-        ax3.plot(timesteps, paper_leg_avg, label='Paper - Legitimate', color='green', linestyle='-', linewidth=2)
-        ax3.plot(timesteps, supervised_leg_avg, label='Supervised - Legitimate', color='green', linestyle='--', linewidth=2)
+        bayesian_leg_avg = np.mean([[step['robot_trust_values'][rid] for rid in legitimate_robots]
+                                    for step in self.bayesian_results], axis=1)
+
+        ax3.plot(timesteps, paper_leg_avg, label='Paper - Legitimate',
+                color=method_colors['paper'], linestyle='-', linewidth=2.5)
+        ax3.plot(timesteps, supervised_leg_avg, label='Supervised - Legitimate',
+                color=method_colors['supervised'], linestyle='-', linewidth=2.5)
+        ax3.plot(timesteps, bayesian_leg_avg, label='Bayesian - Legitimate',
+                color=method_colors['bayesian'], linestyle='-', linewidth=2.5)
 
         if adversarial_robots:
             paper_adv_avg = np.mean([[step['robot_trust_values'][rid] for rid in adversarial_robots]
                                      for step in self.paper_results], axis=1)
             supervised_adv_avg = np.mean([[step['robot_trust_values'][rid] for rid in adversarial_robots]
                                           for step in self.supervised_results], axis=1)
-            ax3.plot(timesteps, paper_adv_avg, label='Paper - Adversarial', color='red', linestyle='-', linewidth=2)
-            ax3.plot(timesteps, supervised_adv_avg, label='Supervised - Adversarial', color='red', linestyle='--', linewidth=2)
+            bayesian_adv_avg = np.mean([[step['robot_trust_values'][rid] for rid in adversarial_robots]
+                                        for step in self.bayesian_results], axis=1)
+
+            ax3.plot(timesteps, paper_adv_avg, label='Paper - Adversarial',
+                    color=method_colors['paper'], linestyle='--', linewidth=2.5, alpha=0.7)
+            ax3.plot(timesteps, supervised_adv_avg, label='Supervised - Adversarial',
+                    color=method_colors['supervised'], linestyle='--', linewidth=2.5, alpha=0.7)
+            ax3.plot(timesteps, bayesian_adv_avg, label='Bayesian - Adversarial',
+                    color=method_colors['bayesian'], linestyle='--', linewidth=2.5, alpha=0.7)
 
         ax3.set_title('Average Trust by Robot Type and Method')
         ax3.set_xlabel('Simulation Step')
         ax3.set_ylabel('Average Trust Value')
-        ax3.legend()
+        ax3.legend(fontsize=8, ncol=2)
         ax3.grid(True, alpha=0.3)
 
         # Plot 4: Final trust comparison
         ax4 = axes[1, 1]
         final_paper_leg = [self.paper_results[-1]['robot_trust_values'][rid] for rid in legitimate_robots]
         final_supervised_leg = [self.supervised_results[-1]['robot_trust_values'][rid] for rid in legitimate_robots]
+        final_bayesian_leg = [self.bayesian_results[-1]['robot_trust_values'][rid] for rid in legitimate_robots]
         final_paper_adv = [self.paper_results[-1]['robot_trust_values'][rid] for rid in adversarial_robots] if adversarial_robots else []
         final_supervised_adv = [self.supervised_results[-1]['robot_trust_values'][rid] for rid in adversarial_robots] if adversarial_robots else []
+        final_bayesian_adv = [self.bayesian_results[-1]['robot_trust_values'][rid] for rid in adversarial_robots] if adversarial_robots else []
 
         categories = []
         means = []
         stds = []
         colors = []
 
-        categories.extend(['Paper\nLegitimate', 'Supervised\nLegitimate'])
-        means.extend([np.mean(final_paper_leg), np.mean(final_supervised_leg)])
-        stds.extend([np.std(final_paper_leg), np.std(final_supervised_leg)])
-        colors.extend(['lightgreen', 'darkgreen'])
+        # Legitimate robots
+        categories.extend(['Paper\nLegitimate', 'Supervised\nLegitimate', 'Bayesian\nLegitimate'])
+        means.extend([np.mean(final_paper_leg), np.mean(final_supervised_leg), np.mean(final_bayesian_leg)])
+        stds.extend([np.std(final_paper_leg), np.std(final_supervised_leg), np.std(final_bayesian_leg)])
+        colors.extend([method_colors['paper'], method_colors['supervised'], method_colors['bayesian']])
 
+        # Adversarial robots
         if adversarial_robots:
-            categories.extend(['Paper\nAdversarial', 'Supervised\nAdversarial'])
-            means.extend([np.mean(final_paper_adv), np.mean(final_supervised_adv)])
-            stds.extend([np.std(final_paper_adv), np.std(final_supervised_adv)])
-            colors.extend(['lightcoral', 'darkred'])
+            categories.extend(['Paper\nAdversarial', 'Supervised\nAdversarial', 'Bayesian\nAdversarial'])
+            means.extend([np.mean(final_paper_adv), np.mean(final_supervised_adv), np.mean(final_bayesian_adv)])
+            stds.extend([np.std(final_paper_adv), np.std(final_supervised_adv), np.std(final_bayesian_adv)])
+            # Use darker shades for adversarial
+            colors.extend(['#0d47a1', '#e65100', '#1b5e20'])
 
         x_pos = np.arange(len(categories))
-        bars = ax4.bar(x_pos, means, yerr=stds, capsize=5, color=colors, alpha=0.7)
+        bars = ax4.bar(x_pos, means, yerr=stds, capsize=5, color=colors, alpha=0.7, edgecolor='black', linewidth=1)
         ax4.set_title('Final Trust Values Comparison')
         ax4.set_ylabel('Final Trust Value')
         ax4.set_xticks(x_pos)
-        ax4.set_xticklabels(categories, fontsize=9)
+        ax4.set_xticklabels(categories, fontsize=8)
         ax4.grid(True, alpha=0.3, axis='y')
 
+        # Add value labels on bars
         for bar, mean in zip(bars, means):
             height = bar.get_height()
             ax4.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                     f'{mean:.3f}', ha='center', va='bottom', fontweight='bold', fontsize=8)
+                     f'{mean:.3f}', ha='center', va='bottom', fontweight='bold', fontsize=7)
 
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -674,7 +924,7 @@ class TrustMethodComparison:
 
     def print_summary(self):
         """Print comparison summary"""
-        if not self.paper_results or not self.supervised_results:
+        if not self.paper_results or not self.supervised_results or not self.bayesian_results:
             print("⚠️ Incomplete results for summary")
             return
 
@@ -697,15 +947,20 @@ class TrustMethodComparison:
             for robot_type in ['legitimate', 'adversarial']:
                 if robot_type in metrics['final_trust_values']:
                     print(f"\n  {robot_type.title()} Robots:")
-                    for method in ['paper', 'supervised']:
+                    for method in ['paper', 'supervised', 'bayesian']:
                         if method in metrics['final_trust_values'][robot_type]:
                             stats = metrics['final_trust_values'][robot_type][method]
                             print(f"    {method.title()}: {stats['mean']:.3f} ± {stats['std']:.3f}")
 
         # Method differences
         if 'method_differences' in metrics:
-            diff = metrics['method_differences']['supervised_minus_paper']
-            print(f"\n📈 Supervised vs Paper Difference: {diff['mean']:+.3f} ± {diff['std']:.3f}")
+            diff_sp = metrics['method_differences']['supervised_minus_paper']
+            diff_bp = metrics['method_differences']['bayesian_minus_paper']
+            diff_bs = metrics['method_differences']['bayesian_minus_supervised']
+            print(f"\n📈 Method Differences:")
+            print(f"    Supervised vs Paper: {diff_sp['mean']:+.3f} ± {diff_sp['std']:.3f}")
+            print(f"    Bayesian vs Paper: {diff_bp['mean']:+.3f} ± {diff_bp['std']:.3f}")
+            print(f"    Bayesian vs Supervised: {diff_bs['mean']:+.3f} ± {diff_bs['std']:.3f}")
 
         print("\n✨ Comparison completed successfully!")
 
