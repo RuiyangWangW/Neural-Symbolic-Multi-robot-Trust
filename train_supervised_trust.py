@@ -441,13 +441,10 @@ class SupervisedTrustTrainer:
                     track_loss_value = track_loss.item()
                     track_loss_count = len(meaningful_track_indices)
 
-        # Normalize by total component count (agents + tracks) for proper gradient scaling
-        # This ensures each component contributes equally regardless of graph size
-        total_components = agent_loss_count + track_loss_count
-        if total_components > 0:
-            normalized_loss = loss / total_components
-        else:
-            normalized_loss = 0.0
+        # Return the weighted sum directly without normalization
+        # The loss is already properly weighted by agent_loss_weight and track_loss_weight
+        # Normalizing by component count makes the loss misleading (too small)
+        # The optimizer will handle averaging across batches/samples
 
         loss_components = {
             'agent_loss': agent_loss_value,
@@ -456,7 +453,7 @@ class SupervisedTrustTrainer:
             'track_count': track_loss_count,
         }
 
-        return normalized_loss, loss_components
+        return loss, loss_components
 
     def _compute_metrics(self, predictions: Dict, labels: Dict) -> Dict:
         """
@@ -789,13 +786,10 @@ class SupervisedTrustTrainer:
 
             total_loss += graph_loss
 
-        # Normalize by total component count (agents + tracks) for proper gradient scaling
-        # This ensures each component contributes equally regardless of graph size
-        total_components = total_agent_count + total_track_count
-        if total_components > 0:
-            normalized_loss = total_loss / total_components
-        else:
-            normalized_loss = torch.tensor(0.0, device=self.device)
+        # Return the weighted sum directly without normalization
+        # The loss is already properly weighted by agent_loss_weight and track_loss_weight
+        # Normalizing by component count makes the loss misleading (too small)
+        # The optimizer will handle averaging across batches/samples
 
         loss_components = {
             'agent_loss': total_agent_loss,
@@ -804,7 +798,7 @@ class SupervisedTrustTrainer:
             'track_count': total_track_count,
         }
 
-        return normalized_loss, loss_components
+        return total_loss, loss_components
 
     def _compute_batched_metrics(self, predictions: Dict, agent_labels: torch.Tensor,
                                   track_labels: torch.Tensor, ego_robot_indices: List[int],
@@ -1336,8 +1330,8 @@ def main():
                        help='Log file path (default: output_path.replace(.pth, _training.log))')
     parser.add_argument('--no-pyg-batch', action='store_true',
                        help='Disable PyTorch Geometric batching (use individual processing instead)')
-    parser.add_argument('--agent-loss-weight', type=float, default=10.0,
-                       help='Weight for agent loss (default: 10.0 to balance with multiple tracks)')
+    parser.add_argument('--agent-loss-weight', type=float, default=5.0,
+                       help='Weight for agent loss (default: 5.0 to balance with multiple tracks)')
     parser.add_argument('--track-loss-weight', type=float, default=1.0,
                        help='Weight for track loss (default: 1.0)')
 
