@@ -52,11 +52,12 @@ class SimulationEnvironment:
                  fov_angle: float = np.pi/3,
                  false_positive_rate: float = 0.5,
                  false_negative_rate: float = 0.0,
+                 allow_fp_codetection: bool = False,
                  num_robots: Optional[int] = None,
                  num_targets: Optional[int] = None):
         """
         Initialize simulation environment
-        
+
         Args:
             world_size: Size of the simulation world (fixed for density-based configuration)
             robot_density: Robots per unit area (used when num_robots not provided)
@@ -67,6 +68,7 @@ class SimulationEnvironment:
             fov_angle: Field of view angle in radians (default: π/3, 60 degrees)
             false_positive_rate: Rate of false positive detections (default: 0.5)
             false_negative_rate: Rate of false negative detections (default: 0.0)
+            allow_fp_codetection: If True, allows adversarial robots to co-detect FP objects (default: False)
         """
         self.world_size = world_size
         self.area = self.world_size[0] * self.world_size[1]
@@ -91,6 +93,7 @@ class SimulationEnvironment:
         self.fov_angle = fov_angle
         self.false_positive_rate = false_positive_rate
         self.false_negative_rate = false_negative_rate
+        self.allow_fp_codetection = allow_fp_codetection
 
         self.robots: List[Robot] = []
         self.ground_truth_objects: List[GroundTruthObject] = []
@@ -616,13 +619,22 @@ class SimulationEnvironment:
         # Generate tracks for FP objects assigned to this specific robot
         # Each adversarial robot ALWAYS detects its assigned FP objects (no probability)
         for fp_obj in self.shared_fp_objects:
-            # Only detect FP objects assigned to THIS robot
+            # Check if this FP object should be detected by this robot
             assigned_robot_id = self.fp_object_assignments.get(fp_obj.id)
-            if assigned_robot_id != robot.id:
-                continue  # Skip FP objects not assigned to this robot
+
+            # Determine if this robot can detect this FP object
+            if assigned_robot_id == robot.id:
+                # This robot is assigned to this FP object - always detect
+                can_detect = True
+            elif self.allow_fp_codetection and robot.is_adversarial:
+                # FP codetection enabled and this is an adversarial robot - allow codetection
+                can_detect = True
+            else:
+                # Not assigned and codetection disabled - skip
+                continue
 
             # Check if FP object is in FoV
-            if robot.is_in_fov(fp_obj.position):
+            if can_detect and robot.is_in_fov(fp_obj.position):
                 # ALWAYS detect assigned FP object (no probability check)
                 fp_object_id = f"fp_obj_{fp_obj.id}"
                 fp_track_key = f"{robot.id}_{fp_object_id}"

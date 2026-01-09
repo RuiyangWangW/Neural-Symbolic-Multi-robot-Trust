@@ -29,7 +29,7 @@ class SupervisedDataSample:
     The full ego graph is saved (all robots and tracks) for GNN input.
     Cross-validation constraints are applied via:
     - ego_has_cross_validation: Only samples where ego robot has co_detection/contradicts edges
-    - meaningful_track_indices: Tracks detected by ego at current timestep AND have edges to >=2 robots
+    - meaningful_track_indices: ALL tracks detected by ego at current timestep (no cross-validation filter)
 
     During training, loss is computed only for:
     - Ego robot (index 0) if ego_has_cross_validation=True
@@ -339,7 +339,8 @@ class SupervisedDataGenerator:
 
         A track is meaningful if:
         1. It's currently detected by ego robot (in get_all_current_tracks())
-        2. It has edges to >= 2 robots (cross-validation constraint)
+
+        Note: Cross-validation filter has been removed - we update ALL tracks detected by ego robot.
 
         Args:
             ego_robot: The ego robot
@@ -347,7 +348,7 @@ class SupervisedDataGenerator:
             num_tracks: Total number of tracks in ego graph
 
         Returns:
-            List of track indices that are meaningful
+            List of track indices that are meaningful (all ego-detected tracks)
         """
         meaningful_indices = []
 
@@ -363,16 +364,11 @@ class SupervisedDataGenerator:
             # Fallback: can't identify tracks without stored track list
             return []
 
-        # For each track, check if it's meaningful
+        # Include ALL tracks detected by ego robot (no cross-validation filter)
         for track_idx, track in enumerate(all_tracks[:num_tracks]):
-            # Check 1: Is this track currently detected by ego robot?
+            # Is this track currently detected by ego robot?
             # Match by object_id (not track_id) since fusion changes track_id
-            if track.object_id not in ego_object_ids:
-                continue
-
-            # Check 2: Does this track have edges to >= 2 robots?
-            num_robots_with_edges = self._count_robots_with_edges_to_track(ego_graph, track_idx)
-            if num_robots_with_edges >= 2:
+            if track.object_id in ego_object_ids:
                 meaningful_indices.append(track_idx)
 
         return meaningful_indices
@@ -675,7 +671,7 @@ class SupervisedDataGenerator:
                     #     filtered_adversarial_no_contradicts += 1
                     #     continue
 
-                    # Identify meaningful tracks: ego-detected at current timestep AND have edges to >= 2 robots
+                    # Identify meaningful tracks: ALL tracks detected by ego at current timestep (no cross-validation filter)
                     meaningful_track_indices = self._identify_meaningful_tracks(
                         ego_robot, ego_graph, num_tracks
                     )

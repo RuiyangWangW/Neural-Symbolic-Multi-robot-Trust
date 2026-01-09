@@ -187,9 +187,10 @@ for idx, adv_ratio in enumerate(high_adversarial_settings):
 
 DEFAULT_SCENARIOS: List[Dict] = IN_SAMPLE_SCENARIOS + OOD_SCENARIOS
 
-METHOD_ORDER = ["paper", "supervised", "bayesian"]
+METHOD_ORDER = ["baseline", "bayesian", "paper", "supervised"]
 METHOD_DISPLAY_NAMES = {
-    "paper": "Paper Algorithm",
+    "baseline": "Baseline (No Trust)",
+    "paper": "PSM Aggregation",
     "supervised": "Supervised GNN",
     "bayesian": "Bayesian Ego Graph",
 }
@@ -284,31 +285,50 @@ def compute_robot_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str,
     return metrics, stats
 
 
-def compute_track_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str, float], Dict[str, float]]:
+def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    Compute object-level accuracy by averaging trust across all robots detecting each object.
+    Objects never detected by any robot are excluded from accuracy calculation.
+    """
     track_data = final_step.get("track_trust_values", {})
-    labels = []
-    scores = []
-    gt_trust = []
-    fp_trust = []
+
+    # Aggregate tracks by object_id across all robots
+    object_trust_values = {}  # object_id -> list of trust values from different robots
 
     for robot_tracks in track_data.values():
         for _, track_info in robot_tracks.items():
             object_id = track_info.get("object_id", "")
             trust_value = float(track_info.get("trust_value", 0.5))
-            if object_id.startswith("gt_"):
-                labels.append(1)
-                gt_trust.append(trust_value)
-            elif object_id.startswith("fp_"):
-                labels.append(0)
-                fp_trust.append(trust_value)
-            else:
-                continue
-            scores.append(trust_value)
+
+            if object_id.startswith("gt_") or object_id.startswith("fp_"):
+                if object_id not in object_trust_values:
+                    object_trust_values[object_id] = []
+                object_trust_values[object_id].append(trust_value)
+
+    # Calculate average trust per object and evaluate
+    labels = []
+    scores = []
+    gt_trust = []
+    fp_trust = []
+
+    for object_id, trust_values in object_trust_values.items():
+        avg_trust = float(np.mean(trust_values))
+
+        if object_id.startswith("gt_"):
+            labels.append(1)
+            gt_trust.append(avg_trust)
+        elif object_id.startswith("fp_"):
+            labels.append(0)
+            fp_trust.append(avg_trust)
+        else:
+            continue
+
+        scores.append(avg_trust)
 
     metrics = classification_metrics(labels, scores, threshold)
     stats = {
-        "mean_true_track_trust": float(np.mean(gt_trust)) if gt_trust else 0.0,
-        "mean_false_track_trust": float(np.mean(fp_trust)) if fp_trust else 0.0,
+        "mean_true_object_trust": float(np.mean(gt_trust)) if gt_trust else 0.0,
+        "mean_false_object_trust": float(np.mean(fp_trust)) if fp_trust else 0.0,
     }
     return metrics, stats
 
@@ -323,10 +343,10 @@ def evaluate_methods(results: Dict, threshold: float) -> Dict[str, Dict[str, Dic
             continue
         final_step = method_results[-1]
         robot_metrics, robot_stats = compute_robot_metrics(final_step, threshold)
-        track_metrics, track_stats = compute_track_metrics(final_step, threshold)
+        object_metrics, object_stats = compute_object_metrics(final_step, threshold)
         evaluation[method_key] = {
             "robots": {**robot_metrics, **robot_stats},
-            "tracks": {**track_metrics, **track_stats},
+            "objects": {**object_metrics, **object_stats},
         }
     return evaluation
 
@@ -334,28 +354,29 @@ def evaluate_methods(results: Dict, threshold: float) -> Dict[str, Dict[str, Dic
 def plot_accuracy(summary: List[Dict], output_dir: Path) -> None:
     scenarios = [entry["name"] for entry in summary]
     x = np.arange(len(scenarios))
-    width = 0.20  # Adjusted for 3 methods instead of 2
+    width = 0.18  # Adjusted for 4 methods
 
-    # Define consistent colors for each method (matching compare_trust_methods.py)
+    # Define consistent colors for each method
     method_colors = {
+        'baseline': '#d62728',   # Red
+        'bayesian': '#2ca02c',   # Green
         'paper': '#1f77b4',      # Blue
         'supervised': '#ff7f0e', # Orange
-        'bayesian': '#2ca02c'    # Green
     }
 
-    robot_fig, (ax_robot, ax_track) = plt.subplots(1, 2, figsize=(16, 6), sharey=False)
+    robot_fig, (ax_robot, ax_object) = plt.subplots(1, 2, figsize=(16, 6), sharey=False)
 
     for idx, method in enumerate(METHOD_ORDER):
         robot_acc = [entry["metrics"].get(method, {}).get("robots", {}).get("accuracy", 0.0) for entry in summary]
-        track_acc = [entry["metrics"].get(method, {}).get("tracks", {}).get("accuracy", 0.0) for entry in summary]
-        offsets = x + (idx - 1) * width
+        object_acc = [entry["metrics"].get(method, {}).get("objects", {}).get("accuracy", 0.0) for entry in summary]
+        offsets = x + (idx - 1.5) * width
         color = method_colors.get(method, f'C{idx}')
         ax_robot.bar(offsets, robot_acc, width=width, label=METHOD_DISPLAY_NAMES[method],
                     color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
-        ax_track.bar(offsets, track_acc, width=width, label=METHOD_DISPLAY_NAMES[method],
+        ax_object.bar(offsets, object_acc, width=width, label=METHOD_DISPLAY_NAMES[method],
                     color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
 
-    for ax, title in zip((ax_robot, ax_track), ("Robot Accuracy", "Track Accuracy")):
+    for ax, title in zip((ax_robot, ax_object), ("Robot Accuracy", "Object Accuracy")):
         ax.set_xticks(x)
         ax.set_xticklabels(scenarios, rotation=25, ha="right", fontsize=8)
         ax.set_ylim(0.0, 1.05)
@@ -363,7 +384,7 @@ def plot_accuracy(summary: List[Dict], output_dir: Path) -> None:
         ax.set_title(title, fontsize=12, fontweight='bold')
         ax.grid(True, axis="y", linestyle=":", alpha=0.4)
 
-    ax_track.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=3, fontsize=10)
+    ax_object.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=4, fontsize=10)
     robot_fig.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
     robot_fig.savefig(output_dir / "trust_method_accuracy_summary.png", dpi=200, bbox_inches="tight")

@@ -22,17 +22,19 @@ class BayesianEgoGraphTrust:
     Simple Bayesian trust update using ego graph edge counts as evidence.
 
     For each ego robot:
-    1. Build ego graph
-    2. Count positive and negative evidence edges
-    3. Update trust hyperparameters (alpha, beta) directly
+    1. Build ego graph (includes proximal robots and their tracks)
+    2. Count positive and negative evidence edges from ALL agents in the graph
+    3. Update trust hyperparameters (alpha, beta) for ego robot and its tracks only
+
+    Key principle: Uses neighborhood evidence but only updates ego's own entities.
     """
 
-    def __init__(self, proximity_radius: float = 15.0):
+    def __init__(self, proximity_radius: float = 50.0):
         """
         Args:
             proximity_radius: Distance threshold for considering robots as neighbors
         """
-        self.ego_graph_builder = EgoGraphBuilder()
+        self.ego_graph_builder = EgoGraphBuilder(proximal_range=proximity_radius)
         self.proximity_radius = proximity_radius
 
     def update_trust(self, robots: List[Robot], environment=None) -> Dict[int, Dict]:
@@ -41,7 +43,8 @@ class BayesianEgoGraphTrust:
 
         For each ego robot, builds an ego graph and updates:
         - The ego robot's trust based on its co_detection and contradicts edges
-        - Trust for tracks detected by the ego robot based on observation edges
+        - Trust for ONLY tracks detected by the ego robot (not all tracks in graph)
+        - Uses ALL edges from ANY agent in the ego graph for counting evidence
 
         Args:
             robots: List of all robots in the environment
@@ -172,6 +175,8 @@ class BayesianEgoGraphTrust:
         }
 
         # ===== TRACK NODE UPDATES =====
+        # IMPORTANT: Only update tracks that the EGO ROBOT detected
+        # But use ALL edges from ANY agent in the ego graph for counting evidence
         # Positive evidence: in_fov_and_observed edges
         # Negative evidence: in_fov_only edges
 
@@ -184,20 +189,38 @@ class BayesianEgoGraphTrust:
 
         track_node_map = ego_graph_data.track_nodes  # track_id -> node_index
 
-        # Get all tracks from the graph (fused + individual)
+        # Get all tracks from the graph (fused + individual) for matching
         all_graph_tracks = []
         if hasattr(ego_graph_data, '_fused_tracks'):
             all_graph_tracks.extend(ego_graph_data._fused_tracks)
         if hasattr(ego_graph_data, '_individual_tracks'):
             all_graph_tracks.extend(ego_graph_data._individual_tracks)
 
-        # Count edges for each track in the graph
-        for track in all_graph_tracks:
-            if track.track_id not in track_node_map:
+        # Create object_id -> graph track mapping for easy lookup
+        # NOTE: object_id is globally unique (e.g., "gt_obj_5"), while track_id is robot-local (e.g., "3_gt_obj_5")
+        object_id_to_graph_track = {}
+        for graph_track in all_graph_tracks:
+            object_id_to_graph_track[graph_track.object_id] = graph_track
+
+        # ONLY update tracks detected by the ego robot in the CURRENT timestep
+        ego_tracks = ego_robot.get_all_current_tracks()
+
+        for ego_track in ego_tracks:
+            # Find the corresponding track in the ego graph by object_id
+            # (The graph may have fused this track, so track_id might differ)
+            # Match by object_id (global) not track_id (robot-local)
+            graph_track = object_id_to_graph_track.get(ego_track.object_id)
+
+            if graph_track is None:
+                # Ego track not in the graph (shouldn't happen, but handle gracefully)
+                continue
+
+            # Get the node index for this track in the graph
+            if graph_track.track_id not in track_node_map:
                 # Track not in graph node mapping, skip
                 continue
 
-            track_node_idx = track_node_map[track.track_id]
+            track_node_idx = track_node_map[graph_track.track_id]
             track_positive = 0
             track_negative = 0
 
@@ -221,20 +244,20 @@ class BayesianEgoGraphTrust:
                     track_edges = (fov_only_edges[1] == track_node_idx).sum()
                     track_negative = int(track_edges.item())
 
-            # Update track trust
+            # Update the EGO ROBOT'S ORIGINAL track (not the graph copy)
             if track_positive > 0 or track_negative > 0:
-                track.update_trust(
+                ego_track.update_trust(
                     delta_alpha=float(track_positive),
                     delta_beta=float(track_negative)
                 )
 
-            track_updates[track.track_id] = {
-                'alpha': track.trust_alpha,
-                'beta': track.trust_beta,
-                'mean_trust': track.trust_value,
+            track_updates[ego_track.track_id] = {
+                'alpha': ego_track.trust_alpha,
+                'beta': ego_track.trust_beta,
+                'mean_trust': ego_track.trust_value,
                 'num_positive': track_positive,
                 'num_negative': track_negative,
-                'object_id': track.object_id
+                'object_id': ego_track.object_id
             }
 
         return robot_updates, track_updates

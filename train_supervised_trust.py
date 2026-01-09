@@ -398,7 +398,7 @@ class SupervisedTrustTrainer:
 
         Note: We only compute loss for:
         - Ego robot (index 0) if ego_has_cross_validation is True
-        - Tracks in meaningful_track_indices (ego-detected with edges to >=2 robots)
+        - Tracks in meaningful_track_indices (ALL tracks detected by ego robot)
         """
         loss = 0.0
         agent_loss_value = 0.0

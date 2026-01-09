@@ -84,12 +84,14 @@ class TrustMethodComparison:
         self.paper_results = []
         self.supervised_results = []
         self.bayesian_results = []
+        self.baseline_results = []
 
         # Simulation parameters (can be overridden)
         self.adversarial_ratio = 0.3
         self.false_positive_rate = 0.5
         self.false_negative_rate = 0.0
         self.proximal_range = 50.0
+        self.allow_fp_codetection = False  # Can be set to True for FP codetection experiments
 
         # Try to load supervised model after proximal_range is set
         try:
@@ -114,7 +116,7 @@ class TrustMethodComparison:
         except Exception as e:
             print(f"⚠️ Failed to initialize Bayesian algorithm: {e}")
 
-    def create_identical_environments(self, count: int = 3) -> List[SimulationEnvironment]:
+    def create_identical_environments(self, count: int = 4) -> List[SimulationEnvironment]:
         """Create identical simulation environments."""
         envs = []
         for _ in range(count):
@@ -130,7 +132,8 @@ class TrustMethodComparison:
                 fov_range=self.fov_range,
                 fov_angle=self.fov_angle,
                 false_positive_rate=self.false_positive_rate,
-                false_negative_rate=self.false_negative_rate
+                false_negative_rate=self.false_negative_rate,
+                allow_fp_codetection=self.allow_fp_codetection
             )
             envs.append(env)
         return envs
@@ -445,6 +448,97 @@ class TrustMethodComparison:
         print("✅ Bayesian model simulation completed")
         return results
 
+    def run_baseline_simulation(self, env: SimulationEnvironment) -> List[Dict]:
+        """Run simulation with no trust updates (baseline that believes all robots equally)"""
+        print("🚀 Running baseline (no trust) simulation...")
+
+        results = []
+
+        for step in range(self.num_timesteps):
+            # CRITICAL: Reset random seed for each step to ensure identical randomness
+            step_seed = self.random_seed + step
+            np.random.seed(step_seed)
+            random.seed(step_seed)
+
+            # Step the simulation WITHOUT any trust updates
+            frame_data = env.step()
+
+            # Update current timestep tracks for all robots
+            for robot in env.robots:
+                robot.update_current_timestep_tracks()
+
+            # NO TRUST UPDATES - robots and tracks keep initial trust (0.5)
+
+            # Collect results (same structure as other algorithms)
+            step_result = {
+                'step': step,
+                'time': env.time,
+                'robot_trust_values': {
+                    robot.id: robot.trust_value for robot in env.robots
+                },
+                'robot_alpha_beta': {
+                    robot.id: {'alpha': robot.trust_alpha, 'beta': robot.trust_beta}
+                    for robot in env.robots
+                },
+                'track_trust_values': {},
+                'adversarial_robots': [r.id for r in env.robots if r.is_adversarial],
+                'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial]
+            }
+
+            # Collect track trust values
+            for robot in env.robots:
+                step_result['track_trust_values'][robot.id] = {
+                    track.track_id: {
+                        'trust_value': track.trust_value,
+                        'alpha': track.trust_alpha,
+                        'beta': track.trust_beta,
+                        'object_id': track.object_id
+                    }
+                    for track in robot.get_all_tracks()
+                }
+
+            # Store per-frame robot state and detections
+            robot_states = []
+            robot_detections = {}
+
+            for robot in env.robots:
+                robot_states.append({
+                    'id': robot.id,
+                    'position': robot.position[:2].tolist() if hasattr(robot.position, '__iter__') else [float(robot.position)],
+                    'orientation': float(getattr(robot, 'orientation', 0.0)),
+                    'trust_value': float(robot.trust_value),
+                    'is_adversarial': bool(robot.is_adversarial),
+                    'fov_range': float(robot.fov_range),
+                    'fov_angle': float(robot.fov_angle),
+                    'velocity': robot.velocity[:2].tolist() if hasattr(robot.velocity, '__iter__') else [float(robot.velocity)],
+                })
+
+                detections = []
+                for track in robot.get_current_timestep_tracks():
+                    object_type = "ground_truth" if track.object_id.startswith("gt_") else "false_positive" if track.object_id.startswith("fp_") else "unknown"
+                    detections.append({
+                        'track_id': track.track_id,
+                        'object_id': track.object_id,
+                        'position': track.position[:2].tolist() if hasattr(track.position, '__iter__') else [float(track.position)],
+                        'type': object_type,
+                        'trust_value': float(track.trust_value),
+                    })
+                robot_detections[str(robot.id)] = detections
+
+            step_result['frame_state'] = {
+                'world_size': list(env.world_size),
+                'robots': robot_states,
+                'detections': robot_detections,
+            }
+
+            results.append(step_result)
+
+            if step % 100 == 0:
+                print(f"  Baseline step {step}/{self.num_timesteps}")
+
+        print("✅ Baseline simulation completed")
+        return results
+
     def _run_trust_simulation(self, env: SimulationEnvironment, trust_system, label: str) -> List[Dict]:
         """Shared simulation loop for trust systems (baseline or mass-based)."""
 
@@ -602,7 +696,7 @@ class TrustMethodComparison:
         return results
 
     def run_comparison(self) -> Dict:
-        """Run complete comparison between paper algorithm, supervised model, and Bayesian method"""
+        """Run complete comparison between paper algorithm, supervised model, Bayesian method, and baseline"""
         print("🔄 Starting trust method comparison...")
         print(
             f"Configuration: world={self.world_size}m, robots={self.num_robots} "
@@ -612,10 +706,10 @@ class TrustMethodComparison:
         )
         print(f"Random seed: {self.random_seed}")
 
-        # Create identical environments for all three methods
-        paper_env, supervised_env, bayesian_env = self.create_identical_environments(3)
+        # Create identical environments for all four methods
+        paper_env, supervised_env, bayesian_env, baseline_env = self.create_identical_environments(4)
 
-        # Run all three simulations
+        # Run all four simulations
         print("\n" + "="*50)
         self.paper_results = self.run_paper_algorithm_simulation(paper_env)
 
@@ -624,6 +718,9 @@ class TrustMethodComparison:
 
         print("\n" + "="*50)
         self.bayesian_results = self.run_bayesian_simulation(bayesian_env)
+
+        print("\n" + "="*50)
+        self.baseline_results = self.run_baseline_simulation(baseline_env)
 
         # Generate comparison results
         comparison_results = {
@@ -640,6 +737,7 @@ class TrustMethodComparison:
             'paper_results': self.paper_results,
             'supervised_results': self.supervised_results,
             'bayesian_results': self.bayesian_results,
+            'baseline_results': self.baseline_results,
             'comparison_metrics': self._compute_comparison_metrics()
         }
 

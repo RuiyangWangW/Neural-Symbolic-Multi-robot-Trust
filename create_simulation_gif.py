@@ -10,103 +10,192 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 import json
 
 def convert_raw_data_to_animation_format(raw_data):
-    """Convert raw simulation data to format expected by animation"""
+    """Convert raw simulation data to format expected by animation
+
+    Handles two formats:
+    1. Direct simulation format: frames have 'robot_states', 'ground_truth', etc.
+    2. Comparison results format: frames have 'frame_state' with 'robots', 'detections', etc.
+    """
     simulation_data = []
-    
+
     for frame in raw_data:
         frame_data = {
-            'time': frame['time'],
+            'time': frame.get('time', 0.0),
             'robots': [],
             'ground_truth_objects': [],
             'detections': {},
             'false_positives': {}
         }
-        
-        # Get trust updates for this frame
-        trust_updates = frame.get('trust_updates', {})
-        
-        # Convert robot states
-        for robot_state in frame['robot_states']:
-            robot_id, position, velocity, is_adversarial, fov_range, fov_angle = robot_state
 
-            # Extract actual trust from trust_updates
-            robot_trust_info = trust_updates.get(str(robot_id), {})
-            trust_mean = robot_trust_info.get('mean_trust', 0.5)  # Use actual trust or default
-            
-            # Calculate orientation from velocity (direction of movement)
-            if velocity[0] != 0 or velocity[1] != 0:
-                orientation = np.arctan2(velocity[1], velocity[0])
-            else:
-                orientation = 0.0
-            
-            frame_data['robots'].append({
-                'id': robot_id,
-                'position': position[:2],  # Only x, y coordinates
-                'orientation': orientation,  # Actual orientation from movement
-                'fov_range': fov_range,  # Correct FOV range from simulation
-                'fov_angle': fov_angle,  # 60 degrees FOV angle
-                'is_adversarial': is_adversarial,
-                'trust': trust_mean  # Actual trust value
-            })
-            
-            # Initialize detection and false positive lists for each robot
-            frame_data['detections'][robot_id] = []
-            frame_data['false_positives'][robot_id] = []
-        
-        # Convert ground truth objects
-        gt_data = frame.get('ground_truth', {})
-        gt_objects = gt_data.get('objects', [])
-        for gt_obj in gt_objects:
-            obj_id, position, _, obj_type, movement_pattern = gt_obj
-            frame_data['ground_truth_objects'].append({
-                'id': obj_id,
-                'position': position[:2],  # Only x, y coordinates
-                'object_type': obj_type,
-                'movement_pattern': movement_pattern
-            })
-        
-        # Convert FP objects (persistent) - these show the actual FP object positions  
-        shared_fp_objects = frame.get('shared_fp_objects', [])
-        for fp_data in shared_fp_objects:
-            fp_id, position, velocity, obj_type, movement_pattern = fp_data
-            # Add FP objects to the ground truth objects list for visualization (as orange stars)
-            frame_data['ground_truth_objects'].append({
-                'id': fp_id,
-                'position': position[:2],  # Only x, y coordinates
-                'object_type': 'false_positive',
-                'movement_pattern': movement_pattern
-            })
-        
-        # ALSO convert FP detection tracks for debugging comparison
-        tracks = frame.get('tracks', {})
-        for robot_id_str, robot_tracks in tracks.items():
-            robot_id = int(robot_id_str)  # Convert string to int
-            for track in robot_tracks:
-                object_id, position, confidence, trust_alpha, trust_beta = track
-                track_data = {
+        # Check if this is comparison results format (has frame_state)
+        if 'frame_state' in frame:
+            # Comparison results format - extract from frame_state
+            frame_state = frame['frame_state']
+            robot_trust_values = frame.get('robot_trust_values', {})
+
+            # Robots are already in the right format
+            for robot in frame_state.get('robots', []):
+                robot_id = robot['id']
+                # Use trust from robot_trust_values if available, otherwise from robot data
+                trust_value = robot_trust_values.get(str(robot_id), robot.get('trust_value', 0.5))
+
+                frame_data['robots'].append({
+                    'id': robot_id,
+                    'position': robot['position'][:2],
+                    'orientation': robot.get('orientation', 0.0),
+                    'fov_range': robot.get('fov_range', 50.0),
+                    'fov_angle': robot.get('fov_angle', np.pi/3),
+                    'is_adversarial': robot.get('is_adversarial', False),
+                    'trust': trust_value
+                })
+
+                # Initialize detection lists
+                frame_data['detections'][robot_id] = []
+                frame_data['false_positives'][robot_id] = []
+
+            # Get detections from frame_state
+            # Detections is a dict mapping robot_id (string) -> list of detection objects
+            detections_dict = frame_state.get('detections', {})
+
+            # Track unique ground truth and FP objects for the ground truth layer
+            gt_objects_seen = {}  # object_id -> position
+            fp_objects_seen = {}  # object_id -> position
+
+            for robot_id_str, robot_detections in detections_dict.items():
+                robot_id = int(robot_id_str)
+                for detection in robot_detections:
+                    det_data = {
+                        'position': detection['position'][:2],
+                        'object_id': detection.get('object_id', ''),
+                        'trust_mean': detection.get('trust_value', 0.5),
+                        'confidence': detection.get('confidence', 1.0)
+                    }
+
+                    object_id = detection.get('object_id', '')
+                    position = detection['position'][:2]
+
+                    if 'gt_obj_' in object_id:
+                        det_data['type'] = 'gt_detection'
+                        frame_data['detections'][robot_id].append(det_data)
+                        # Track unique GT objects for visualization
+                        if object_id not in gt_objects_seen:
+                            gt_objects_seen[object_id] = position
+                    elif 'fp_' in object_id:
+                        det_data['type'] = 'fp_detection'
+                        frame_data['false_positives'][robot_id].append(det_data)
+                        # Track unique FP objects for visualization
+                        if object_id not in fp_objects_seen:
+                            fp_objects_seen[object_id] = position
+
+            # Add ground truth objects to frame data for visualization
+            for obj_id, position in gt_objects_seen.items():
+                frame_data['ground_truth_objects'].append({
+                    'id': obj_id,
+                    'position': position,
+                    'object_type': 'ground_truth',
+                    'movement_pattern': 'unknown'  # Not available in comparison format
+                })
+
+            # Add FP objects to frame data for visualization
+            for obj_id, position in fp_objects_seen.items():
+                frame_data['ground_truth_objects'].append({
+                    'id': obj_id,
+                    'position': position,
+                    'object_type': 'false_positive',
+                    'movement_pattern': 'unknown'  # Not available in comparison format
+                })
+
+        else:
+            # Direct simulation format - use old logic
+            trust_updates = frame.get('trust_updates', {})
+
+            # Convert robot states
+            for robot_state in frame['robot_states']:
+                robot_id, position, velocity, is_adversarial, fov_range, fov_angle = robot_state
+
+                # Extract actual trust from trust_updates
+                robot_trust_info = trust_updates.get(str(robot_id), {})
+                trust_mean = robot_trust_info.get('mean_trust', 0.5)  # Use actual trust or default
+
+                # Calculate orientation from velocity (direction of movement)
+                if velocity[0] != 0 or velocity[1] != 0:
+                    orientation = np.arctan2(velocity[1], velocity[0])
+                else:
+                    orientation = 0.0
+
+                frame_data['robots'].append({
+                    'id': robot_id,
                     'position': position[:2],  # Only x, y coordinates
-                    'object_id': object_id,
-                    'trust_mean': trust_alpha / (trust_alpha + trust_beta) if (trust_alpha + trust_beta) > 0 else 0.5,
-                    'confidence': confidence
-                }
-                
-                # Include both GT detections and FP detections for debugging
-                if 'gt_obj_' in object_id:
-                    track_data['type'] = 'gt_detection'
-                    frame_data['detections'][robot_id].append(track_data)
-                elif 'fp_' in object_id:
-                    track_data['type'] = 'fp_detection'
-                    frame_data['false_positives'][robot_id].append(track_data)
+                    'orientation': orientation,  # Actual orientation from movement
+                    'fov_range': fov_range,  # Correct FOV range from simulation
+                    'fov_angle': fov_angle,  # 60 degrees FOV angle
+                    'is_adversarial': is_adversarial,
+                    'trust': trust_mean  # Actual trust value
+                })
+
+                # Initialize detection and false positive lists for each robot
+                frame_data['detections'][robot_id] = []
+                frame_data['false_positives'][robot_id] = []
+
+            # Convert ground truth objects
+            gt_data = frame.get('ground_truth', {})
+            gt_objects = gt_data.get('objects', [])
+            for gt_obj in gt_objects:
+                obj_id, position, _, obj_type, movement_pattern = gt_obj
+                frame_data['ground_truth_objects'].append({
+                    'id': obj_id,
+                    'position': position[:2],  # Only x, y coordinates
+                    'object_type': obj_type,
+                    'movement_pattern': movement_pattern
+                })
+
+            # Convert FP objects (persistent) - these show the actual FP object positions
+            shared_fp_objects = frame.get('shared_fp_objects', [])
+            for fp_data in shared_fp_objects:
+                fp_id, position, velocity, obj_type, movement_pattern = fp_data
+                # Add FP objects to the ground truth objects list for visualization (as orange stars)
+                frame_data['ground_truth_objects'].append({
+                    'id': fp_id,
+                    'position': position[:2],  # Only x, y coordinates
+                    'object_type': 'false_positive',
+                    'movement_pattern': movement_pattern
+                })
+
+            # ALSO convert FP detection tracks for debugging comparison
+            tracks = frame.get('tracks', {})
+            for robot_id_str, robot_tracks in tracks.items():
+                robot_id = int(robot_id_str)  # Convert string to int
+                for track in robot_tracks:
+                    object_id, position, confidence, trust_alpha, trust_beta = track
+                    track_data = {
+                        'position': position[:2],  # Only x, y coordinates
+                        'object_id': object_id,
+                        'trust_mean': trust_alpha / (trust_alpha + trust_beta) if (trust_alpha + trust_beta) > 0 else 0.5,
+                        'confidence': confidence
+                    }
+
+                    # Include both GT detections and FP detections for debugging
+                    if 'gt_obj_' in object_id:
+                        track_data['type'] = 'gt_detection'
+                        frame_data['detections'][robot_id].append(track_data)
+                    elif 'fp_' in object_id:
+                        track_data['type'] = 'fp_detection'
+                        frame_data['false_positives'][robot_id].append(track_data)
         
         simulation_data.append(frame_data)
     
     return simulation_data
 
-def create_simulation_gif(data_file='trust_simulation_data.json'):
-    """Create animated GIF from existing simulation data"""
+def create_simulation_gif(data_file='trust_simulation_data.json', method='paper'):
+    """Create animated GIF from existing simulation data
+
+    Args:
+        data_file: Path to JSON file (can be comparison results or direct simulation data)
+        method: Which method to visualize ('paper', 'supervised', or 'bayesian') if using comparison results
+    """
     print("Creating Trust-Based Sensor Fusion Simulation GIF...")
     print(f"Loading data from: {data_file}")
-    
+
     # Load existing simulation data
     try:
         with open(data_file, 'r') as f:
@@ -114,28 +203,46 @@ def create_simulation_gif(data_file='trust_simulation_data.json'):
     except FileNotFoundError:
         print(f"Error: {data_file} not found. Please run the simulation first.")
         return
-    
+
+    # Check if this is comparison results format or direct simulation format
+    if isinstance(raw_data, dict) and ('paper_results' in raw_data or 'supervised_results' in raw_data or 'bayesian_results' in raw_data):
+        # This is comparison results format - extract the specified method
+        print(f"Detected comparison results format. Extracting '{method}' method data...")
+        method_key = f"{method}_results"
+        if method_key not in raw_data:
+            print(f"Error: Method '{method}' not found in data. Available methods: {[k.replace('_results', '') for k in raw_data.keys() if k.endswith('_results')]}")
+            return
+        frames_data = raw_data[method_key]
+    else:
+        # This is direct simulation format (array of frames)
+        frames_data = raw_data
+
     # Convert raw data to format expected by animation
-    simulation_data = convert_raw_data_to_animation_format(raw_data)
+    simulation_data = convert_raw_data_to_animation_format(frames_data)
     num_frames = len(simulation_data)
-    
+
     if num_frames == 0:
         print("Error: No simulation data found.")
         return
-    
+
     print(f"Loaded {num_frames} frames of simulation data")
-    
-    # Determine world size - use ground truth objects to set overall bounds
-    # but ensure robot movement area is clearly visible
-    world_size = raw_data[0].get('world_size', (100.0, 100.0))
+
+    # Determine world size
+    if frames_data and isinstance(frames_data[0], dict):
+        # Try to get from frame_state first
+        if 'frame_state' in frames_data[0]:
+            world_size = tuple(frames_data[0]['frame_state'].get('world_size', [100.0, 100.0]))
+        else:
+            world_size = tuple(frames_data[0].get('world_size', [100.0, 100.0]))
+    else:
+        world_size = (100.0, 100.0)
     # Set up the figure and axis
     fig, ax = plt.subplots(figsize=(12, 10))
     ax.set_xlim(0, world_size[0])
     ax.set_ylim(0, world_size[1])
     ax.set_aspect('equal')
     ax.grid(True, alpha=0.3)
-    ax.set_xlabel('X Position (m)', fontsize=12)
-    ax.set_ylabel('Y Position (m)', fontsize=12)
+    ax.tick_params(axis='both', labelsize=32)
     
     # Colors for robots (consistent throughout animation)
     num_robots = len(simulation_data[0]['robots']) if simulation_data else 4
@@ -149,77 +256,39 @@ def create_simulation_gif(data_file='trust_simulation_data.json'):
         ax.set_ylim(0, world_size[1])
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)
-        ax.set_xlabel('X Position (m)', fontsize=12)
-        ax.set_ylabel('Y Position (m)', fontsize=12)
-        
+        ax.tick_params(axis='both', labelsize=32)
+
         data = simulation_data[frame]
-        
-        # Title with time and trust info
-        title_parts = [f'Trust-Based Sensor Fusion (t={data["time"]:.1f}s)']
-        
-        # Calculate average trust for each type
-        leg_trusts = [r['trust'] for r in data['robots'] if not r['is_adversarial']]
-        adv_trusts = [r['trust'] for r in data['robots'] if r['is_adversarial']]
-        
-        if leg_trusts:
-            title_parts.append(f'LEG Trust: {np.mean(leg_trusts):.2f}')
-        if adv_trusts:
-            title_parts.append(f'ADV Trust: {np.mean(adv_trusts):.2f}')
-            
-        ax.set_title(' | '.join(title_parts), fontsize=14, fontweight='bold')
-        
-        # Plot ground truth objects (blue stars) and FP objects (orange stars)
+
+        # Plot ground truth objects (green circles) and FP objects (red circles)
         for gt_obj in data['ground_truth_objects']:
             if gt_obj.get('object_type') == 'false_positive':
-                # FP objects: orange stars
-                color = 'orange'
-                label = 'False Positive' if gt_obj['id'] == 0 else ''
-                prefix = 'FP'
+                # FP objects: red circles
+                color = 'red'
             else:
-                # GT objects: blue stars
-                color = 'blue' 
-                label = 'Ground Truth' if gt_obj['id'] == 0 else ''
-                prefix = 'GT'
-                
+                # GT objects: green circles
+                color = 'green'
+
             ax.scatter(gt_obj['position'][0], gt_obj['position'][1],
-                      c=color, marker='*', s=300, alpha=0.9,
-                      edgecolors='black', linewidth=2, 
-                      label=label)
-            
-            # Add object ID label
-            ax.text(gt_obj['position'][0], gt_obj['position'][1] + 1.2, f'{prefix}{gt_obj["id"]}', 
-                   ha='center', va='bottom', fontsize=8, fontweight='bold',
-                   bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
-        
-        # Plot robots with FOV and detections
+                      c=color, marker='o', s=200, alpha=0.8,
+                      edgecolors='black', linewidth=1.5)
+
+        # Plot robots with FOV
         for i, robot in enumerate(data['robots']):
             pos = robot['position']
-            
-            # All robots use square marker, color based on type
+
+            # All robots are custom blue boxes
             marker = 's'  # Square for all robots
-            if robot['is_adversarial']:
-                color = 'red'
-                robot_type = 'ADV'
-            else:
-                color = 'green'
-                robot_type = 'LEG'
-            
-            # Robot size based on trust (higher trust = larger)
-            robot_size = 100 + robot['trust'] * 200
-            
+            color = '#6093D3'
+            robot_size = 200
+
             ax.scatter(pos[0], pos[1], c=color, marker=marker, s=robot_size,
-                      edgecolors='white', linewidth=2, alpha=0.9,
-                      label=f'{robot_type} Robot' if (robot_type == 'LEG' and i == 0) or (robot_type == 'ADV' and robot['is_adversarial'] and not any(r['is_adversarial'] and r['id'] < robot['id'] for r in data['robots'])) else '')
-            
-            # Robot ID text
-            ax.text(pos[0], pos[1] - 1.5, f'R{robot["id"]}\\n{robot["trust"]:.2f}', 
-                   ha='center', va='top', fontsize=9, fontweight='bold',
-                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor=color))
-            
+                      edgecolors='black', linewidth=2, alpha=0.9)
+
             # Field of View (FOV) visualization
             fov_angles = np.linspace(robot['orientation'] - robot['fov_angle']/2,
                                    robot['orientation'] + robot['fov_angle']/2, 30)
-            
+
             # FOV triangle
             fov_x = [pos[0]]
             fov_y = [pos[1]]
@@ -228,65 +297,10 @@ def create_simulation_gif(data_file='trust_simulation_data.json'):
                 fov_y.append(pos[1] + robot['fov_range'] * np.sin(angle))
             fov_x.append(pos[0])
             fov_y.append(pos[1])
-            
-            # FOV fill (make adversarial FOV more visible)
-            fov_alpha = 0.15 if robot['is_adversarial'] else 0.1  # Increased from 0.05 to 0.15
-            ax.fill(fov_x, fov_y, color=color, alpha=fov_alpha)
-            ax.plot(fov_x, fov_y, color=color, linewidth=2, alpha=0.6)  # Stronger outline
-            
-            # Plot false positive objects only (same symbol as GT, different color)
-            for fp in data['false_positives'][robot['id']]:
-                fp_pos = fp['position']
-                fp_type = fp.get('type', 'unknown')
-                
-                # Only show FP objects, not FP detections
-                if fp_type == 'fp_object':
-                    # FP Objects: Use same star symbol as GT objects but orange color
-                    ax.scatter(fp_pos[0], fp_pos[1], 
-                              c='orange', marker='*', s=300, alpha=0.9, 
-                              edgecolors='black', linewidth=2)
-                    
-                    # Add FP object ID label (similar to GT objects)
-                    ax.text(fp_pos[0], fp_pos[1] + 1.2, f'FP{fp["object_id"].replace("fp_", "")}', 
-                           ha='center', va='bottom', fontsize=8, fontweight='bold',
-                           bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
-        
-        # Add consistent legend for all frames
-        from matplotlib.patches import Patch
-        from matplotlib.lines import Line2D
-        
-        legend_elements = [
-            Line2D([0], [0], marker='*', color='w', markerfacecolor='blue', markersize=12, label='Ground Truth Objects'),
-            Line2D([0], [0], marker='*', color='w', markerfacecolor='orange', markeredgecolor='black', 
-                   markeredgewidth=2, markersize=12, label='False Positive Objects'),
-            Line2D([0], [0], marker='s', color='w', markerfacecolor='green', markersize=10, label='Legitimate Robots'), 
-            Line2D([0], [0], marker='s', color='w', markerfacecolor='red', markersize=10, label='Adversarial Robots'),
-        ]
-        ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1, 1), fontsize=10)
-        
-        # Add info box
-        info_text = f"Ground Truth Objects: {len(data['ground_truth_objects'])}\\n"
-        
-        # Count only FP objects (no longer showing FP detections)
-        total_fp_objects = 0
-        for fps in data['false_positives'].values():
-            for fp in fps:
-                if fp.get('type') == 'fp_object':
-                    total_fp_objects += 1
-        
-        info_text += f"False Positive Objects: {total_fp_objects}\\n"
-        
-        # Add robot trust info
-        leg_trusts = [r['trust'] for r in data['robots'] if not r['is_adversarial']]
-        adv_trusts = [r['trust'] for r in data['robots'] if r['is_adversarial']]
-        if leg_trusts:
-            info_text += f"Avg LEG Trust: {np.mean(leg_trusts):.2f}\\n"
-        if adv_trusts:
-            info_text += f"Avg ADV Trust: {np.mean(adv_trusts):.2f}"
-        
-        ax.text(0.02, 0.98, info_text, transform=ax.transAxes, 
-               verticalalignment='top', fontsize=10,
-               bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8))
+
+            # FOV fill - transparent lightblue
+            ax.fill(fov_x, fov_y, color='lightblue', alpha=0.15)
+            ax.plot(fov_x, fov_y, color='lightblue', linewidth=1.5, alpha=0.4)
     
     # Create animation (5x faster: reduced interval and increased fps)
     print("Rendering GIF (this may take a moment)...")
@@ -322,54 +336,40 @@ def create_summary_plot(world_bounds, simulation_data):
     ax1.set_ylim(y_min - 2, y_max + 2)
     ax1.set_aspect('equal')
     ax1.grid(True, alpha=0.3)
-    ax1.set_xlabel('X Position (m)', fontsize=12)
-    ax1.set_ylabel('Y Position (m)', fontsize=12)
-    ax1.set_title('Final Simulation State', fontsize=14, fontweight='bold')
-    
+    ax1.tick_params(axis='both', labelsize=32)
+
     num_robots = len(final_data['robots']) if final_data['robots'] else 4
     robot_colors = plt.cm.Set1(np.linspace(0, 1, num_robots))
-    
-    # Plot ground truth objects (blue stars, same as GIF)
+
+    # Plot ground truth objects (green circles) and FP objects (red circles)
     for gt_obj in final_data['ground_truth_objects']:
+        if gt_obj.get('object_type') == 'false_positive':
+            # FP objects: red circles
+            color = 'red'
+        else:
+            # GT objects: green circles
+            color = 'green'
+
         ax1.scatter(gt_obj['position'][0], gt_obj['position'][1],
-                   c='blue', marker='*', s=300, alpha=0.9,
-                   edgecolors='black', linewidth=2, 
-                   label='Ground Truth' if gt_obj['id'] == 0 else '')
-        
-        # Add GT object ID label
-        ax1.text(gt_obj['position'][0], gt_obj['position'][1] + 1.2, f'GT{gt_obj["id"]}', 
-               ha='center', va='bottom', fontsize=8, fontweight='bold',
-               bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
-    
-    # Plot robots with FOV (matching GIF format exactly)
+                   c=color, marker='o', s=200, alpha=0.8,
+                   edgecolors='black', linewidth=1.5)
+
+    # Plot robots with FOV
     for i, robot in enumerate(final_data['robots']):
         pos = robot['position']
-        
-        # Robot color and type (matching GIF)
-        if robot['is_adversarial']:
-            color = 'red'
-            robot_type = 'ADV'
-        else:
-            color = 'green'
-            robot_type = 'LEG'
-        
-        # Robot size based on trust (matching GIF)
-        robot_size = 100 + robot['trust'] * 200
-        
-        # All robots use square marker (matching GIF)
-        ax1.scatter(pos[0], pos[1], c=color, marker='s', s=robot_size,
-                   edgecolors='white', linewidth=2, alpha=0.9,
-                   label=f'{robot_type} Robot' if (robot_type == 'LEG' and i == 0) or (robot_type == 'ADV' and robot['is_adversarial'] and not any(r['is_adversarial'] and r['id'] < robot['id'] for r in final_data['robots'])) else '')
-        
-        # Robot ID text (matching GIF)
-        ax1.text(pos[0], pos[1] - 1.5, f'R{robot["id"]}\n{robot["trust"]:.2f}', 
-               ha='center', va='top', fontsize=9, fontweight='bold',
-               bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor=color))
-        
-        # Field of View (FOV) visualization (matching GIF)
+
+        # All robots are custom blue boxes
+        marker = 's'
+        color = '#6093D3'
+        robot_size = 200
+
+        ax1.scatter(pos[0], pos[1], c=color, marker=marker, s=robot_size,
+                   edgecolors='black', linewidth=2, alpha=0.9)
+
+        # Field of View (FOV) visualization
         fov_angles = np.linspace(robot['orientation'] - robot['fov_angle']/2,
                                robot['orientation'] + robot['fov_angle']/2, 30)
-        
+
         # FOV triangle
         fov_x = [pos[0]]
         fov_y = [pos[1]]
@@ -378,38 +378,10 @@ def create_summary_plot(world_bounds, simulation_data):
             fov_y.append(pos[1] + robot['fov_range'] * np.sin(angle))
         fov_x.append(pos[0])
         fov_y.append(pos[1])
-        
-        # FOV fill (matching GIF transparency)
-        fov_alpha = 0.15 if robot['is_adversarial'] else 0.1
-        ax1.fill(fov_x, fov_y, color=color, alpha=fov_alpha)
-        ax1.plot(fov_x, fov_y, color=color, linewidth=2, alpha=0.6)
-        
-        # Plot false positive objects (orange stars, same as GT but different color)
-        for fp in final_data['false_positives'][robot['id']]:
-            if fp.get('type') == 'fp_object':  # Only show FP objects
-                fp_pos = fp['position']
-                
-                # FP Objects: Use same star symbol as GT objects but orange color
-                ax1.scatter(fp_pos[0], fp_pos[1], 
-                          c='orange', marker='*', s=300, alpha=0.9, 
-                          edgecolors='black', linewidth=2)
-                
-                # Add FP object ID label (similar to GT objects)
-                ax1.text(fp_pos[0], fp_pos[1] + 1.2, f'FP{fp["object_id"].replace("fp_", "")}', 
-                       ha='center', va='bottom', fontsize=8, fontweight='bold',
-                       bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.8))
-    
-    # Add consistent legend (matching GIF format)
-    from matplotlib.lines import Line2D
-    
-    legend_elements = [
-        Line2D([0], [0], marker='*', color='w', markerfacecolor='blue', markersize=12, label='Ground Truth Objects'),
-        Line2D([0], [0], marker='*', color='w', markerfacecolor='orange', markeredgecolor='black', 
-               markeredgewidth=2, markersize=12, label='False Positive Objects'),
-        Line2D([0], [0], marker='s', color='w', markerfacecolor='green', markersize=10, label='Legitimate Robots'), 
-        Line2D([0], [0], marker='s', color='w', markerfacecolor='red', markersize=10, label='Adversarial Robots'),
-    ]
-    ax1.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1, 1), fontsize=10)
+
+        # FOV fill - transparent lightblue
+        ax1.fill(fov_x, fov_y, color='lightblue', alpha=0.15)
+        ax1.plot(fov_x, fov_y, color='lightblue', linewidth=1.5, alpha=0.4)
     
     # Right plot: Trust evolution over time
     ax2.set_xlabel('Time (s)', fontsize=12)
@@ -444,6 +416,12 @@ def create_summary_plot(world_bounds, simulation_data):
     print("✅ Summary plot saved as: simulation_summary.png")
 
 if __name__ == "__main__":
-    import sys
-    data_file = sys.argv[1] if len(sys.argv) > 1 else "trust_simulation_data.json"
-    create_simulation_gif(data_file)
+    import argparse
+    parser = argparse.ArgumentParser(description='Create animated GIF from trust simulation data')
+    parser.add_argument('data_file', nargs='?', default='trust_simulation_data.json',
+                        help='Path to JSON file (can be comparison results or direct simulation data)')
+    parser.add_argument('--method', default='paper', choices=['paper', 'supervised', 'bayesian'],
+                        help='Which method to visualize (for comparison results)')
+    args = parser.parse_args()
+
+    create_simulation_gif(args.data_file, method=args.method)

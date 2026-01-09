@@ -547,11 +547,12 @@ class SupervisedTrustPredictor:
 
     def _identify_meaningful_tracks(self, ego_robot: 'Robot', graph_data, num_tracks: int) -> List[int]:
         """
-        Identify meaningful tracks for inference
+        Identify tracks to update for inference
 
-        A track is meaningful if:
+        A track is included if:
         1. It's currently detected by ego robot (in get_all_current_tracks())
-        2. It has edges to >= 2 robots (cross-validation constraint)
+
+        Note: Cross-validation filter has been removed - we update ALL tracks detected by ego robot.
 
         Args:
             ego_robot: The ego robot
@@ -559,9 +560,9 @@ class SupervisedTrustPredictor:
             num_tracks: Number of tracks in the ego graph
 
         Returns:
-            List of meaningful track indices
+            List of track indices for all ego-detected tracks
         """
-        meaningful_indices = []
+        track_indices = []
 
         # Get tracks currently detected by ego robot
         ego_current_tracks = ego_robot.get_all_current_tracks()
@@ -574,21 +575,14 @@ class SupervisedTrustPredictor:
         else:
             return []
 
-        edge_index_dict = graph_data.edge_index_dict
-
-        # For each track, check if it's meaningful
+        # For each track, check if it's detected by ego robot
         for track_idx, track in enumerate(all_tracks[:num_tracks]):
-            # Check 1: Is this track currently detected by ego robot?
+            # Is this track currently detected by ego robot?
             # Match by object_id (not track_id) since fusion changes track_id
-            if track.object_id not in ego_object_ids:
-                continue
+            if track.object_id in ego_object_ids:
+                track_indices.append(track_idx)
 
-            # Check 2: Does this track have edges to >= 2 robots?
-            num_robots_with_edges = self._count_robots_with_edges_to_track(edge_index_dict, track_idx)
-            if num_robots_with_edges >= 2:
-                meaningful_indices.append(track_idx)
-
-        return meaningful_indices
+        return track_indices
 
     def _count_robots_with_edges_to_track(self, edge_index_dict: Dict, track_idx: int) -> int:
         """
@@ -623,7 +617,7 @@ class SupervisedTrustPredictor:
                                  robots: List['Robot'],
                                  threshold: float = 0.5) -> Dict:
         """
-        Predict trust labels directly from ego robot and all robots with cross-validation constraints
+        Predict trust labels directly from ego robot and all robots
 
         Args:
             ego_robot: The robot for which to build the ego graph
@@ -635,7 +629,9 @@ class SupervisedTrustPredictor:
 
         Note: Only returns predictions if:
         - Ego robot has cross-validation (co_detection or contradicts edges)
-        - There are meaningful tracks (ego-detected AND have edges to >=2 robots)
+        - Ego robot has at least one detected track
+
+        All tracks detected by ego robot will be updated (no cross-validation filter for tracks).
         """
         if self.model is None:
             raise ValueError("Model not loaded successfully")
@@ -654,21 +650,21 @@ class SupervisedTrustPredictor:
         num_agents = graph_data.x_dict['agent'].shape[0] if 'agent' in graph_data.x_dict else 0
         num_tracks = graph_data.x_dict['track'].shape[0] if 'track' in graph_data.x_dict else 0
 
-        # Identify meaningful tracks
-        meaningful_track_indices = self._identify_meaningful_tracks(ego_robot, graph_data, num_tracks)
+        # Identify tracks detected by ego robot (all ego-detected tracks, no cross-validation filter)
+        ego_track_indices = self._identify_meaningful_tracks(ego_robot, graph_data, num_tracks)
 
-        if len(meaningful_track_indices) == 0:
-            # No meaningful tracks, skip update
+        if len(ego_track_indices) == 0:
+            # No tracks detected by ego robot, skip update
             return None
 
         # Make predictions
         predictions = self.predict(num_agents, num_tracks, graph_data.edge_index_dict, threshold)
 
-        # Return predictions with meaningful track indices for filtering
+        # Return predictions with ego track indices
         return {
             'predictions': predictions,
             'graph_data': graph_data,
-            'meaningful_track_indices': meaningful_track_indices,
+            'meaningful_track_indices': ego_track_indices,  # All ego-detected tracks
             'ego_has_cross_validation': ego_has_cross_validation
         }
 
