@@ -65,7 +65,7 @@ class SupervisedDataGenerator:
                  false_positive_rate: Union[float, Tuple[float, float]] = 0.5,
                  false_negative_rate: Union[float, Tuple[float, float]] = 0.0,
                  proximal_range: float = 50.0,
-                 fov_range: float = 80.0,
+                 fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
                  max_steps_per_episode: int = 100):
         """
@@ -105,92 +105,6 @@ class SupervisedDataGenerator:
         # Initialize ego graph builder (will be updated for each episode)
         self.ego_graph_builder = None
 
-    def _assign_ground_truth_trust(self, robots: List):
-        """
-        Assign trust values based on ground truth labels with controlled noise.
-
-        80% of the time: Perfect ground truth trust
-        - Legitimate robots/tracks: trust randomly from 0.7 to 1.0
-        - Adversarial robots/false positive tracks: trust randomly from 0.0 to 0.3
-
-        20% of the time: Random noise trust
-        - Any entity: trust randomly from 0.0 to 1.0 (regardless of ground truth)
-
-        This creates a more comprehensive dataset for supervised learning.
-        """
-        import random
-
-        for robot in robots:
-            # 80% chance of ground truth, 20% chance of random noise
-            if random.random() < 0.8:
-                # Ground truth trust assignment
-                if robot.is_adversarial:
-                    # Adversarial robot: low trust (0.0 to 0.3)
-                    trust_value = random.uniform(0.0, 0.3)
-                else:
-                    # Legitimate robot: high trust (0.7 to 1.0)
-                    trust_value = random.uniform(0.7, 1.0)
-            else:
-                # Random noise: any value between 0 and 1
-                trust_value = random.uniform(0.0, 1.0)
-
-            # Calculate confidence based on certainty
-            # High confidence when trust is close to 0 or 1
-            # Use distance from 0.5 as measure of certainty
-            certainty = abs(trust_value - 0.5) * 2  # 0 to 1 scale
-            # Map certainty to κ (kappa): higher certainty = higher κ = higher confidence
-            # κ range: [5, 30] where 5 = low confidence, 30 = high confidence
-            kappa = 5 + certainty * 25
-
-            # Calculate alpha and beta from trust and kappa
-            # mean = alpha/(alpha+beta) = trust_value
-            # alpha + beta = kappa
-            alpha = trust_value * kappa
-            beta = (1.0 - trust_value) * kappa
-
-            # Ensure minimum values
-            alpha = max(1.0, alpha)
-            beta = max(1.0, beta)
-
-            # Assign to robot
-            robot.trust_alpha = alpha
-            robot.trust_beta = beta
-
-            # Also assign trust to all tracks from this robot
-            for track in robot.get_all_tracks():
-                # 80% chance of ground truth, 20% chance of random noise
-                if random.random() < 0.8:
-                    # Ground truth trust assignment for tracks
-                    # Determine if track is false positive using same logic as label generation
-                    track_id_str = str(track.object_id)
-                    is_false_positive = track_id_str.startswith('fp_obj_')
-
-                    # Track trust should be based on whether it's a false positive,
-                    # NOT on whether the robot is adversarial
-                    # (adversarial robots can detect real objects too!)
-                    if is_false_positive:
-                        # False positive track: low trust
-                        track_trust_value = random.uniform(0.0, 0.3)
-                    else:
-                        # True positive track: high trust
-                        track_trust_value = random.uniform(0.7, 1.0)
-                else:
-                    # Random noise: any value between 0 and 1
-                    track_trust_value = random.uniform(0.0, 1.0)
-
-                # Calculate confidence for track
-                track_certainty = abs(track_trust_value - 0.5) * 2
-                track_kappa = 5 + track_certainty * 25
-
-                track_alpha = track_trust_value * track_kappa
-                track_beta = (1.0 - track_trust_value) * track_kappa
-
-                track_alpha = max(1.0, track_alpha)
-                track_beta = max(1.0, track_beta)
-
-                track.trust_alpha = track_alpha
-                track.trust_beta = track_beta
-
     def _simulate_step_with_rl(self, step_idx: int):
         """
         Execute a single environment step and apply ground truth trust assignment.
@@ -199,9 +113,6 @@ class SupervisedDataGenerator:
 
         for robot in self.sim_env.robots:
             robot.update_current_timestep_tracks()
-
-        # Assign ground truth trust values instead of using RL trust system
-        self._assign_ground_truth_trust(self.sim_env.robots)
 
         return frame_data
 

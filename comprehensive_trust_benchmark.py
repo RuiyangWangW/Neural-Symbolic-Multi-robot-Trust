@@ -400,8 +400,8 @@ def plot_accuracy(summary: List[Dict], output_dir: Path) -> None:
     robot_fig, (ax_robot, ax_object) = plt.subplots(1, 2, figsize=(16, 6), sharey=False)
 
     for idx, method in enumerate(METHOD_ORDER):
-        robot_acc = [entry["metrics"].get(method, {}).get("robots", {}).get("accuracy", 0.0) for entry in summary]
-        object_acc = [entry["metrics"].get(method, {}).get("objects", {}).get("accuracy", 0.0) for entry in summary]
+        robot_acc = [entry["metrics"].get(method, {}).get("robots", {}).get("precision", 0.0) for entry in summary]
+        object_acc = [entry["metrics"].get(method, {}).get("objects", {}).get("precision", 0.0) for entry in summary]
         offsets = x + (idx - 1.5) * width
         color = method_colors.get(method, f'C{idx}')
         ax_robot.bar(offsets, robot_acc, width=width, label=METHOD_DISPLAY_NAMES[method],
@@ -420,7 +420,7 @@ def plot_accuracy(summary: List[Dict], output_dir: Path) -> None:
     ax_object.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=4, fontsize=10)
     robot_fig.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
-    robot_fig.savefig(output_dir / "trust_method_accuracy_summary.png", dpi=200, bbox_inches="tight")
+    robot_fig.savefig(output_dir / "trust_method_precision_summary.png", dpi=200, bbox_inches="tight")
     plt.close(robot_fig)
 
 
@@ -435,7 +435,7 @@ def run_scenario(scenario: Dict, args: argparse.Namespace, output_dir: Path) -> 
         num_timesteps=scenario["num_timesteps"],
         random_seed=scenario["random_seed"],
         world_size=scenario["world_size"],
-        fov_range=80.0,
+        fov_range=50.0,
         fov_angle=np.pi / 3,
     )
     comparison.adversarial_ratio = scenario["adversarial_ratio"]
