@@ -8,7 +8,7 @@ that predicts trust values from the structure of ego-centric observation graphs.
 Key Properties:
 - Ego-centric: Each robot updates only its own trust and detected tracks
 - Ego robot cross-validation: Only updates when ego robot has co-detection or contradicts edges
-- Track updates: All tracks detected by ego robot are updated (no cross-validation filter)
+- Track cross-validation: Only updates tracks detected by ego AND with edges to >=2 robots
 - Neural-symbolic: GNN predictions guide Beta distribution trust updates
 """
 
@@ -173,13 +173,13 @@ class SupervisedTrustAlgorithm:
 
         This design ensures:
         - Ego-centric updates (each robot only updates itself)
-        - All ego-detected tracks updated (no cross-validation filter for tracks)
+        - Cross-validated tracks only (ego-detected + edges to >=2 robots)
         - Privacy-preserving (no robot updates another robot's trust)
 
         Args:
             predictions: Model predictions containing trust probabilities
             graph_data: Graph data with node mappings (agent_nodes, track_nodes)
-            meaningful_track_indices: List of track indices for ALL tracks detected by ego robot
+            meaningful_track_indices: List of track indices (ego-detected + edges to >=2 robots)
 
         Returns:
             Set of track_ids that were updated

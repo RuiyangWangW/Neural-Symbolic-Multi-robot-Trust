@@ -551,8 +551,9 @@ class SupervisedTrustPredictor:
 
         A track is included if:
         1. It's currently detected by ego robot (in get_all_current_tracks())
-
-        Note: Cross-validation filter has been removed - we update ALL tracks detected by ego robot.
+        2. It has edges to at least one OTHER robot besides ego (cross-validation)
+           - Ego robot is always at index 0
+           - Track must have edges to >= 2 robots total (ego + at least 1 other)
 
         Args:
             ego_robot: The ego robot
@@ -560,7 +561,7 @@ class SupervisedTrustPredictor:
             num_tracks: Number of tracks in the ego graph
 
         Returns:
-            List of track indices for all ego-detected tracks
+            List of track indices that meet both criteria
         """
         track_indices = []
 
@@ -575,11 +576,17 @@ class SupervisedTrustPredictor:
         else:
             return []
 
-        # For each track, check if it's detected by ego robot
+        # Check each track for both criteria
         for track_idx, track in enumerate(all_tracks[:num_tracks]):
-            # Is this track currently detected by ego robot?
+            # Criterion 1: Is this track currently detected by ego robot?
             # Match by object_id (not track_id) since fusion changes track_id
-            if track.object_id in ego_object_ids:
+            if track.object_id not in ego_object_ids:
+                continue
+
+            # Criterion 2: Does this track have edges to at least one OTHER robot?
+            # Count total robots with edges - should be >= 2 (ego + at least 1 other)
+            num_robots_with_edges = self._count_robots_with_edges_to_track(graph_data.edge_index_dict, track_idx)
+            if num_robots_with_edges >= 2:
                 track_indices.append(track_idx)
 
         return track_indices
@@ -629,9 +636,7 @@ class SupervisedTrustPredictor:
 
         Note: Only returns predictions if:
         - Ego robot has cross-validation (co_detection or contradicts edges)
-        - Ego robot has at least one detected track
-
-        All tracks detected by ego robot will be updated (no cross-validation filter for tracks).
+        - Ego robot has at least one meaningful track (detected + edges to >=2 robots)
         """
         if self.model is None:
             raise ValueError("Model not loaded successfully")
@@ -650,7 +655,7 @@ class SupervisedTrustPredictor:
         num_agents = graph_data.x_dict['agent'].shape[0] if 'agent' in graph_data.x_dict else 0
         num_tracks = graph_data.x_dict['track'].shape[0] if 'track' in graph_data.x_dict else 0
 
-        # Identify tracks detected by ego robot (all ego-detected tracks, no cross-validation filter)
+        # Identify meaningful tracks (ego-detected + edges to >=2 robots for cross-validation)
         ego_track_indices = self._identify_meaningful_tracks(ego_robot, graph_data, num_tracks)
 
         if len(ego_track_indices) == 0:

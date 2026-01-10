@@ -287,32 +287,54 @@ def compute_robot_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str,
 
 def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str, float], Dict[str, float]]:
     """
-    Compute object-level accuracy by averaging trust across all robots detecting each object.
-    Objects never detected by any robot are excluded from accuracy calculation.
+    Compute object-level accuracy using only believed-legitimate robots (trust >= threshold).
+
+    Algorithm:
+    1. Filter to robots with trust >= threshold (believed legitimate)
+    2. Aggregate tracks by object_id using weighted average from filtered robots only
+    3. Objects with aggregated trust > threshold are "believed to be true"
+    4. Accuracy = (GT objects believed true) / (GT + FP objects believed true)
+
+    This measures: "Of all objects we trust (based on trusted robots), what fraction are actually real?"
     """
     track_data = final_step.get("track_trust_values", {})
+    robot_trust_data = final_step.get("robot_trust_values", {})
 
-    # Aggregate tracks by object_id across all robots
-    object_trust_values = {}  # object_id -> list of trust values from different robots
+    # Filter to believed-legitimate robots (trust >= threshold)
+    legitimate_robots = {robot_id for robot_id, trust in robot_trust_data.items()
+                        if float(trust) >= threshold}
 
-    for robot_tracks in track_data.values():
+    # Aggregate tracks by object_id from legitimate robots only
+    object_weighted_trusts = {}  # object_id -> list of (robot_trust, track_trust) tuples
+
+    for robot_id, robot_tracks in track_data.items():
+        if robot_id not in legitimate_robots:
+            continue  # Skip robots with trust <= threshold
+
+        robot_trust = float(robot_trust_data.get(robot_id, 0.5))
+
         for _, track_info in robot_tracks.items():
             object_id = track_info.get("object_id", "")
-            trust_value = float(track_info.get("trust_value", 0.5))
+            track_trust = float(track_info.get("trust_value", 0.5))
 
             if object_id.startswith("gt_") or object_id.startswith("fp_"):
-                if object_id not in object_trust_values:
-                    object_trust_values[object_id] = []
-                object_trust_values[object_id].append(trust_value)
+                if object_id not in object_weighted_trusts:
+                    object_weighted_trusts[object_id] = []
+                object_weighted_trusts[object_id].append((robot_trust, track_trust))
 
-    # Calculate average trust per object and evaluate
+    # Calculate weighted average trust per object and evaluate
     labels = []
     scores = []
     gt_trust = []
     fp_trust = []
 
-    for object_id, trust_values in object_trust_values.items():
-        avg_trust = float(np.mean(trust_values))
+    for object_id, weighted_values in object_weighted_trusts.items():
+        # Calculate weighted average: sum(robot_trust * track_trust) / sum(robot_trust)
+        sum_weighted = sum(robot_trust * track_trust for robot_trust, track_trust in weighted_values)
+        sum_weights = sum(robot_trust for robot_trust, track_trust in weighted_values)
+
+        # Avoid division by zero
+        avg_trust = float(sum_weighted / sum_weights) if sum_weights > 0 else 0.5
 
         if object_id.startswith("gt_"):
             labels.append(1)
