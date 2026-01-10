@@ -53,29 +53,50 @@ def make_scenario(
     }
 
 
+# ============================================================================
+# SCENARIO DEFINITIONS - Matching the 6 benchmark files
+# ============================================================================
+# This comprehensive benchmark includes:
+#   - 10 In-sample scenarios (matching training distribution)
+#   - 40 OOD scenarios across 4 dimensions:
+#     * 10 higher FP rate (0.4-0.9)
+#     * 10 higher FN rate (0.4-0.8)
+#     * 10 higher adversarial ratio (0.4-0.5)
+#     * 10 even higher adversarial ratio (0.5-0.8)
+# Total: 50 scenarios
+# ============================================================================
+
+# Base parameters matching the 6 benchmark files
 BASE_ROBOT_DENSITY = 0.0005  # ≈5 robots in 100x100 world
-BASE_TARGET_DENSITY_MULTIPLIER = 4.0  # ≈20 targets in 100x100 world
+BASE_TARGET_DENSITY_MULTIPLIER = 2.0  # ≈10 targets (matches benchmark files)
 BASE_TARGET_DENSITY = round(BASE_ROBOT_DENSITY * BASE_TARGET_DENSITY_MULTIPLIER, 8)
 WORLD_SIZE_METERS = 100.0
 
-IN_SAMPLE_SCENARIOS: List[Dict] = []
-robot_density_values = [0.00045, 0.00048, 0.0005, 0.00052, 0.00055, 0.00046, 0.00049, 0.00053, 0.00057, 0.00051]
-target_density_values = [0.0018, 0.0019, 0.0020, 0.0021, 0.0022, 0.00185, 0.00195, 0.00205, 0.00215, 0.00225]
+# In-sample parameter ranges (matching in_sample_benchmark.py and generate_supervised_data.py)
+ROBOT_DENSITY_RANGE = (0.0005, 0.0020)
+TARGET_DENSITY_MULTIPLIER = 2.0
+ADVERSARIAL_RATIO_RANGE = (0.1, 0.3)
+FALSE_POSITIVE_RATE_RANGE = (0.1, 0.3)
+FALSE_NEGATIVE_RATE_RANGE = (0.0, 0.3)
 
-for idx, (rd, td) in enumerate(zip(robot_density_values, target_density_values)):
-    target_multiplier = round(td / rd, 6) if rd > 0 else BASE_TARGET_DENSITY_MULTIPLIER
-    fp = 0.45 + (idx % 3) * 0.02
-    fn = 0.02 if idx % 4 == 0 else 0.0
+IN_SAMPLE_SCENARIOS: List[Dict] = []
+# Sample 10 in-distribution scenarios with varied parameters
+robot_density_values = [0.0006, 0.0008, 0.0010, 0.0012, 0.0015, 0.0018, 0.0007, 0.0009, 0.0011, 0.0013]
+adversarial_values = [0.1, 0.15, 0.2, 0.25, 0.3, 0.15, 0.2, 0.25, 0.1, 0.3]
+fp_values = [0.1, 0.15, 0.2, 0.25, 0.3, 0.2, 0.15, 0.3, 0.25, 0.1]
+fn_values = [0.0, 0.1, 0.2, 0.3, 0.1, 0.2, 0.0, 0.3, 0.15, 0.25]
+
+for idx, (rd, adv, fp, fn) in enumerate(zip(robot_density_values, adversarial_values, fp_values, fn_values)):
     IN_SAMPLE_SCENARIOS.append(
         make_scenario(
             name=f"in_sample_{idx+1:02d}",
             description=f"In-distribution scenario variant {idx+1}.",
             robot_density=rd,
-            target_density_multiplier=target_multiplier,
-            adversarial_ratio=0.5,
+            target_density_multiplier=TARGET_DENSITY_MULTIPLIER,
+            adversarial_ratio=adv,
             false_positive_rate=fp,
             false_negative_rate=fn,
-            num_timesteps=100 + (idx % 3) * 10,
+            num_timesteps=100,
             random_seed=1000 + idx * 37,
         )
     )
@@ -83,105 +104,95 @@ for idx, (rd, td) in enumerate(zip(robot_density_values, target_density_values))
 
 OOD_SCENARIOS: List[Dict] = []
 
-# Lower robot/target density to mimic larger operational areas
-low_density_pairs = [
-    (0.00020, 0.0010),
-    (0.00024, 0.0012),
-    (0.00028, 0.0014),
-    (0.00032, 0.0015),
-    (0.00035, 0.0016),
-]
-for idx, (rd, td) in enumerate(low_density_pairs):
-    target_multiplier = round(td / rd, 6) if rd > 0 else BASE_TARGET_DENSITY_MULTIPLIER
+# 1. Higher False Positive Rate (matching higher_false_positive_rate_benchmark.py)
+# FP range: 0.4-0.9, keep other params in-sample
+robot_density_values_fp = [0.0008, 0.0010, 0.0012, 0.0015, 0.0018, 0.0007, 0.0011, 0.0014, 0.0016, 0.0009]
+fp_values_ood = [0.45, 0.5, 0.6, 0.7, 0.8, 0.55, 0.65, 0.75, 0.85, 0.9]
+
+for idx, (rd, fp) in enumerate(zip(robot_density_values_fp, fp_values_ood)):
+    # Sample adversarial and FN from in-sample ranges
+    adv = 0.1 + (idx % 3) * 0.1  # 0.1, 0.2, 0.3
+    fn = 0.0 if idx % 3 == 0 else (0.1 if idx % 3 == 1 else 0.2)
     OOD_SCENARIOS.append(
         make_scenario(
-            name=f"ood_low_density_{idx+1:02d}",
-            description="OOD: sparse coverage reminiscent of larger operational areas.",
+            name=f"ood_high_fp_{idx+1:02d}",
+            description="OOD: Higher false positive rate (0.4-0.9).",
             robot_density=rd,
-            target_density_multiplier=target_multiplier,
-            adversarial_ratio=0.5,
-            false_positive_rate=0.5,
-            false_negative_rate=0.05,
-            num_timesteps=120,
+            target_density_multiplier=TARGET_DENSITY_MULTIPLIER,
+            adversarial_ratio=adv,
+            false_positive_rate=fp,
+            false_negative_rate=fn,
+            num_timesteps=100,
             random_seed=2000 + idx * 41,
         )
     )
 
-# Higher density (more robots/targets in fixed world)
-high_density_pairs = [
-    (0.00070, 0.0026),
-    (0.00080, 0.0028),
-    (0.00090, 0.0030),
-    (0.00100, 0.0032),
-    (0.00110, 0.0034),
-]
-for idx, (rd, td) in enumerate(high_density_pairs):
-    target_multiplier = round(td / rd, 6) if rd > 0 else BASE_TARGET_DENSITY_MULTIPLIER
+# 2. Higher False Negative Rate (matching higher_false_negative_rate_benchmark.py)
+# FN range: 0.4-0.8, keep other params in-sample
+robot_density_values_fn = [0.0009, 0.0011, 0.0013, 0.0016, 0.0019, 0.0008, 0.0012, 0.0015, 0.0017, 0.0010]
+fn_values_ood = [0.4, 0.45, 0.5, 0.6, 0.7, 0.5, 0.55, 0.65, 0.75, 0.8]
+
+for idx, (rd, fn) in enumerate(zip(robot_density_values_fn, fn_values_ood)):
+    # Sample adversarial and FP from in-sample ranges
+    adv = 0.15 + (idx % 3) * 0.05  # 0.15, 0.2, 0.25
+    fp = 0.15 + (idx % 4) * 0.05  # 0.15, 0.2, 0.25, 0.3
     OOD_SCENARIOS.append(
         make_scenario(
-            name=f"ood_high_density_{idx+1:02d}",
-            description="OOD: crowded environment with many robots and targets.",
+            name=f"ood_high_fn_{idx+1:02d}",
+            description="OOD: Higher false negative rate (0.4-0.8).",
             robot_density=rd,
-            target_density_multiplier=target_multiplier,
-            adversarial_ratio=0.5,
-            false_positive_rate=0.55,
-            false_negative_rate=0.05,
-            num_timesteps=130,
+            target_density_multiplier=TARGET_DENSITY_MULTIPLIER,
+            adversarial_ratio=adv,
+            false_positive_rate=fp,
+            false_negative_rate=fn,
+            num_timesteps=100,
             random_seed=2500 + idx * 53,
         )
     )
 
-# Elevated false-positive rates
-high_false_positive_settings = [0.7, 0.75, 0.8, 0.85, 0.9]
-for idx, fp_rate in enumerate(high_false_positive_settings):
+# 3. Higher Adversarial Ratio (matching higher_adversarial_ratio_benchmark.py)
+# Adversarial range: 0.4-0.5, keep other params in-sample
+robot_density_values_adv = [0.0007, 0.0010, 0.0013, 0.0016, 0.0019, 0.0008, 0.0011, 0.0014, 0.0017, 0.0012]
+adv_values_ood1 = [0.40, 0.42, 0.44, 0.46, 0.48, 0.41, 0.43, 0.45, 0.47, 0.50]
+
+for idx, (rd, adv) in enumerate(zip(robot_density_values_adv, adv_values_ood1)):
+    # Sample FP and FN from in-sample ranges
+    fp = 0.15 + (idx % 3) * 0.05  # 0.15, 0.2, 0.25
+    fn = 0.0 if idx % 4 == 0 else (0.1 if idx % 4 == 1 else (0.2 if idx % 4 == 2 else 0.3))
     OOD_SCENARIOS.append(
         make_scenario(
-            name=f"ood_high_false_positive_{idx+1:02d}",
-            description="OOD: sensors prone to frequent false positives.",
-            robot_density=BASE_ROBOT_DENSITY,
-            target_density_multiplier=BASE_TARGET_DENSITY_MULTIPLIER,
-            adversarial_ratio=0.5,
-            false_positive_rate=fp_rate,
-            false_negative_rate=0.1,
-            num_timesteps=130,
+            name=f"ood_higher_adv_{idx+1:02d}",
+            description="OOD: Higher adversarial ratio (0.4-0.5).",
+            robot_density=rd,
+            target_density_multiplier=TARGET_DENSITY_MULTIPLIER,
+            adversarial_ratio=adv,
+            false_positive_rate=fp,
+            false_negative_rate=fn,
+            num_timesteps=100,
             random_seed=3000 + idx * 61,
         )
     )
 
-# Elevated false-negative rates
-high_false_negative_settings = [0.3, 0.35, 0.4, 0.45, 0.5]
-for idx, fn_rate in enumerate(high_false_negative_settings):
-    OOD_SCENARIOS.append(
-        make_scenario(
-            name=f"ood_high_false_negative_{idx+1:02d}",
-            description="OOD: many true detections are missed.",
-            robot_density=BASE_ROBOT_DENSITY,
-            target_density_multiplier=BASE_TARGET_DENSITY_MULTIPLIER,
-            adversarial_ratio=0.5,
-            false_positive_rate=0.55,
-            false_negative_rate=fn_rate,
-            num_timesteps=130,
-            random_seed=3500 + idx * 67,
-        )
-    )
+# 4. Even Higher Adversarial Ratio (matching even_higher_adversarial_ratio_benchmark.py)
+# Adversarial range: 0.5-0.8, keep other params in-sample
+robot_density_values_adv2 = [0.0006, 0.0009, 0.0012, 0.0015, 0.0018, 0.0007, 0.0010, 0.0013, 0.0016, 0.0011]
+adv_values_ood2 = [0.50, 0.55, 0.60, 0.65, 0.70, 0.58, 0.62, 0.68, 0.75, 0.80]
 
-# High adversarial presence
-high_adversarial_settings = [0.6, 0.65, 0.7, 0.8, 0.9]
-for idx, adv_ratio in enumerate(high_adversarial_settings):
-    rd = 0.0006
-    td = 0.0022
-    target_multiplier = round(td / rd, 6) if rd > 0 else BASE_TARGET_DENSITY_MULTIPLIER
+for idx, (rd, adv) in enumerate(zip(robot_density_values_adv2, adv_values_ood2)):
+    # Sample FP and FN from in-sample ranges
+    fp = 0.2 + (idx % 3) * 0.05  # 0.2, 0.25, 0.3
+    fn = 0.1 if idx % 3 == 0 else (0.15 if idx % 3 == 1 else 0.2)
     OOD_SCENARIOS.append(
         make_scenario(
-            name=f"ood_high_adversarial_{idx+1:02d}",
-            description="OOD: high proportion of adversarial robots.",
+            name=f"ood_even_higher_adv_{idx+1:02d}",
+            description="OOD: Even higher adversarial ratio (0.5-0.8).",
             robot_density=rd,
-            target_density_multiplier=target_multiplier,
-            adversarial_ratio=adv_ratio,
-            false_positive_rate=0.6,
-            false_negative_rate=0.1,
-            num_timesteps=130,
-            random_seed=4000 + idx * 73,
+            target_density_multiplier=TARGET_DENSITY_MULTIPLIER,
+            adversarial_ratio=adv,
+            false_positive_rate=fp,
+            false_negative_rate=fn,
+            num_timesteps=100,
+            random_seed=3500 + idx * 67,
         )
     )
 
@@ -190,9 +201,9 @@ DEFAULT_SCENARIOS: List[Dict] = IN_SAMPLE_SCENARIOS + OOD_SCENARIOS
 METHOD_ORDER = ["baseline", "bayesian", "paper", "supervised"]
 METHOD_DISPLAY_NAMES = {
     "baseline": "Baseline (No Trust)",
+    "bayesian": "Naïve Bayesian",
     "paper": "PSM Aggregation",
-    "supervised": "Supervised GNN",
-    "bayesian": "Bayesian Ego Graph",
+    "supervised": "NeST-Bayes",
 }
 
 
@@ -424,7 +435,7 @@ def run_scenario(scenario: Dict, args: argparse.Namespace, output_dir: Path) -> 
         num_timesteps=scenario["num_timesteps"],
         random_seed=scenario["random_seed"],
         world_size=scenario["world_size"],
-        fov_range=50.0,
+        fov_range=80.0,
         fov_angle=np.pi / 3,
     )
     comparison.adversarial_ratio = scenario["adversarial_ratio"]

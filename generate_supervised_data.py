@@ -65,7 +65,7 @@ class SupervisedDataGenerator:
                  false_positive_rate: Union[float, Tuple[float, float]] = 0.5,
                  false_negative_rate: Union[float, Tuple[float, float]] = 0.0,
                  proximal_range: float = 50.0,
-                 fov_range: float = 50.0,
+                 fov_range: float = 80.0,
                  fov_angle: float = np.pi/3,
                  max_steps_per_episode: int = 100):
         """
