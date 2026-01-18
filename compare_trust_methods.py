@@ -35,7 +35,9 @@ class TrustMethodComparison:
                  world_size: float = 100.0,
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
-                 fixed_step_scale: float = 0.5):
+                 fixed_step_scale: float = 0.5,
+                 allow_fp_codetection: bool = False,
+                 ):
         """
         Initialize comparison with all three trust methods
 
@@ -50,6 +52,7 @@ class TrustMethodComparison:
             fov_range: Field of view range for robots
             fov_angle: Field of view angle for robots
             fixed_step_scale: Step scale for baseline fixed-step method (default: 0.5)
+            allow_fp_codetection: Whether to allow FP codetection (default: False)
         """
         self.supervised_model_path = Path(supervised_model_path) if supervised_model_path else None
         self.world_size = float(world_size)
@@ -91,7 +94,7 @@ class TrustMethodComparison:
         self.false_positive_rate = 0.5
         self.false_negative_rate = 0.0
         self.proximal_range = 50.0
-        self.allow_fp_codetection = False  # Can be set to True for FP codetection experiments
+        self.allow_fp_codetection = allow_fp_codetection  # Can be set to True for FP codetection experiments
 
         # Try to load supervised model after proximal_range is set
         try:

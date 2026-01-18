@@ -301,12 +301,18 @@ def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str
     Compute object-level accuracy using only believed-legitimate robots (trust >= threshold).
 
     Algorithm:
-    1. Filter to robots with trust >= threshold (believed legitimate)
-    2. Aggregate tracks by object_id using weighted average from filtered robots only
-    3. Objects with aggregated trust > threshold are "believed to be true"
-    4. Accuracy = (GT objects believed true) / (GT + FP objects believed true)
+    1. Collect ALL objects from all robots (to ensure correct recall calculation)
+    2. Filter to robots with trust >= threshold (believed legitimate)
+    3. Aggregate tracks by object_id using weighted average from filtered robots only
+    4. Objects NOT seen by any trusted robot receive score = 0.0
+    5. Objects with aggregated trust >= threshold are "believed to be true"
+    6. Metrics calculated using classification_metrics(labels, scores, threshold)
 
     This measures: "Of all objects we trust (based on trusted robots), what fraction are actually real?"
+
+    IMPORTANT: We evaluate ALL objects (including those only seen by untrusted robots) to ensure
+    correct recall calculation. Objects only seen by untrusted robots get score=0.0, which means
+    they will be counted as False Negatives if they are GT objects (correct for recall).
     """
     track_data = final_step.get("track_trust_values", {})
     robot_trust_data = final_step.get("robot_trust_values", {})
@@ -315,12 +321,20 @@ def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str
     legitimate_robots = {robot_id for robot_id, trust in robot_trust_data.items()
                         if float(trust) >= threshold}
 
-    # Aggregate tracks by object_id from legitimate robots only
+    # First pass: Collect ALL objects (from all robots) to ensure we don't miss any GT objects
+    all_objects = set()  # All object_ids that exist in the simulation
+    for robot_id, robot_tracks in track_data.items():
+        for _, track_info in robot_tracks.items():
+            object_id = track_info.get("object_id", "")
+            if object_id.startswith("gt_") or object_id.startswith("fp_"):
+                all_objects.add(object_id)
+
+    # Second pass: Aggregate tracks by object_id from legitimate robots only
     object_weighted_trusts = {}  # object_id -> list of (robot_trust, track_trust) tuples
 
     for robot_id, robot_tracks in track_data.items():
         if robot_id not in legitimate_robots:
-            continue  # Skip robots with trust <= threshold
+            continue  # Skip robots with trust < threshold
 
         robot_trust = float(robot_trust_data.get(robot_id, 0.5))
 
@@ -339,13 +353,17 @@ def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str
     gt_trust = []
     fp_trust = []
 
-    for object_id, weighted_values in object_weighted_trusts.items():
-        # Calculate weighted average: sum(robot_trust * track_trust) / sum(robot_trust)
-        sum_weighted = sum(robot_trust * track_trust for robot_trust, track_trust in weighted_values)
-        sum_weights = sum(robot_trust for robot_trust, track_trust in weighted_values)
-
-        # Avoid division by zero
-        avg_trust = float(sum_weighted / sum_weights) if sum_weights > 0 else 0.5
+    # Evaluate ALL objects, including those not seen by trusted robots
+    for object_id in all_objects:
+        if object_id in object_weighted_trusts:
+            weighted_values = object_weighted_trusts[object_id]
+            # Calculate weighted average: sum(robot_trust * track_trust) / sum(robot_trust)
+            sum_weighted = sum(robot_trust * track_trust for robot_trust, track_trust in weighted_values)
+            sum_weights = sum(robot_trust for robot_trust, _ in weighted_values)
+            avg_trust = float(sum_weighted / sum_weights) if sum_weights > 0 else 0.0
+        else:
+            # Object only seen by untrusted robots -> score = 0.0
+            avg_trust = 0.0
 
         if object_id.startswith("gt_"):
             labels.append(1)
@@ -366,7 +384,114 @@ def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str
     return metrics, stats
 
 
-def evaluate_methods(results: Dict, threshold: float) -> Dict[str, Dict[str, Dict[str, float]]]:
+def compute_object_metrics_with_adversarial_lies(final_step: Dict, threshold: float) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    Compute object-level metrics with ADVERSARIAL TRACK LIES.
+
+    Adversarial robots lie about track trust values:
+    - GT objects: lie low (random uniform 0.0 to 0.2)
+    - FP objects: lie high (random uniform 0.8 to 1.0)
+
+    This affects the weighted averaging calculation and thus the final metrics.
+
+    Algorithm (same as compute_object_metrics but with adversarial track lies):
+    1. Collect ALL objects from all robots (to ensure correct recall calculation)
+    2. Filter to robots with trust >= threshold (believed legitimate)
+    3. Aggregate tracks with adversarial lies applied to track trust values
+    4. Objects NOT seen by any trusted robot receive score = 0.0
+    5. Objects with aggregated trust >= threshold are "believed to be true"
+
+    IMPORTANT: We evaluate ALL objects (including those only seen by untrusted robots) to ensure
+    correct recall calculation. Objects only seen by untrusted robots get score=0.0, which means
+    they will be counted as False Negatives if they are GT objects (correct for recall).
+
+    Use this version for benchmarks that test robustness against adversarial manipulation
+    of track-level trust values (e.g., adversarial_track_lies variants).
+    """
+    import random
+
+    track_data = final_step.get("track_trust_values", {})
+    robot_trust_data = final_step.get("robot_trust_values", {})
+    adversarial_robots = set(final_step.get("adversarial_robots", []))
+
+    # Filter to believed-legitimate robots (trust >= threshold)
+    legitimate_robots = {robot_id for robot_id, trust in robot_trust_data.items()
+                        if float(trust) >= threshold}
+
+    # First pass: Collect ALL objects (from all robots) to ensure we don't miss any GT objects
+    all_objects = set()  # All object_ids that exist in the simulation
+    for robot_id, robot_tracks in track_data.items():
+        for _, track_info in robot_tracks.items():
+            object_id = track_info.get("object_id", "")
+            if object_id.startswith("gt_") or object_id.startswith("fp_"):
+                all_objects.add(object_id)
+
+    # Second pass: Aggregate tracks by object_id from legitimate robots only
+    object_weighted_trusts = {}  # object_id -> list of (robot_trust, track_trust) tuples
+
+    for robot_id, robot_tracks in track_data.items():
+        if robot_id not in legitimate_robots:
+            continue  # Skip robots with trust < threshold
+
+        robot_trust = float(robot_trust_data.get(robot_id, 0.5))
+        is_adversarial = robot_id in adversarial_robots
+
+        for _, track_info in robot_tracks.items():
+            object_id = track_info.get("object_id", "")
+            track_trust = float(track_info.get("trust_value", 0.5))
+
+            # ADVERSARIAL TRACK LIES: Override track trust if robot is adversarial
+            if is_adversarial:
+                if object_id.startswith("gt_"):
+                    track_trust = random.uniform(0.0, 0.2)
+                elif object_id.startswith("fp_"):
+                    track_trust = random.uniform(0.8, 1.0)
+
+            if object_id.startswith("gt_") or object_id.startswith("fp_"):
+                if object_id not in object_weighted_trusts:
+                    object_weighted_trusts[object_id] = []
+                object_weighted_trusts[object_id].append((robot_trust, track_trust))
+
+    # Calculate weighted average trust per object and evaluate
+    labels = []
+    scores = []
+    gt_trust = []
+    fp_trust = []
+
+    # Evaluate ALL objects, including those not seen by trusted robots
+    for object_id in all_objects:
+        if object_id in object_weighted_trusts:
+            weighted_values = object_weighted_trusts[object_id]
+            # Calculate weighted average: sum(robot_trust * track_trust) / sum(robot_trust)
+            sum_weighted = sum(robot_trust * track_trust for robot_trust, track_trust in weighted_values)
+            sum_weights = sum(robot_trust for robot_trust, _ in weighted_values)
+            avg_trust = float(sum_weighted / sum_weights) if sum_weights > 0 else 0.0
+        else:
+            # Object only seen by untrusted robots -> score = 0.0
+            avg_trust = 0.0
+
+        if object_id.startswith("gt_"):
+            labels.append(1)
+            gt_trust.append(avg_trust)
+        elif object_id.startswith("fp_"):
+            labels.append(0)
+            fp_trust.append(avg_trust)
+        else:
+            continue
+
+        scores.append(avg_trust)
+
+    metrics = classification_metrics(labels, scores, threshold)
+    stats = {
+        "mean_true_object_trust": float(np.mean(gt_trust)) if gt_trust else 0.0,
+        "mean_false_object_trust": float(np.mean(fp_trust)) if fp_trust else 0.0,
+    }
+    return metrics, stats
+
+
+
+
+def evaluate_methods(results: Dict, threshold: float, adversarial_lie: bool = False) -> Dict[str, Dict[str, Dict[str, float]]]:
     evaluation: Dict[str, Dict[str, Dict[str, float]]] = {}
     for method_key in METHOD_ORDER:
         # Map method key to result key (e.g., "paper" -> "paper_results")
@@ -376,7 +501,10 @@ def evaluate_methods(results: Dict, threshold: float) -> Dict[str, Dict[str, Dic
             continue
         final_step = method_results[-1]
         robot_metrics, robot_stats = compute_robot_metrics(final_step, threshold)
-        object_metrics, object_stats = compute_object_metrics(final_step, threshold)
+        if adversarial_lie:
+            object_metrics, object_stats = compute_object_metrics_with_adversarial_lies(final_step, threshold)
+        else:
+            object_metrics, object_stats = compute_object_metrics(final_step, threshold)
         evaluation[method_key] = {
             "robots": {**robot_metrics, **robot_stats},
             "objects": {**object_metrics, **object_stats},
@@ -384,7 +512,8 @@ def evaluate_methods(results: Dict, threshold: float) -> Dict[str, Dict[str, Dic
     return evaluation
 
 
-def plot_accuracy(summary: List[Dict], output_dir: Path) -> None:
+def plot_metrics(summary: List[Dict], output_dir: Path) -> None:
+    """Plot precision, recall, and accuracy for robots and objects (2x3 grid: 6 subplots)"""
     scenarios = [entry["name"] for entry in summary]
     x = np.arange(len(scenarios))
     width = 0.18  # Adjusted for 4 methods
@@ -397,31 +526,148 @@ def plot_accuracy(summary: List[Dict], output_dir: Path) -> None:
         'supervised': '#ff7f0e', # Orange
     }
 
-    robot_fig, (ax_robot, ax_object) = plt.subplots(1, 2, figsize=(16, 6), sharey=False)
+    # Create 2x3 subplot grid (6 plots: robot prec/rec/acc, object prec/rec/acc)
+    fig, ((ax_robot_prec, ax_robot_rec, ax_robot_acc), (ax_object_prec, ax_object_rec, ax_object_acc)) = plt.subplots(2, 3, figsize=(20, 12), sharey=False)
 
     for idx, method in enumerate(METHOD_ORDER):
-        robot_acc = [entry["metrics"].get(method, {}).get("robots", {}).get("precision", 0.0) for entry in summary]
-        object_acc = [entry["metrics"].get(method, {}).get("objects", {}).get("precision", 0.0) for entry in summary]
+        robot_prec = [entry["metrics"].get(method, {}).get("robots", {}).get("precision", 0.0) for entry in summary]
+        robot_rec = [entry["metrics"].get(method, {}).get("robots", {}).get("recall", 0.0) for entry in summary]
+        robot_acc = [entry["metrics"].get(method, {}).get("robots", {}).get("accuracy", 0.0) for entry in summary]
+        object_prec = [entry["metrics"].get(method, {}).get("objects", {}).get("precision", 0.0) for entry in summary]
+        object_rec = [entry["metrics"].get(method, {}).get("objects", {}).get("recall", 0.0) for entry in summary]
+        object_acc = [entry["metrics"].get(method, {}).get("objects", {}).get("accuracy", 0.0) for entry in summary]
         offsets = x + (idx - 1.5) * width
         color = method_colors.get(method, f'C{idx}')
-        ax_robot.bar(offsets, robot_acc, width=width, label=METHOD_DISPLAY_NAMES[method],
+
+        ax_robot_prec.bar(offsets, robot_prec, width=width, label=METHOD_DISPLAY_NAMES[method],
                     color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
-        ax_object.bar(offsets, object_acc, width=width, label=METHOD_DISPLAY_NAMES[method],
+        ax_robot_rec.bar(offsets, robot_rec, width=width, label=METHOD_DISPLAY_NAMES[method],
+                    color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
+        ax_robot_acc.bar(offsets, robot_acc, width=width, label=METHOD_DISPLAY_NAMES[method],
+                    color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
+        ax_object_prec.bar(offsets, object_prec, width=width, label=METHOD_DISPLAY_NAMES[method],
+                    color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
+        ax_object_rec.bar(offsets, object_rec, width=width, label=METHOD_DISPLAY_NAMES[method],
+                    color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
+        ax_object_acc.bar(offsets, object_acc, width=width, label=METHOD_DISPLAY_NAMES[method],
                     color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
 
-    for ax, title in zip((ax_robot, ax_object), ("Robot Accuracy", "Object Accuracy")):
+    # Configure each subplot
+    for ax, title, ylabel in zip(
+        (ax_robot_prec, ax_robot_rec, ax_robot_acc, ax_object_prec, ax_object_rec, ax_object_acc),
+        ("Robot Precision (Adversarial Rejection)", "Robot Recall (Legitimate Robot Identification)", "Robot Accuracy",
+         "Object Precision (FP Rejection)", "Object Recall (GT Object Identification)", "Object Accuracy"),
+        ("Precision", "Recall", "Accuracy", "Precision", "Recall", "Accuracy")
+    ):
         ax.set_xticks(x)
-        ax.set_xticklabels(scenarios, rotation=25, ha="right", fontsize=8)
+        ax.set_xticklabels(scenarios, rotation=45, ha="right", fontsize=7)
         ax.set_ylim(0.0, 1.05)
-        ax.set_ylabel("Accuracy", fontsize=11)
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_ylabel(ylabel, fontsize=11)
+        ax.set_title(title, fontsize=10, fontweight='bold')
         ax.grid(True, axis="y", linestyle=":", alpha=0.4)
+        ax.legend(fontsize=8, loc='upper right')
 
-    ax_object.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=4, fontsize=10)
-    robot_fig.tight_layout()
+    fig.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
-    robot_fig.savefig(output_dir / "trust_method_precision_summary.png", dpi=200, bbox_inches="tight")
-    plt.close(robot_fig)
+    fig.savefig(output_dir / "trust_method_metrics_summary.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def print_summary_statistics(summary: List[Dict]):
+    """Print mean and std dev for each method"""
+    # Collect metrics for each method
+    method_robot_precisions = {method: [] for method in METHOD_ORDER}
+    method_robot_recalls = {method: [] for method in METHOD_ORDER}
+    method_robot_accuracies = {method: [] for method in METHOD_ORDER}
+    method_object_precisions = {method: [] for method in METHOD_ORDER}
+    method_object_recalls = {method: [] for method in METHOD_ORDER}
+    method_object_accuracies = {method: [] for method in METHOD_ORDER}
+
+    for entry in summary:
+        for method in METHOD_ORDER:
+            if method in entry["metrics"]:
+                robot_prec = entry["metrics"][method]["robots"].get("precision", 0.0)
+                robot_rec = entry["metrics"][method]["robots"].get("recall", 0.0)
+                robot_acc = entry["metrics"][method]["robots"].get("accuracy", 0.0)
+                object_prec = entry["metrics"][method]["objects"].get("precision", 0.0)
+                object_rec = entry["metrics"][method]["objects"].get("recall", 0.0)
+                object_acc = entry["metrics"][method]["objects"].get("accuracy", 0.0)
+                method_robot_precisions[method].append(robot_prec)
+                method_robot_recalls[method].append(robot_rec)
+                method_robot_accuracies[method].append(robot_acc)
+                method_object_precisions[method].append(object_prec)
+                method_object_recalls[method].append(object_rec)
+                method_object_accuracies[method].append(object_acc)
+
+    print("\n" + "=" * 80)
+    print("COMPREHENSIVE BENCHMARK RESULTS")
+    print("=" * 80)
+    print("\nROBOT PRECISION (Adversarial Rejection):")
+    print("-" * 80)
+    print(f"{'Method':<25} {'Mean':<15} {'Std Dev':<15} {'N':<10}")
+    print("-" * 80)
+    for method in METHOD_ORDER:
+        precs = method_robot_precisions[method]
+        if precs:
+            mean_prec = np.mean(precs)
+            std_prec = np.std(precs)
+            print(f"{METHOD_DISPLAY_NAMES[method]:<25} {mean_prec:.4f}          {std_prec:.4f}          {len(precs)}")
+
+    print("\nROBOT RECALL (Legitimate Robot Identification):")
+    print("-" * 80)
+    print(f"{'Method':<25} {'Mean':<15} {'Std Dev':<15} {'N':<10}")
+    print("-" * 80)
+    for method in METHOD_ORDER:
+        recs = method_robot_recalls[method]
+        if recs:
+            mean_rec = np.mean(recs)
+            std_rec = np.std(recs)
+            print(f"{METHOD_DISPLAY_NAMES[method]:<25} {mean_rec:.4f}          {std_rec:.4f}          {len(recs)}")
+
+    print("\nROBOT ACCURACY:")
+    print("-" * 80)
+    print(f"{'Method':<25} {'Mean':<15} {'Std Dev':<15} {'N':<10}")
+    print("-" * 80)
+    for method in METHOD_ORDER:
+        accs = method_robot_accuracies[method]
+        if accs:
+            mean_acc = np.mean(accs)
+            std_acc = np.std(accs)
+            print(f"{METHOD_DISPLAY_NAMES[method]:<25} {mean_acc:.4f}          {std_acc:.4f}          {len(accs)}")
+
+    print("\nOBJECT PRECISION (FP Rejection):")
+    print("-" * 80)
+    print(f"{'Method':<25} {'Mean':<15} {'Std Dev':<15} {'N':<10}")
+    print("-" * 80)
+    for method in METHOD_ORDER:
+        precs = method_object_precisions[method]
+        if precs:
+            mean_prec = np.mean(precs)
+            std_prec = np.std(precs)
+            print(f"{METHOD_DISPLAY_NAMES[method]:<25} {mean_prec:.4f}          {std_prec:.4f}          {len(precs)}")
+
+    print("\nOBJECT RECALL (GT Object Identification):")
+    print("-" * 80)
+    print(f"{'Method':<25} {'Mean':<15} {'Std Dev':<15} {'N':<10}")
+    print("-" * 80)
+    for method in METHOD_ORDER:
+        recs = method_object_recalls[method]
+        if recs:
+            mean_rec = np.mean(recs)
+            std_rec = np.std(recs)
+            print(f"{METHOD_DISPLAY_NAMES[method]:<25} {mean_rec:.4f}          {std_rec:.4f}          {len(recs)}")
+
+    print("\nOBJECT ACCURACY:")
+    print("-" * 80)
+    print(f"{'Method':<25} {'Mean':<15} {'Std Dev':<15} {'N':<10}")
+    print("-" * 80)
+    for method in METHOD_ORDER:
+        accs = method_object_accuracies[method]
+        if accs:
+            mean_acc = np.mean(accs)
+            std_acc = np.std(accs)
+            print(f"{METHOD_DISPLAY_NAMES[method]:<25} {mean_acc:.4f}          {std_acc:.4f}          {len(accs)}")
+    print("=" * 80)
 
 
 def run_scenario(scenario: Dict, args: argparse.Namespace, output_dir: Path) -> Tuple[Dict, Dict]:
@@ -498,8 +744,12 @@ def main() -> None:
     metrics_path.write_text(json.dumps(aggregated_results, indent=2))
     print(f"\n✅ Aggregated metrics saved to {metrics_path}")
 
-    plot_accuracy(summary, args.output_dir)
-    print(f"📈 Accuracy summary plot saved to {args.output_dir / 'trust_method_accuracy_summary.png'}")
+    # Print summary statistics
+    print_summary_statistics(summary)
+
+    # Create plots
+    plot_metrics(summary, args.output_dir)
+    print(f"\n📈 Metrics summary plot saved to {args.output_dir / 'trust_method_metrics_summary.png'}")
 
 
 if __name__ == "__main__":
