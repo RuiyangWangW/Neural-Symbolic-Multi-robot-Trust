@@ -90,7 +90,7 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
     def _initialize_robots(self):
         """Initialize Robot objects for trust tracking"""
         for robot_name in self.robot_data.keys():
-            # Create Robot object with SPOT dual-camera FoV enabled
+            # Create Robot object with SPOT dual-camera FoV and occupancy grid for line-of-sight
             robot = Robot(
                 robot_id=robot_name,
                 position=np.array([0.0, 0.0, 0.0]),  # Will be updated each timestep
@@ -99,7 +99,11 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
                 trust_beta=1.0,
                 fov_range=20.0,  # From camera specs
                 fov_angle=np.pi/4,  # 45 degrees
-                use_spot_fov=True  # Enable SPOT dual-camera FoV for Webots
+                use_spot_fov=True,  # Enable SPOT dual-camera FoV for Webots
+                occ_grid=self.occ_grid,  # Pass occupancy grid for line-of-sight checking
+                grid_resolution=self.resolution,
+                grid_xmin=self.grid_xmin,
+                grid_ymin=self.grid_ymin
             )
 
             # Add additional attributes
@@ -124,7 +128,7 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
 
         # Calculate number of FP objects per adversarial robot
         num_ground_truth = len(self.ground_truth_objects)
-        total_fp_objects = int(self.false_positive_rate * num_ground_truth * 4)
+        total_fp_objects = int(self.false_positive_rate * num_ground_truth)
 
         # Ensure at least one FP object per adversarial robot
         total_fp_objects = max(len(adversarial_robots), total_fp_objects)
@@ -160,11 +164,12 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
 
     def _update_fp_positions(self, timestep: int):
         """
-        Update FP object positions to follow their assigned robots (IDENTICAL to simulation_environment.py).
+        Update FP object positions to follow their assigned robots.
 
-        FP objects maintain a fixed angle offset relative to their assigned robot's heading,
-        positioned at 50% of FoV range. This ensures FP objects stay in the assigned robot's FoV
-        while being stored in global coordinates for FoV checks by other robots.
+        FP objects maintain a fixed angle offset relative to their assigned robot's heading.
+        The position is adjusted to ensure the object stays within both geometric FoV AND
+        line-of-sight (not blocked by walls/obstacles). If blocked, the position is moved
+        closer to the robot recursively until a clear line-of-sight is found.
 
         Args:
             timestep: Current timestep
@@ -180,19 +185,45 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
             robot = self.robots[assigned_robot_name]
             angle_offset = fp_obj['angle_offset']
 
-            # Calculate robot heading from orientation (same as simulation_environment.py line 468)
+            # Calculate robot heading from orientation
             # In Webots, robot.orientation is already the heading (yaw angle)
             robot_heading = robot.orientation
 
-            # Calculate target position: 50% of FoV range, at designated angle
-            # (IDENTICAL to simulation_environment.py lines 471-477)
-            target_distance = fov_range * 0.5
+            # Calculate initial target position: 50% of FoV range, at designated angle
+            initial_distance = fov_range * 0.5
             target_angle = robot_heading + angle_offset
-            target_position = robot.position + np.array([
-                target_distance * np.cos(target_angle),
-                target_distance * np.sin(target_angle),
-                0.3  # Height (0.3m above ground)
-            ])
+
+            # Try to find a position that's both in FoV and has line-of-sight
+            # Start at initial distance and move closer if blocked
+            max_attempts = 20
+            distance_step = initial_distance / max_attempts
+
+            target_position = None
+            for attempt in range(max_attempts):
+                # Try progressively closer distances
+                current_distance = initial_distance - (attempt * distance_step)
+
+                if current_distance <= 0.5:  # Don't get too close to robot
+                    current_distance = 0.5
+
+                test_position = robot.position + np.array([
+                    current_distance * np.cos(target_angle),
+                    current_distance * np.sin(target_angle),
+                    0.3  # Height (0.3m above ground)
+                ])
+
+                # Check if this position is visible (both FoV and line-of-sight)
+                if robot.is_in_fov(test_position):
+                    target_position = test_position
+                    break
+
+            # If no valid position found (shouldn't happen), use closest position
+            if target_position is None:
+                target_position = robot.position + np.array([
+                    0.5 * np.cos(target_angle),
+                    0.5 * np.sin(target_angle),
+                    0.3
+                ])
 
             # Store in global position (this allows other robots to check is_in_fov)
             fp_obj['position'] = target_position

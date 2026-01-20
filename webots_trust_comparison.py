@@ -414,19 +414,23 @@ class WebotsTrustComparison:
             'legitimate_trust_history': leg_trust_over_time,
             'adversarial_trust_history': adv_trust_over_time,
 
-            # Robot precision/recall
-            'robot_precision': robot_metrics['precision'],
-            'robot_recall': robot_metrics['recall'],
-            'robot_f1': robot_metrics['f1'],
-            'robot_accuracy': robot_metrics['accuracy'],
+            # Robot classification metrics (nested)
+            'robot_classification': {
+                'precision': robot_metrics['precision'],
+                'recall': robot_metrics['recall'],
+                'f1': robot_metrics['f1'],
+                'accuracy': robot_metrics['accuracy']
+            },
 
-            # Object precision/recall (with adversarial lies)
-            'object_precision': object_metrics['precision'],
-            'object_recall': object_metrics['recall'],
-            'object_f1': object_metrics['f1'],
-            'object_accuracy': object_metrics['accuracy'],
-            'mean_true_object_trust': object_metrics['mean_true_object_trust'],
-            'mean_false_object_trust': object_metrics['mean_false_object_trust']
+            # Object classification metrics (nested)
+            'object_classification': {
+                'precision': object_metrics['precision'],
+                'recall': object_metrics['recall'],
+                'f1': object_metrics['f1'],
+                'accuracy': object_metrics['accuracy'],
+                'mean_true_object_trust': object_metrics['mean_true_object_trust'],
+                'mean_false_object_trust': object_metrics['mean_false_object_trust']
+            }
         }
 
         return metrics
@@ -444,16 +448,16 @@ class WebotsTrustComparison:
             for method_name, metrics in methods_data.items():
                 formatted_methods[method_name] = {
                     'robots': {
-                        'precision': metrics['robot_precision'],
-                        'recall': metrics['robot_recall'],
-                        'f1': metrics['robot_f1'],
-                        'accuracy': metrics['robot_accuracy']
+                        'precision': metrics['robot_classification']['precision'],
+                        'recall': metrics['robot_classification']['recall'],
+                        'f1': metrics['robot_classification']['f1'],
+                        'accuracy': metrics['robot_classification']['accuracy']
                     },
                     'objects': {
-                        'precision': metrics['object_precision'],
-                        'recall': metrics['object_recall'],
-                        'f1': metrics['object_f1'],
-                        'accuracy': metrics['object_accuracy']
+                        'precision': metrics['object_classification']['precision'],
+                        'recall': metrics['object_classification']['recall'],
+                        'f1': metrics['object_classification']['f1'],
+                        'accuracy': metrics['object_classification']['accuracy']
                     }
                 }
 

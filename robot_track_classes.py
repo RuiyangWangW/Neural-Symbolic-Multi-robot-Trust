@@ -183,7 +183,11 @@ class Robot:
                  trust_beta: float = 1.0,
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
-                 use_spot_fov: bool = False):
+                 use_spot_fov: bool = False,
+                 occ_grid: np.ndarray = None,
+                 grid_resolution: float = None,
+                 grid_xmin: float = None,
+                 grid_ymin: float = None):
         """
         Initialize a robot.
 
@@ -196,6 +200,10 @@ class Robot:
             fov_range: Field of view range
             fov_angle: Field of view angle in radians
             use_spot_fov: If True, use SPOT dual-camera FoV instead of default single-camera FoV
+            occ_grid: Occupancy grid (2D array, 1=occupied, 0=free), optional for line-of-sight checking
+            grid_resolution: Resolution of occupancy grid in meters per pixel
+            grid_xmin: Minimum X coordinate of grid in world coordinates
+            grid_ymin: Minimum Y coordinate of grid in world coordinates
         """
         self.id = robot_id
         self.position = np.array(position)
@@ -222,6 +230,14 @@ class Robot:
         self.fov_range = fov_range
         self.fov_angle = fov_angle
         self.use_spot_fov = use_spot_fov  # Use SPOT dual-camera FoV if True
+
+        # Occupancy grid for line-of-sight checking (optional)
+        self.occ_grid = occ_grid
+        self.grid_resolution = grid_resolution
+        self.grid_xmin = grid_xmin
+        self.grid_ymin = grid_ymin
+        if occ_grid is not None:
+            self.grid_height, self.grid_width = occ_grid.shape
 
         # Local tracks maintained by this robot
         self.local_tracks: Dict[str, Track] = {}  # object_id -> Track
@@ -405,7 +421,79 @@ class Robot:
         angle_diff = abs(target_angle - self.orientation)
         angle_diff = min(angle_diff, 2*np.pi - angle_diff)  # Wrap around
 
-        return angle_diff <= self.fov_angle / 2
+        if angle_diff > self.fov_angle / 2:
+            return False
+
+        # Geometric FoV check passed, now check line of sight
+        return self.has_line_of_sight(target_position)
+
+    def has_line_of_sight(self, target_position: np.ndarray) -> bool:
+        """
+        Check if there's a clear line of sight from robot to target using occupancy grid.
+
+        Uses Bresenham's line algorithm to check all cells along the ray from robot to target.
+
+        Args:
+            target_position: Target position in world frame [x, y, z]
+
+        Returns:
+            True if line of sight is clear (no occupied cells), False otherwise
+            Returns True if no occupancy grid is available (no occlusion checking)
+        """
+        # If no occupancy grid, assume clear line of sight
+        if self.occ_grid is None:
+            return True
+
+        # Convert positions to grid coordinates
+        start_col = int(np.floor((self.position[0] - self.grid_xmin) / self.grid_resolution))
+        start_row = int(np.floor((self.position[1] - self.grid_ymin) / self.grid_resolution))
+        end_col = int(np.floor((target_position[0] - self.grid_xmin) / self.grid_resolution))
+        end_row = int(np.floor((target_position[1] - self.grid_ymin) / self.grid_resolution))
+
+        # Clamp to grid bounds
+        start_row = np.clip(start_row, 0, self.grid_height - 1)
+        start_col = np.clip(start_col, 0, self.grid_width - 1)
+        end_row = np.clip(end_row, 0, self.grid_height - 1)
+        end_col = np.clip(end_col, 0, self.grid_width - 1)
+
+        # Bresenham's line algorithm
+        dx = abs(end_col - start_col)
+        dy = abs(end_row - start_row)
+        sx = 1 if end_col > start_col else -1
+        sy = 1 if end_row > start_row else -1
+        err = dx - dy
+
+        col, row = start_col, start_row
+
+        # Skip the first cell (robot's position) and check cells in between
+        first_cell = True
+
+        while True:
+            # Reached target (don't check target cell either, it's the object position)
+            if col == end_col and row == end_row:
+                break
+
+            # Move to next cell before checking
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                col += sx
+            if e2 < dx:
+                err += dx
+                row += sy
+
+            # Skip first iteration (we just moved from start position)
+            if first_cell:
+                first_cell = False
+                continue
+
+            # Check if current cell is occupied (only intermediate cells)
+            if col != end_col or row != end_row:  # Don't check target cell
+                if 0 <= row < self.grid_height and 0 <= col < self.grid_width:
+                    if self.occ_grid[row, col] == 1:
+                        return False  # Occupied cell blocks line of sight
+
+        return True  # Clear line of sight
 
     def is_in_spot_dual_camera_fov(self, target_position: np.ndarray,
                                      fov_angle: float = np.pi/4,
@@ -456,13 +544,15 @@ class Robot:
             # Get camera pointing direction in world frame
             camera_yaw = self._get_camera_pointing_direction(self.orientation, camera_R)
 
-            # Check if object is in this camera's FoV
+            # Check if object is in this camera's FoV (geometric check)
             if self._is_in_single_camera_fov(camera_x, camera_y, camera_yaw,
                                              target_position[0], target_position[1],
                                              fov_angle, fov_range):
-                return True  # Visible to at least one camera
+                # Geometric FoV check passed, now check line of sight
+                if self.has_line_of_sight(target_position):
+                    return True  # Visible to at least one camera with clear line of sight
 
-        return False  # Not visible to either camera
+        return False  # Not visible to either camera or line of sight blocked
 
     def _axis_angle_to_rotation_matrix(self, ax: float, ay: float, az: float, angle: float) -> np.ndarray:
         """Convert axis-angle rotation to rotation matrix using Rodrigues formula"""
