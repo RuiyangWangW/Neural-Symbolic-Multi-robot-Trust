@@ -262,11 +262,3 @@ class BayesianEgoGraphTrust:
 
         return robot_updates, track_updates
 
-    def get_expected_trust(self, alpha: float, beta: float) -> float:
-        """Calculate expected value E[trust] = alpha / (alpha + beta)"""
-        return alpha / (alpha + beta)
-
-    def get_trust_variance(self, alpha: float, beta: float) -> float:
-        """Calculate variance V[trust] = (alpha * beta) / ((alpha + beta)^2 * (alpha + beta + 1))"""
-        denominator = (alpha + beta) ** 2 * (alpha + beta + 1)
-        return (alpha * beta) / denominator

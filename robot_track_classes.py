@@ -175,25 +175,27 @@ class Robot:
     This eliminates the confusion between different track storage systems.
     """
     
-    def __init__(self, 
+    def __init__(self,
                  robot_id: int,
                  position: np.ndarray,
                  velocity: np.ndarray = None,
                  trust_alpha: float = 1.0,
                  trust_beta: float = 1.0,
                  fov_range: float = 50.0,
-                 fov_angle: float = np.pi/3):
+                 fov_angle: float = np.pi/3,
+                 use_spot_fov: bool = False):
         """
         Initialize a robot.
-        
+
         Args:
             robot_id: Unique identifier for this robot
             position: Current position [x, y]
-            velocity: Current velocity [vx, vy] 
+            velocity: Current velocity [vx, vy]
             trust_alpha: Alpha parameter of robot's trust distribution
             trust_beta: Beta parameter of robot's trust distribution
             fov_range: Field of view range
             fov_angle: Field of view angle in radians
+            use_spot_fov: If True, use SPOT dual-camera FoV instead of default single-camera FoV
         """
         self.id = robot_id
         self.position = np.array(position)
@@ -219,7 +221,8 @@ class Robot:
         # Field of view parameters
         self.fov_range = fov_range
         self.fov_angle = fov_angle
-        
+        self.use_spot_fov = use_spot_fov  # Use SPOT dual-camera FoV if True
+
         # Local tracks maintained by this robot
         self.local_tracks: Dict[str, Track] = {}  # object_id -> Track
         
@@ -379,20 +382,156 @@ class Robot:
             self.create_track_for_object(object_id, position, velocity, current_time)
     
     def is_in_fov(self, target_position: np.ndarray) -> bool:
-        """Check if a position is within this robot's field of view."""
+        """
+        Check if a position is within this robot's field of view.
+
+        If use_spot_fov is True, uses SPOT dual-camera FoV.
+        Otherwise uses default single-camera FoV.
+        """
+        if self.use_spot_fov:
+            # Use SPOT dual-camera FoV for Webots environment
+            return self.is_in_spot_dual_camera_fov(target_position, self.fov_angle, self.fov_range)
+
+        # Default single-camera FoV
         # Calculate relative position
         rel_pos = target_position - self.position
         distance = np.linalg.norm(rel_pos[:2])  # 2D distance
 
         if distance > self.fov_range:
             return False
-        
+
         # Check angle constraint
         target_angle = np.arctan2(rel_pos[1], rel_pos[0])
         angle_diff = abs(target_angle - self.orientation)
         angle_diff = min(angle_diff, 2*np.pi - angle_diff)  # Wrap around
 
         return angle_diff <= self.fov_angle / 2
+
+    def is_in_spot_dual_camera_fov(self, target_position: np.ndarray,
+                                     fov_angle: float = np.pi/4,
+                                     fov_range: float = 20.0) -> bool:
+        """
+        Check if position is in SPOT robot's dual-camera field of view.
+
+        SPOT has two head cameras (left and right) with specific offsets and orientations.
+        An object is visible if it's in EITHER camera's FoV.
+
+        Args:
+            target_position: Target position in world frame [x, y, z]
+            fov_angle: FoV angle for each camera (default: π/4 = 45°)
+            fov_range: Maximum detection range (default: 20m)
+
+        Returns:
+            True if target is visible to either camera
+        """
+        # Camera transforms from Spot.proto (same as filter_detections_by_fov.py)
+        # HEAD_SHAPES transformation
+        head_trans = np.array([-0.459994, -0.000019, -1.650002])
+        head_rot_aa = (0.577350, -0.577354, -0.577346, 2.094389)
+        head_R = self._axis_angle_to_rotation_matrix(*head_rot_aa)
+
+        # Right head camera (local to HEAD_SHAPES)
+        right_cam_trans_local = np.array([0.044898, 1.677970, -0.922603])
+        right_cam_rot_local_aa = (-0.425009, 0.613005, 0.666028, 2.205231)
+        right_R_local = self._axis_angle_to_rotation_matrix(*right_cam_rot_local_aa)
+
+        # Left head camera (local to HEAD_SHAPES)
+        left_cam_trans_local = np.array([-0.045109, 1.679550, -0.923250])
+        left_cam_rot_local_aa = (-0.685445, 0.491870, 0.536869, 1.854317)
+        left_R_local = self._axis_angle_to_rotation_matrix(*left_cam_rot_local_aa)
+
+        # Compose transformations
+        right_camera_offset = head_trans + head_R @ right_cam_trans_local
+        left_camera_offset = head_trans + head_R @ left_cam_trans_local
+        right_R_composed = head_R @ right_R_local
+        left_R_composed = head_R @ left_R_local
+
+        # Check both cameras
+        for camera_offset, camera_R in [(left_camera_offset, left_R_composed),
+                                         (right_camera_offset, right_R_composed)]:
+            # Get camera world pose
+            camera_x, camera_y = self._get_camera_world_pose(self.position[0], self.position[1],
+                                                              self.orientation, camera_offset)
+
+            # Get camera pointing direction in world frame
+            camera_yaw = self._get_camera_pointing_direction(self.orientation, camera_R)
+
+            # Check if object is in this camera's FoV
+            if self._is_in_single_camera_fov(camera_x, camera_y, camera_yaw,
+                                             target_position[0], target_position[1],
+                                             fov_angle, fov_range):
+                return True  # Visible to at least one camera
+
+        return False  # Not visible to either camera
+
+    def _axis_angle_to_rotation_matrix(self, ax: float, ay: float, az: float, angle: float) -> np.ndarray:
+        """Convert axis-angle rotation to rotation matrix using Rodrigues formula"""
+        norm = np.sqrt(ax*ax + ay*ay + az*az)
+        if norm < 1e-10:
+            return np.eye(3)
+        ax, ay, az = ax/norm, ay/norm, az/norm
+
+        c = np.cos(angle)
+        s = np.sin(angle)
+        C = 1 - c
+
+        R = np.array([
+            [ax*ax*C + c,    ax*ay*C - az*s, ax*az*C + ay*s],
+            [ay*ax*C + az*s, ay*ay*C + c,    ay*az*C - ax*s],
+            [az*ax*C - ay*s, az*ay*C + ax*s, az*az*C + c]
+        ])
+        return R
+
+    def _get_camera_world_pose(self, robot_x: float, robot_y: float, robot_yaw: float,
+                                camera_offset: np.ndarray) -> tuple:
+        """Get camera position in world frame"""
+        offset_forward, offset_left, offset_up = camera_offset
+
+        cos_yaw = np.cos(robot_yaw)
+        sin_yaw = np.sin(robot_yaw)
+
+        camera_x = robot_x + (offset_forward * cos_yaw - offset_left * sin_yaw)
+        camera_y = robot_y + (offset_forward * sin_yaw + offset_left * cos_yaw)
+
+        return camera_x, camera_y
+
+    def _get_camera_pointing_direction(self, robot_yaw: float, camera_rotation_matrix: np.ndarray) -> float:
+        """Get camera pointing direction in world frame"""
+        # Camera default direction is +X in mesh coords
+        camera_default_dir = np.array([1, 0, 0])
+        pointing_dir = camera_rotation_matrix @ camera_default_dir
+
+        # Get yaw in robot frame
+        camera_yaw_local = np.arctan2(pointing_dir[1], pointing_dir[0])
+
+        # Convert to world frame
+        camera_yaw_world = robot_yaw + camera_yaw_local
+
+        return camera_yaw_world
+
+    def _is_in_single_camera_fov(self, camera_x: float, camera_y: float, camera_yaw: float,
+                                   object_x: float, object_y: float,
+                                   fov_angle: float, fov_range: float) -> bool:
+        """Check if an object is within a single camera's field of view"""
+        # Vector from camera to object
+        dx = object_x - camera_x
+        dy = object_y - camera_y
+
+        # Distance to object
+        distance = np.sqrt(dx*dx + dy*dy)
+
+        # Angle to object (from world +X axis)
+        angle_to_object = np.arctan2(dy, dx)
+
+        # Angle difference (normalized to [-pi, pi])
+        angle_diff = angle_to_object - camera_yaw
+        angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
+
+        # Check if within FoV
+        in_range = distance <= fov_range
+        in_angle = abs(angle_diff) <= fov_angle / 2
+
+        return (in_range and in_angle)
 
     def start_new_timestep(self, timestep: float):
         """Start a new timestep and clear current timestep tracks."""

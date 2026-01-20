@@ -132,8 +132,9 @@ class WebotsTrustComparison:
 
     def run_all_scenarios(self):
         """Run all scenarios and compare trust methods"""
-        # First, load environment to get robot names
-        temp_env = WebotsTrustEnvironment(webots_data_path=self.webots_data_path)
+        # First, load base environment to get robot names (more efficient than full trust environment)
+        from webots_simulation_environment import WebotsSimulationEnvironment
+        temp_env = WebotsSimulationEnvironment(webots_data_path=self.webots_data_path)
         robot_names = list(temp_env.robot_data.keys())
 
         # Generate scenarios
@@ -171,16 +172,6 @@ class WebotsTrustComparison:
         Returns:
             Dictionary with results from all methods
         """
-        # Create environment
-        env = WebotsTrustEnvironment(
-            webots_data_path=self.webots_data_path,
-            adversarial_robot_ids=scenario['adversarial_robots'],
-            false_positive_rate=scenario['fp_rate'],
-            false_negative_rate=scenario['fn_rate'],
-            allow_fp_codetection=False,
-            random_seed=scenario['seed']
-        )
-
         # Initialize trust algorithms
         paper_algo = PaperTrustAlgorithm()
         supervised_algo = SupervisedTrustAlgorithm(model_path=str(self.supervised_model_path))

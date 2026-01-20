@@ -134,7 +134,7 @@ class SupervisedTrustAlgorithm:
             track_trust_info = {}
 
             # Collect track information
-            for track in robot.get_all_tracks():
+            for track in robot.get_all_current_tracks():
                 was_meaningful = (
                     robot.id in updated_tracks and
                     track.track_id in updated_tracks[robot.id]
@@ -237,21 +237,14 @@ class SupervisedTrustAlgorithm:
                     # Find the track object using the mapping
                     track_id = index_to_track_id.get(track_idx)
                     if track_id:
-                        # Find track in proximal robots' track lists
-                        for robot in graph_data._proximal_robots:
-                            for track in robot.get_all_tracks():
-                                if track.track_id == track_id:
-                                    track.update_trust(delta_alpha, delta_beta)
-                                    updated_track_ids.add(track_id)
-                                    break
+                        # IMPORTANT: Only update ego robot's track (index 0)
+                        # Each robot manages its own tracks independently
+                        ego_robot = graph_data._proximal_robots[0]
+                        for track in ego_robot.get_all_current_tracks():
+                            if track.track_id == track_id:
+                                track.update_trust(delta_alpha, delta_beta)
+                                updated_track_ids.add(track_id)
+                                break
 
         return updated_track_ids
 
-    def get_expected_trust(self, alpha: float, beta: float) -> float:
-        """Calculate expected value E[trust] = alpha / (alpha + beta)"""
-        return alpha / (alpha + beta)
-
-    def get_trust_variance(self, alpha: float, beta: float) -> float:
-        """Calculate variance V[trust] = (alpha * beta) / ((alpha + beta)^2 * (alpha + beta + 1))"""
-        denominator = (alpha + beta) ** 2 * (alpha + beta + 1)
-        return (alpha * beta) / denominator

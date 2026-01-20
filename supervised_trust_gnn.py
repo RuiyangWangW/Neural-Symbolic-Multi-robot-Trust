@@ -1300,5 +1300,11 @@ class EgoGraphBuilder:
         return False
 
     def _track_in_robot_fov(self, robot, track):
-        """Determine if track is in robot's field of view using Robot's built-in method"""
-        return robot.is_in_fov(track.position)  # Use Robot class's is_in_fov method
+        """
+        Determine if track is in robot's field of view.
+
+        Uses robot.is_in_fov() which automatically selects the correct FoV implementation:
+        - If robot.use_spot_fov=True: Uses SPOT dual-camera FoV (for Webots)
+        - If robot.use_spot_fov=False: Uses default single-camera FoV (for simulation)
+        """
+        return robot.is_in_fov(track.position)

@@ -5,8 +5,8 @@ Webots Trust-Based Sensor Fusion Environment
 Extends WebotsSimulationEnvironment to support adversarial robots with
 false positive and false negative detections for trust algorithm testing.
 
-Uses validated camera-based FoV checking from filter_detections_by_fov_corrected.py
-to ensure all detections (including FP objects) respect camera line-of-sight.
+Configures robots with SPOT dual-camera FoV (use_spot_fov=True) to match
+the actual Webots simulation camera geometry.
 """
 
 import numpy as np
@@ -17,152 +17,6 @@ from collections import defaultdict
 
 from webots_simulation_environment import WebotsSimulationEnvironment
 from robot_track_classes import Robot, Track
-
-
-# ============================================================================
-# Camera FoV Helper Functions (from filter_detections_by_fov_corrected.py)
-# ============================================================================
-
-def axis_angle_to_rotation_matrix(ax, ay, az, angle):
-    """Convert axis-angle rotation to rotation matrix using Rodrigues formula"""
-    norm = np.sqrt(ax*ax + ay*ay + az*az)
-    if norm < 1e-10:
-        return np.eye(3)
-    ax, ay, az = ax/norm, ay/norm, az/norm
-
-    c = np.cos(angle)
-    s = np.sin(angle)
-    C = 1 - c
-
-    R = np.array([
-        [ax*ax*C + c,    ax*ay*C - az*s, ax*az*C + ay*s],
-        [ay*ax*C + az*s, ay*ay*C + c,    ay*az*C - ax*s],
-        [az*ax*C - ay*s, az*ay*C + ax*s, az*az*C + c]
-    ])
-    return R
-
-
-def get_camera_transforms():
-    """Get camera transformations from Spot.proto (validated from filter_detections_by_fov_corrected.py)"""
-    # HEAD_SHAPES transformation
-    head_trans = np.array([-0.459994, -0.000019, -1.650002])
-    head_rot_aa = (0.577350, -0.577354, -0.577346, 2.094389)
-    head_R = axis_angle_to_rotation_matrix(*head_rot_aa)
-
-    # Right head camera
-    right_cam_trans_local = np.array([0.044898, 1.677970, -0.922603])
-    right_cam_rot_local_aa = (-0.425009, 0.613005, 0.666028, 2.205231)
-    right_R_local = axis_angle_to_rotation_matrix(*right_cam_rot_local_aa)
-
-    # Left head camera
-    left_cam_trans_local = np.array([-0.045109, 1.679550, -0.923250])
-    left_cam_rot_local_aa = (-0.685445, 0.491870, 0.536869, 1.854317)
-    left_R_local = axis_angle_to_rotation_matrix(*left_cam_rot_local_aa)
-
-    # Compose transformations
-    right_camera_offset = head_trans + head_R @ right_cam_trans_local
-    left_camera_offset = head_trans + head_R @ left_cam_trans_local
-
-    right_R_composed = head_R @ right_R_local
-    left_R_composed = head_R @ left_R_local
-
-    return {
-        'right': {'offset': right_camera_offset, 'rotation': right_R_composed},
-        'left': {'offset': left_camera_offset, 'rotation': left_R_composed}
-    }
-
-
-def get_camera_world_pose(robot_x, robot_y, robot_yaw, camera_offset):
-    """Get camera position in world frame"""
-    offset_forward, offset_left, offset_up = camera_offset
-
-    cos_yaw = np.cos(robot_yaw)
-    sin_yaw = np.sin(robot_yaw)
-
-    camera_x = robot_x + (offset_forward * cos_yaw - offset_left * sin_yaw)
-    camera_y = robot_y + (offset_forward * sin_yaw + offset_left * cos_yaw)
-
-    return camera_x, camera_y
-
-
-def get_camera_pointing_direction(robot_yaw, camera_rotation_matrix):
-    """Get camera pointing direction in world frame"""
-    # Camera default direction is +X in mesh coords
-    camera_default_dir = np.array([1, 0, 0])
-    pointing_dir = camera_rotation_matrix @ camera_default_dir
-
-    # Get yaw in robot frame
-    camera_yaw_local = np.arctan2(pointing_dir[1], pointing_dir[0])
-
-    # Convert to world frame
-    camera_yaw_world = robot_yaw + camera_yaw_local
-
-    return camera_yaw_world
-
-
-def is_in_camera_fov(camera_x, camera_y, camera_yaw, object_x, object_y, fov_angle, fov_range):
-    """
-    Check if an object is within a camera's field of view.
-
-    Args:
-        camera_x, camera_y: Camera position in world frame
-        camera_yaw: Camera pointing direction (radians)
-        object_x, object_y: Object position in world frame
-        fov_angle: Field of view angle (radians)
-        fov_range: Maximum detection range (meters)
-
-    Returns:
-        bool: True if object is in FoV
-    """
-    # Vector from camera to object
-    dx = object_x - camera_x
-    dy = object_y - camera_y
-
-    # Distance to object
-    distance = np.sqrt(dx*dx + dy*dy)
-
-    # Angle to object (from world +X axis)
-    angle_to_object = np.arctan2(dy, dx)
-
-    # Angle difference (normalized to [-pi, pi])
-    angle_diff = angle_to_object - camera_yaw
-    angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
-
-    # Check if within FoV
-    in_range = distance <= fov_range
-    in_angle = abs(angle_diff) <= fov_angle / 2
-
-    return (in_range and in_angle)
-
-
-def is_in_either_camera_fov(robot_x, robot_y, robot_yaw, object_x, object_y,
-                             fov_angle=np.pi/4, fov_range=20.0):
-    """
-    Check if object is visible from EITHER left or right camera.
-
-    Args:
-        robot_x, robot_y, robot_yaw: Robot pose
-        object_x, object_y: Object position
-        fov_angle: Camera FoV angle (default: π/4 = 45°)
-        fov_range: Camera detection range (default: 20m)
-
-    Returns:
-        bool: True if object is in at least one camera's FoV
-    """
-    cameras = get_camera_transforms()
-
-    for cam_name, cam_data in cameras.items():
-        # Get camera world pose
-        cam_x, cam_y = get_camera_world_pose(robot_x, robot_y, robot_yaw, cam_data['offset'])
-
-        # Get camera pointing direction
-        cam_yaw = get_camera_pointing_direction(robot_yaw, cam_data['rotation'])
-
-        # Check if object is in this camera's FoV
-        if is_in_camera_fov(cam_x, cam_y, cam_yaw, object_x, object_y, fov_angle, fov_range):
-            return True
-
-    return False
 
 
 class WebotsTrustEnvironment(WebotsSimulationEnvironment):
@@ -236,7 +90,7 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
     def _initialize_robots(self):
         """Initialize Robot objects for trust tracking"""
         for robot_name in self.robot_data.keys():
-            # Create Robot object
+            # Create Robot object with SPOT dual-camera FoV enabled
             robot = Robot(
                 robot_id=robot_name,
                 position=np.array([0.0, 0.0, 0.0]),  # Will be updated each timestep
@@ -245,6 +99,7 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
                 trust_beta=1.0,
                 fov_range=20.0,  # From camera specs
                 fov_angle=np.pi/4,  # 45 degrees
+                use_spot_fov=True  # Enable SPOT dual-camera FoV for Webots
             )
 
             # Add additional attributes
@@ -269,7 +124,7 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
 
         # Calculate number of FP objects per adversarial robot
         num_ground_truth = len(self.ground_truth_objects)
-        total_fp_objects = int(self.false_positive_rate * num_ground_truth * len(adversarial_robots))
+        total_fp_objects = int(self.false_positive_rate * num_ground_truth * 4)
 
         # Ensure at least one FP object per adversarial robot
         total_fp_objects = max(len(adversarial_robots), total_fp_objects)
