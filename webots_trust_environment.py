@@ -128,7 +128,7 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
 
         # Calculate number of FP objects per adversarial robot
         num_ground_truth = len(self.ground_truth_objects)
-        total_fp_objects = int(self.false_positive_rate * num_ground_truth)
+        total_fp_objects = int(self.false_positive_rate * num_ground_truth * 2)
 
         # Ensure at least one FP object per adversarial robot
         total_fp_objects = max(len(adversarial_robots), total_fp_objects)

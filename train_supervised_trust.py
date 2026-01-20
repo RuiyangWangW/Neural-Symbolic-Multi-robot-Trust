@@ -1227,17 +1227,58 @@ def load_dataset(data_path: str, log_print=None) -> List[SupervisedDataSample]:
 
 def split_dataset(dataset: List[SupervisedDataSample],
                  train_ratio: float = 0.8,
+                 random_seed: int = 42,
                  log_print=None) -> Tuple[List[SupervisedDataSample], List[SupervisedDataSample]]:
-    """Split dataset into train and validation sets"""
+    """
+    Split dataset into train and validation sets by episodes to avoid data leakage.
+
+    Important: Splits at the episode level, not sample level. This ensures that
+    samples from the same episode (which are highly correlated) don't appear in
+    both training and validation sets.
+
+    Args:
+        dataset: List of SupervisedDataSample objects
+        train_ratio: Fraction of episodes to use for training (default: 0.8)
+        random_seed: Random seed for reproducible splits (default: 42)
+        log_print: Logging function
+
+    Returns:
+        Tuple of (train_data, val_data)
+    """
     if log_print is None:
         log_print = print
 
-    np.random.shuffle(dataset)
-    split_idx = int(len(dataset) * train_ratio)
-    train_data = dataset[:split_idx]
-    val_data = dataset[split_idx:]
+    # Group samples by episode to avoid data leakage
+    episode_samples = {}
+    for sample in dataset:
+        episode_id = sample.episode
+        if episode_id not in episode_samples:
+            episode_samples[episode_id] = []
+        episode_samples[episode_id].append(sample)
 
-    log_print(f"📊 Dataset split: {len(train_data)} train, {len(val_data)} validation")
+    # Shuffle episodes (not individual samples) for reproducibility
+    episode_ids = list(episode_samples.keys())
+    np.random.seed(random_seed)
+    np.random.shuffle(episode_ids)
+
+    # Split episodes
+    split_idx = int(len(episode_ids) * train_ratio)
+    train_episodes = episode_ids[:split_idx]
+    val_episodes = episode_ids[split_idx:]
+
+    # Collect samples from each episode group
+    train_data = []
+    val_data = []
+    for ep_id in train_episodes:
+        train_data.extend(episode_samples[ep_id])
+    for ep_id in val_episodes:
+        val_data.extend(episode_samples[ep_id])
+
+    log_print(f"📊 Dataset split by episode (seed={random_seed}):")
+    log_print(f"   Train: {len(train_episodes)} episodes, {len(train_data)} samples")
+    log_print(f"   Val:   {len(val_episodes)} episodes, {len(val_data)} samples")
+    log_print(f"   ✓ No data leakage: entire episodes in one set")
+
     return train_data, val_data
 
 
@@ -1334,6 +1375,10 @@ def main():
                        help='Weight for agent loss (default: 5.0 to balance with multiple tracks)')
     parser.add_argument('--track-loss-weight', type=float, default=1.0,
                        help='Weight for track loss (default: 1.0)')
+    parser.add_argument('--train-ratio', type=float, default=0.8,
+                       help='Train/validation split ratio (default: 0.8 = 80%% train, 20%% val)')
+    parser.add_argument('--split-seed', type=int, default=42,
+                       help='Random seed for train/val split (default: 42, ensures reproducibility)')
 
     args = parser.parse_args()
 
@@ -1401,7 +1446,8 @@ def main():
         return
 
     dataset = load_dataset(args.data, log_print=log_print)
-    train_data, val_data = split_dataset(dataset, log_print=log_print)
+    train_data, val_data = split_dataset(dataset, train_ratio=args.train_ratio,
+                                        random_seed=args.split_seed, log_print=log_print)
 
     # Create data loaders with MPS/CUDA optimizations
     train_dataset = SupervisedTrustDataset(train_data)
