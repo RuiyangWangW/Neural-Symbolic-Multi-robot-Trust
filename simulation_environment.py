@@ -27,12 +27,11 @@ class GroundTruthObject:
     object_type: str         # 'vehicle', 'person', etc.
     movement_pattern: str    # 'linear', 'random_walk', 'circular', 'stationary'
     spawn_time: float        # When object first appeared
-    lifespan: float          # How long object exists (-1 for permanent)
-    
+
     # Movement parameters
     base_speed: float = 1.0
     turn_probability: float = 0.02  # For random walk
-    
+
     # Circular motion parameters (only used for circular movement)
     circular_center: np.ndarray = None  # Center of circular motion
     circular_radius: float = 0.0        # Radius of circular motion
@@ -48,7 +47,7 @@ class SimulationEnvironment:
                  target_density: float = 0.002,
                  adversarial_ratio: float = 0.3,
                  proximal_range: float = 100.0,
-                 fov_range: float = 50.0,
+                 fov_range: float = 30.0,
                  fov_angle: float = np.pi/3,
                  false_positive_rate: float = 0.5,
                  false_negative_rate: float = 0.0,
@@ -274,9 +273,6 @@ class SimulationEnvironment:
         object_types = ['vehicle', 'person', 'animal']
         object_type = random.choice(object_types)
 
-        # FP objects are permanent (no expiration)
-        lifespan = -1
-
         return GroundTruthObject(
             id=obj_id,
             position=position,
@@ -284,7 +280,6 @@ class SimulationEnvironment:
             object_type=object_type,
             movement_pattern=movement_pattern,
             spawn_time=spawn_time,
-            lifespan=lifespan,
             base_speed=base_speed,
             turn_probability=random.uniform(0.1, 0.2),  # Higher turn probability to stay nearby
             direction_change_time=random.uniform(2, 5),
@@ -344,17 +339,11 @@ class SimulationEnvironment:
         # Object type
         object_types = ['vehicle', 'person', 'animal']
         object_type = random.choice(object_types)
-        
-        # Lifespan
-        if random.random() < 0.7:  # 70% permanent objects
-            lifespan = -1
-        else:  # 30% temporary objects
-            lifespan = random.uniform(10, 30)
-        
+
         # Prepare circular motion parameters if needed
         circular_center_param = circular_center if movement_pattern == 'circular' else None
         circular_radius_param = circular_radius if movement_pattern == 'circular' else 0.0
-        
+
         return GroundTruthObject(
             id=obj_id,
             position=position,
@@ -362,7 +351,6 @@ class SimulationEnvironment:
             object_type=object_type,
             movement_pattern=movement_pattern,
             spawn_time=spawn_time,
-            lifespan=lifespan,
             base_speed=base_speed,
             turn_probability=random.uniform(0.01, 0.05),
             direction_change_time=random.uniform(3, 8),
@@ -372,15 +360,8 @@ class SimulationEnvironment:
     
     def _update_ground_truth_objects(self):
         """Update positions and states of all ground truth objects"""
-        objects_to_remove = []
-        
+        # Update object based on movement pattern
         for obj in self.ground_truth_objects:
-            # Fixed objects - no expiration during episode
-            # if obj.lifespan > 0 and (self.time - obj.spawn_time) > obj.lifespan:
-            #     objects_to_remove.append(obj)
-            #     continue
-            
-            # Update object based on movement pattern
             if obj.movement_pattern == 'stationary':
                 pass
                 
@@ -433,12 +414,6 @@ class SimulationEnvironment:
                     obj.position = center + radius * np.array([
                         np.cos(angle), np.sin(angle), 0.0
                     ])
-        
-        # Remove expired objects
-        for obj in objects_to_remove:
-            self.ground_truth_objects.remove(obj)
-
-        # Fixed number of ground truth objects - no dynamic spawning
 
         # Update false positive objects (same dynamics as ground truth objects)
         self._update_fp_objects()
