@@ -36,7 +36,7 @@ class TrustMethodComparison:
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
                  fixed_step_scale: float = 0.5,
-                 allow_fp_codetection: bool = False,
+                 allow_fp_codetection: bool = True,
                  ):
         """
         Initialize comparison with all three trust methods
@@ -52,7 +52,7 @@ class TrustMethodComparison:
             fov_range: Field of view range for robots
             fov_angle: Field of view angle for robots
             fixed_step_scale: Step scale for baseline fixed-step method (default: 0.5)
-            allow_fp_codetection: Whether to allow FP codetection (default: False)
+            allow_fp_codetection: Whether to allow FP codetection (default: True)
         """
         self.supervised_model_path = Path(supervised_model_path) if supervised_model_path else None
         self.world_size = float(world_size)

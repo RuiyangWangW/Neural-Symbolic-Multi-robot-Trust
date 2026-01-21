@@ -203,6 +203,7 @@ class SupervisedDataGenerator:
             proximal_range=params['proximal_range'],
             fov_range=self.fov_range,
             fov_angle=self.fov_angle,
+            allow_fp_codetection=True
         )
 
         # Update ego graph builder with fixed proximal range
