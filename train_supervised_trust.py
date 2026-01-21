@@ -1355,7 +1355,7 @@ def main():
                        help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=256,
                        help='Number of samples per DataLoader batch (processed individually per ego-graph)')
-    parser.add_argument('--lr', type=float, default=1e-3,
+    parser.add_argument('--lr', type=float, default=1e-4,
                        help='Learning rate')
     parser.add_argument('--device', type=str, default='auto',
                        help='Device to use (cpu/cuda/mps/auto)')
