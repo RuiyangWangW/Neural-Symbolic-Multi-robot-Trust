@@ -257,6 +257,8 @@ class SupervisedTrustTrainer:
                  weight_decay: float = 1e-4,
                  agent_loss_weight: float = 1.0,
                  track_loss_weight: float = 1.0,
+                 lr_scheduler_patience: int = 5,
+                 lr_scheduler_factor: float = 0.5,
                 ):
         """
         Initialize trainer
@@ -268,6 +270,8 @@ class SupervisedTrustTrainer:
             weight_decay: Weight decay for regularization
             agent_loss_weight: Weight for agent loss (default: 1.0)
             track_loss_weight: Weight for track loss (default: 1.0)
+            lr_scheduler_patience: Epochs before reducing LR (default: 5)
+            lr_scheduler_factor: LR reduction factor (default: 0.5)
         """
         self.model = model
         self.device = torch.device(device)
@@ -280,7 +284,7 @@ class SupervisedTrustTrainer:
         # Optimizer and loss function
         self.optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.7, patience=10
+            self.optimizer, mode='min', factor=lr_scheduler_factor, patience=lr_scheduler_patience
         )
 
         # Binary cross-entropy loss for classification with sum reduction
@@ -1120,7 +1124,13 @@ class SupervisedTrustTrainer:
             self.val_metrics.append(val_metrics)
 
             # Learning rate scheduling
+            old_lr = self.optimizer.param_groups[0]['lr']
             self.scheduler.step(val_loss)
+            new_lr = self.optimizer.param_groups[0]['lr']
+
+            # Log LR change
+            if new_lr < old_lr:
+                log_print(f"📉 Learning rate reduced: {old_lr:.6f} → {new_lr:.6f}")
 
             # Progress logging - print every epoch
             log_print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
@@ -1355,8 +1365,14 @@ def main():
                        help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=256,
                        help='Number of samples per DataLoader batch (processed individually per ego-graph)')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                       help='Learning rate')
+    parser.add_argument('--lr', type=float, default=5e-4,
+                       help='Learning rate (default: 5e-4, reduced from 1e-3 to prevent overfitting)')
+    parser.add_argument('--weight-decay', type=float, default=1e-4,
+                       help='Weight decay for L2 regularization (default: 1e-4)')
+    parser.add_argument('--lr-scheduler-patience', type=int, default=5,
+                       help='LR scheduler patience - epochs before reducing LR (default: 5)')
+    parser.add_argument('--lr-scheduler-factor', type=float, default=0.5,
+                       help='LR reduction factor (default: 0.5, halve LR on plateau)')
     parser.add_argument('--device', type=str, default='auto',
                        help='Device to use (cpu/cuda/mps/auto)')
     parser.add_argument('--num-workers', type=int, default=0,
@@ -1482,14 +1498,20 @@ def main():
     log_print(f"👷 DataLoader workers: {num_workers}")
     log_print(f"📌 Pin memory: {pin_memory}")
 
-    # Create trainer with loss weighting
+    # Create trainer with loss weighting and scheduler params
     log_print(f"⚖️  Loss weights: Agent={args.agent_loss_weight}, Track={args.track_loss_weight}")
+    log_print(f"📉 Learning rate: {args.lr}")
+    log_print(f"🔧 Weight decay: {args.weight_decay}")
+    log_print(f"📅 LR scheduler: ReduceLROnPlateau (patience={args.lr_scheduler_patience}, factor={args.lr_scheduler_factor})")
     trainer = SupervisedTrustTrainer(
         model,
         device=device,
         learning_rate=args.lr,
+        weight_decay=args.weight_decay,
         agent_loss_weight=args.agent_loss_weight,
-        track_loss_weight=args.track_loss_weight
+        track_loss_weight=args.track_loss_weight,
+        lr_scheduler_patience=args.lr_scheduler_patience,
+        lr_scheduler_factor=args.lr_scheduler_factor
     )
 
     # Train model with logging
