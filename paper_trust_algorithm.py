@@ -73,7 +73,7 @@ class DataAggregator:
             return {}
 
         # Use ONLY current-time detected tracks
-        ego_current_tracks = ego_robot.get_all_tracks()
+        ego_current_tracks = ego_robot.get_all_current_tracks()
 
         if not ego_current_tracks:
             return {}
@@ -95,7 +95,7 @@ class DataAggregator:
                     continue
 
                 # Get current tracks only
-                other_current_tracks = other_robot.get_all_tracks()
+                other_current_tracks = other_robot.get_all_current_tracks()
 
                 # Match by object ID directly (no Hungarian needed!)
                 for other_track in other_current_tracks:
@@ -205,7 +205,7 @@ class PaperTrustAlgorithm:
         # OUTER LOOP: For each ego robot, create ego fused tracks from CURRENT tracks
         for ego_robot in robots:
             # Use CURRENT tracks only
-            ego_robot_tracks = ego_robot.get_all_tracks()
+            ego_robot_tracks = ego_robot.get_all_current_tracks()
 
             if not ego_robot_tracks:
                 continue
@@ -227,7 +227,7 @@ class PaperTrustAlgorithm:
             for proximal_robot in proximal_robots_in_range:
 
                 # Use proximal robot's CURRENT tracks only
-                proximal_robot_tracks = proximal_robot.get_all_tracks()
+                proximal_robot_tracks = proximal_robot.get_all_current_tracks()
                 if not proximal_robot_tracks:
                     continue
 
@@ -243,7 +243,7 @@ class PaperTrustAlgorithm:
             
             # Update track trust for all CURRENT tracks that have PSMs
             track_updates_count = 0
-            for track in robot.get_all_tracks():
+            for track in robot.get_all_current_tracks():
                 if track.track_id in all_track_psms:
                     self.trust_estimator.update_track_trust(track, all_track_psms[track.track_id])
                     track_updates_count += 1
@@ -265,7 +265,7 @@ class PaperTrustAlgorithm:
                         'num_psms': len(all_track_psms.get(track.track_id, [])),
                         'object_id': track.object_id
                     }
-                    for track in robot.get_all_tracks()
+                    for track in robot.get_all_current_tracks()
                 }
             }
         
@@ -342,8 +342,8 @@ class PaperTrustAlgorithm:
         # Calculate agent trust statistics (used in track PSM)
         agent_expected_trust = proximal_robot.trust_value
 
-        # Agent PSM: value = E[proximal_track_trust], confidence = 1-V[proximal_track_trust]
-        agent_value = proximal_track_expected_trust
+        # Agent PSM: value = 1.0 - E[proximal_track_trust], confidence = 1-V[proximal_track_trust]
+        agent_value = 1.0 - proximal_track_expected_trust
         agent_confidence = 1.0 - proximal_track_trust_variance
         robot_psms[proximal_robot.id].append((agent_value, agent_confidence))
 
