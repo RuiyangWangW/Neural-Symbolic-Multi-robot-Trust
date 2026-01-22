@@ -497,7 +497,8 @@ class Robot:
 
     def is_in_spot_dual_camera_fov(self, target_position: np.ndarray,
                                      fov_angle: float = np.pi/4,
-                                     fov_range: float = 20.0) -> bool:
+                                     fov_range: float = 20.0,
+                                     object_shape: Optional[Dict[str, float]] = None) -> bool:
         """
         Check if position is in SPOT robot's dual-camera field of view.
 
@@ -508,9 +509,13 @@ class Robot:
             target_position: Target position in world frame [x, y, z]
             fov_angle: FoV angle for each camera (default: π/4 = 45°)
             fov_range: Maximum detection range (default: 20m)
+            object_shape: Optional shape dict with 'type' and dimensions:
+                - 'rectangle': {'type': 'rectangle', 'width': float, 'length': float}
+                - 'circle': {'type': 'circle', 'radius': float}
+                If None, only checks center point
 
         Returns:
-            True if target is visible to either camera
+            True if target (or any part of its shape) is visible to either camera
         """
         # Camera transforms from Spot.proto (same as filter_detections_by_fov.py)
         # HEAD_SHAPES transformation
@@ -534,6 +539,13 @@ class Robot:
         right_R_composed = head_R @ right_R_local
         left_R_composed = head_R @ left_R_local
 
+        # Generate sample points to check based on object shape
+        if object_shape is not None:
+            sample_points = self._get_object_sample_points(target_position, object_shape)
+        else:
+            # If no shape provided, only check center point
+            sample_points = [target_position]
+
         # Check both cameras
         for camera_offset, camera_R in [(left_camera_offset, left_R_composed),
                                          (right_camera_offset, right_R_composed)]:
@@ -544,15 +556,16 @@ class Robot:
             # Get camera pointing direction in world frame
             camera_yaw = self._get_camera_pointing_direction(self.orientation, camera_R)
 
-            # Check if object is in this camera's FoV (geometric check)
-            if self._is_in_single_camera_fov(camera_x, camera_y, camera_yaw,
-                                             target_position[0], target_position[1],
-                                             fov_angle, fov_range):
-                # Geometric FoV check passed, now check line of sight
-                if self.has_line_of_sight(target_position):
-                    return True  # Visible to at least one camera with clear line of sight
+            # Check if ANY point on the object is visible in this camera's FoV
+            for sample_point in sample_points:
+                if self._is_in_single_camera_fov(camera_x, camera_y, camera_yaw,
+                                                 sample_point[0], sample_point[1],
+                                                 fov_angle, fov_range):
+                    # Geometric FoV check passed, now check line of sight
+                    if self.has_line_of_sight(sample_point):
+                        return True  # At least one point visible with clear line of sight
 
-        return False  # Not visible to either camera or line of sight blocked
+        return False  # No point visible in either camera or all lines of sight blocked
 
     def _axis_angle_to_rotation_matrix(self, ax: float, ay: float, az: float, angle: float) -> np.ndarray:
         """Convert axis-angle rotation to rotation matrix using Rodrigues formula"""
@@ -622,6 +635,71 @@ class Robot:
         in_angle = abs(angle_diff) <= fov_angle / 2
 
         return (in_range and in_angle)
+
+    def _get_object_sample_points(self, center_position: np.ndarray,
+                                   object_shape: Dict[str, float]) -> List[np.ndarray]:
+        """
+        Generate sample points on the object's shape for visibility checking.
+
+        For rectangles: samples center and 4 corners (and edges for large objects)
+        For circles: samples center and points on circumference
+
+        Args:
+            center_position: Object center position [x, y, z]
+            object_shape: Shape dict with 'type' and dimensions
+
+        Returns:
+            List of sample points to check for visibility
+        """
+        sample_points = []
+        x, y = center_position[0], center_position[1]
+        z = center_position[2] if len(center_position) > 2 else 0.0
+
+        shape_type = object_shape.get('type', 'rectangle')
+
+        if shape_type == 'circle':
+            # Circle: sample center and 8 points on circumference
+            radius = object_shape.get('radius', 0.3)
+            sample_points.append(np.array([x, y, z]))  # Center
+
+            # Sample 8 points around the circle
+            for i in range(8):
+                angle = i * 2 * np.pi / 8
+                px = x + radius * np.cos(angle)
+                py = y + radius * np.sin(angle)
+                sample_points.append(np.array([px, py, z]))
+
+        else:  # rectangle
+            width = object_shape.get('width', 0.3)
+            length = object_shape.get('length', 0.3)
+
+            # Sample center
+            sample_points.append(np.array([x, y, z]))
+
+            # Sample 4 corners
+            half_w = width / 2
+            half_l = length / 2
+            corners = [
+                (x - half_w, y - half_l),  # Bottom-left
+                (x + half_w, y - half_l),  # Bottom-right
+                (x + half_w, y + half_l),  # Top-right
+                (x - half_w, y + half_l),  # Top-left
+            ]
+            for cx, cy in corners:
+                sample_points.append(np.array([cx, cy, z]))
+
+            # For larger objects (> 1m), also sample edge midpoints
+            if max(width, length) > 1.0:
+                edge_midpoints = [
+                    (x, y - half_l),        # Bottom edge
+                    (x + half_w, y),        # Right edge
+                    (x, y + half_l),        # Top edge
+                    (x - half_w, y),        # Left edge
+                ]
+                for ex, ey in edge_midpoints:
+                    sample_points.append(np.array([ex, ey, z]))
+
+        return sample_points
 
     def start_new_timestep(self, timestep: float):
         """Start a new timestep and clear current timestep tracks."""

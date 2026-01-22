@@ -155,9 +155,44 @@ class WebotsSimulationEnvironment:
                 "avg_position": avg_position,
                 "first_seen": min(positions_per_timestep.keys()) if positions_per_timestep else 0,
                 "last_seen": max(positions_per_timestep.keys()) if positions_per_timestep else 0,
+                "shape": self._get_object_shape(gid),
             }
 
         print(f"Identified {len(self.ground_truth_objects)} ground truth objects")
+
+    def _get_object_shape(self, gid: str) -> Dict:
+        """
+        Get object shape information from gid.
+
+        Args:
+            gid: Ground truth object ID (e.g., "DEF:WoodenBox_1", "DEF:GasCanister_2")
+                 or false positive object ID (e.g., "fp_obj_1")
+
+        Returns:
+            Dict with 'type' and dimensions:
+            - 'rectangle': {'type': 'rectangle', 'width': float, 'length': float}
+            - 'circle': {'type': 'circle', 'radius': float}
+        """
+        gid_lower = gid.lower()
+
+        # False positive objects are 0.6x0.6 boxes
+        if 'fp_obj' in gid_lower or 'fp' in gid_lower:
+            return {'type': 'rectangle', 'width': 0.6, 'length': 0.6}
+        # WoodenBox and CardboardBox are 0.6x0.6 squares
+        elif 'woodbox' in gid_lower or 'cardbox' in gid_lower:
+            return {'type': 'rectangle', 'width': 0.6, 'length': 0.6}
+        # GasCanister is a circle with radius 0.175
+        elif 'canister' in gid_lower:
+            return {'type': 'circle', 'radius': 0.175}
+        # Human is a 0.35x0.35 box
+        elif 'human' in gid_lower:
+            return {'type': 'rectangle', 'width': 0.35, 'length': 0.35}
+        # Forklift is a large 1.0x4.0 rectangle
+        elif 'forklift' in gid_lower:
+            return {'type': 'rectangle', 'width': 1.0, 'length': 4.0}
+        else:
+            # Default to small square for unknown types
+            return {'type': 'rectangle', 'width': 0.3, 'length': 0.3}
 
     def get_robot_positions(self, timestep: int) -> Dict[str, Tuple[float, float, float]]:
         """
