@@ -298,51 +298,58 @@ def compute_robot_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str,
 
 def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str, float], Dict[str, float]]:
     """
-    Compute object-level accuracy using only believed-legitimate robots (trust >= threshold).
+    Compute object-level accuracy using ALL robots (swarm-wide perception).
 
     Algorithm:
-    1. Collect ALL objects from all robots (to ensure correct recall calculation)
-    2. Filter to robots with trust >= threshold (believed legitimate)
-    3. Aggregate tracks by object_id using weighted average from filtered robots only
-    4. Objects NOT seen by any trusted robot receive score = 0.0
-    5. Objects with aggregated trust >= threshold are "believed to be true"
-    6. Metrics calculated using classification_metrics(labels, scores, threshold)
+    1. Collect ALL objects from all robots
+    2. Aggregate tracks by object_id using weighted average from ALL robots
+       - Adversarial robots contribute with their (low) robot trust weight
+       - Legitimate robots contribute with their (high) robot trust weight
+    3. Objects NOT seen by any robot receive score = 0.0
+    4. Objects with aggregated trust >= threshold are "believed to be true"
+    5. Metrics calculated using classification_metrics(labels, scores, threshold)
 
-    This measures: "Of all objects we trust (based on trusted robots), what fraction are actually real?"
+    This measures: "Of all objects the swarm perceives, what fraction are actually real?"
 
-    IMPORTANT: We evaluate ALL objects (including those only seen by untrusted robots) to ensure
-    correct recall calculation. Objects only seen by untrusted robots get score=0.0, which means
-    they will be counted as False Negatives if they are GT objects (correct for recall).
+    NOTE: Robot-level trust is already evaluated separately, so object accuracy measures
+    overall swarm perception including all robots.
     """
     track_data = final_step.get("track_trust_values", {})
     robot_trust_data = final_step.get("robot_trust_values", {})
 
-    # Filter to believed-legitimate robots (trust >= threshold)
-    legitimate_robots = {robot_id for robot_id, trust in robot_trust_data.items()
-                        if float(trust) >= threshold}
-
-    # First pass: Collect ALL objects (from all robots) to ensure we don't miss any GT objects
+    # First pass: Collect ALL objects (from all robots) to ensure we don't miss any GT objects or FPs
     all_objects = set()  # All object_ids that exist in the simulation
     for robot_id, robot_tracks in track_data.items():
         for _, track_info in robot_tracks.items():
             object_id = track_info.get("object_id", "")
-            if object_id.startswith("gt_") or object_id.startswith("fp_"):
+            # Include ground truth objects
+            if object_id.startswith("gt_"):
+                all_objects.add(object_id)
+            # Include ALL types of false positives (persistent adversarial + transient sensor)
+            elif (object_id.startswith("fp_obj_") or      # Persistent adversarial FP (all modes)
+                  object_id.startswith("sensor_fp_")):    # Transient sensor FP
                 all_objects.add(object_id)
 
-    # Second pass: Aggregate tracks by object_id from legitimate robots only
+    # Second pass: Aggregate tracks by object_id from ALL robots (not filtered by trust)
+    # This measures swarm-wide perception including adversarial robots
     object_weighted_trusts = {}  # object_id -> list of (robot_trust, track_trust) tuples
 
     for robot_id, robot_tracks in track_data.items():
-        if robot_id not in legitimate_robots:
-            continue  # Skip robots with trust < threshold
-
+        # Use ALL robots (removed trust threshold filter)
         robot_trust = float(robot_trust_data.get(robot_id, 0.5))
 
         for _, track_info in robot_tracks.items():
             object_id = track_info.get("object_id", "")
             track_trust = float(track_info.get("trust_value", 0.5))
 
-            if object_id.startswith("gt_") or object_id.startswith("fp_"):
+            # Include ground truth objects
+            if object_id.startswith("gt_"):
+                if object_id not in object_weighted_trusts:
+                    object_weighted_trusts[object_id] = []
+                object_weighted_trusts[object_id].append((robot_trust, track_trust))
+            # Include ALL types of false positives
+            elif (object_id.startswith("fp_obj_") or      # Persistent adversarial FP (all modes)
+                  object_id.startswith("sensor_fp_")):    # Transient sensor FP
                 if object_id not in object_weighted_trusts:
                     object_weighted_trusts[object_id] = []
                 object_weighted_trusts[object_id].append((robot_trust, track_trust))
@@ -353,7 +360,7 @@ def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str
     gt_trust = []
     fp_trust = []
 
-    # Evaluate ALL objects, including those not seen by trusted robots
+    # Evaluate ALL objects, including those not seen by any robot
     for object_id in all_objects:
         if object_id in object_weighted_trusts:
             weighted_values = object_weighted_trusts[object_id]
@@ -362,19 +369,23 @@ def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str
             sum_weights = sum(robot_trust for robot_trust, _ in weighted_values)
             avg_trust = float(sum_weighted / sum_weights) if sum_weights > 0 else 0.0
         else:
-            # Object only seen by untrusted robots -> score = 0.0
+            # Object not seen by any robot -> score = 0.0
             avg_trust = 0.0
 
         if object_id.startswith("gt_"):
+            # Ground truth object (positive class)
             labels.append(1)
             gt_trust.append(avg_trust)
-        elif object_id.startswith("fp_"):
+            scores.append(avg_trust)
+        elif (object_id.startswith("fp_obj_") or      # Persistent adversarial FP (all modes)
+              object_id.startswith("sensor_fp_")):    # Transient sensor FP
+            # False positive object (negative class)
             labels.append(0)
             fp_trust.append(avg_trust)
+            scores.append(avg_trust)
         else:
+            # Unknown object type - skip
             continue
-
-        scores.append(avg_trust)
 
     metrics = classification_metrics(labels, scores, threshold)
     stats = {
@@ -395,18 +406,15 @@ def compute_object_metrics_with_adversarial_lies(final_step: Dict, threshold: fl
     This affects the weighted averaging calculation and thus the final metrics.
 
     Algorithm (same as compute_object_metrics but with adversarial track lies):
-    1. Collect ALL objects from all robots (to ensure correct recall calculation)
-    2. Filter to robots with trust >= threshold (believed legitimate)
-    3. Aggregate tracks with adversarial lies applied to track trust values
-    4. Objects NOT seen by any trusted robot receive score = 0.0
-    5. Objects with aggregated trust >= threshold are "believed to be true"
+    1. Collect ALL objects from all robots
+    2. Aggregate tracks with adversarial lies applied to track trust values (from ALL robots)
+    3. Objects NOT seen by any robot receive score = 0.0
+    4. Objects with aggregated trust >= threshold are "believed to be true"
 
-    IMPORTANT: We evaluate ALL objects (including those only seen by untrusted robots) to ensure
-    correct recall calculation. Objects only seen by untrusted robots get score=0.0, which means
-    they will be counted as False Negatives if they are GT objects (correct for recall).
+    NOTE: Uses ALL robots (not filtered by trust) to measure swarm-wide perception.
 
     Use this version for benchmarks that test robustness against adversarial manipulation
-    of track-level trust values (e.g., adversarial_track_lies variants).
+    of track-level trust values (e.g., deceptive mode with trust manipulation).
     """
     import random
 
@@ -414,25 +422,22 @@ def compute_object_metrics_with_adversarial_lies(final_step: Dict, threshold: fl
     robot_trust_data = final_step.get("robot_trust_values", {})
     adversarial_robots = set(final_step.get("adversarial_robots", []))
 
-    # Filter to believed-legitimate robots (trust >= threshold)
-    legitimate_robots = {robot_id for robot_id, trust in robot_trust_data.items()
-                        if float(trust) >= threshold}
-
-    # First pass: Collect ALL objects (from all robots) to ensure we don't miss any GT objects
+    # First pass: Collect ALL objects from all robots
     all_objects = set()  # All object_ids that exist in the simulation
     for robot_id, robot_tracks in track_data.items():
         for _, track_info in robot_tracks.items():
             object_id = track_info.get("object_id", "")
-            if object_id.startswith("gt_") or object_id.startswith("fp_"):
+            if object_id.startswith("gt_"):
+                all_objects.add(object_id)
+            elif (object_id.startswith("fp_obj_") or      # Persistent adversarial FP (all modes)
+                  object_id.startswith("sensor_fp_")):    # Transient sensor FP
                 all_objects.add(object_id)
 
-    # Second pass: Aggregate tracks by object_id from legitimate robots only
+    # Second pass: Aggregate tracks by object_id from ALL robots (not filtered by trust)
     object_weighted_trusts = {}  # object_id -> list of (robot_trust, track_trust) tuples
 
     for robot_id, robot_tracks in track_data.items():
-        if robot_id not in legitimate_robots:
-            continue  # Skip robots with trust < threshold
-
+        # Use ALL robots (removed trust threshold filter)
         robot_trust = float(robot_trust_data.get(robot_id, 0.5))
         is_adversarial = robot_id in adversarial_robots
 
@@ -444,10 +449,20 @@ def compute_object_metrics_with_adversarial_lies(final_step: Dict, threshold: fl
             if is_adversarial:
                 if object_id.startswith("gt_"):
                     track_trust = random.uniform(0.0, 0.2)
-                elif object_id.startswith("fp_"):
+                elif (object_id.startswith("fp_") or
+                      object_id.startswith("adv_fp_") or
+                      object_id.startswith("sensor_fp_") or
+                      object_id.startswith("natural_fp_")):
                     track_trust = random.uniform(0.8, 1.0)
 
-            if object_id.startswith("gt_") or object_id.startswith("fp_"):
+            if object_id.startswith("gt_"):
+                if object_id not in object_weighted_trusts:
+                    object_weighted_trusts[object_id] = []
+                object_weighted_trusts[object_id].append((robot_trust, track_trust))
+            elif (object_id.startswith("fp_") or          # Persistent adversarial FP (normal mode)
+                  object_id.startswith("adv_fp_") or      # Persistent adversarial FP (optimized/deceptive)
+                  object_id.startswith("sensor_fp_") or   # Transient sensor FP
+                  object_id.startswith("natural_fp_")):   # Legacy natural FP
                 if object_id not in object_weighted_trusts:
                     object_weighted_trusts[object_id] = []
                 object_weighted_trusts[object_id].append((robot_trust, track_trust))
@@ -458,7 +473,7 @@ def compute_object_metrics_with_adversarial_lies(final_step: Dict, threshold: fl
     gt_trust = []
     fp_trust = []
 
-    # Evaluate ALL objects, including those not seen by trusted robots
+    # Evaluate ALL objects, including those not seen by any robot
     for object_id in all_objects:
         if object_id in object_weighted_trusts:
             weighted_values = object_weighted_trusts[object_id]
@@ -467,19 +482,23 @@ def compute_object_metrics_with_adversarial_lies(final_step: Dict, threshold: fl
             sum_weights = sum(robot_trust for robot_trust, _ in weighted_values)
             avg_trust = float(sum_weighted / sum_weights) if sum_weights > 0 else 0.0
         else:
-            # Object only seen by untrusted robots -> score = 0.0
+            # Object not seen by any robot -> score = 0.0
             avg_trust = 0.0
 
         if object_id.startswith("gt_"):
+            # Ground truth object (positive class)
             labels.append(1)
             gt_trust.append(avg_trust)
-        elif object_id.startswith("fp_"):
+            scores.append(avg_trust)
+        elif (object_id.startswith("fp_obj_") or      # Persistent adversarial FP (all modes)
+              object_id.startswith("sensor_fp_")):    # Transient sensor FP
+            # False positive object (negative class)
             labels.append(0)
             fp_trust.append(avg_trust)
+            scores.append(avg_trust)
         else:
+            # Unknown object type - skip
             continue
-
-        scores.append(avg_trust)
 
     metrics = classification_metrics(labels, scores, threshold)
     stats = {

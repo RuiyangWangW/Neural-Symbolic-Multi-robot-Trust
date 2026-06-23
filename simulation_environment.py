@@ -16,6 +16,8 @@ from scipy.spatial.distance import euclidean
 
 # Import the clean robot and track classes
 from robot_track_classes import Robot, Track
+# Import specialized robot types
+from robot_types import LegitimateRobot, AdversarialRobot
 
 
 @dataclass
@@ -37,6 +39,10 @@ class GroundTruthObject:
     circular_radius: float = 0.0        # Radius of circular motion
     direction_change_time: float = 5.0  # For direction changes
 
+    # FP object tracking (only used for FP objects in shared_fp_objects)
+    first_detected_time: Optional[float] = None  # When ANY robot first reported it
+    last_supported_time: Optional[float] = None  # When it was last reported by any robot
+
 
 class SimulationEnvironment:
     """Multi-robot simulation environment with pluggable trust algorithms"""
@@ -49,11 +55,15 @@ class SimulationEnvironment:
                  proximal_range: float = 100.0,
                  fov_range: float = 30.0,
                  fov_angle: float = np.pi/3,
-                 false_positive_rate: float = 0.5,
-                 false_negative_rate: float = 0.0,
+                 adversarial_fp_injection_rate: float = 0.5,
+                 adversarial_fn_suppression_rate: float = 0.0,
+                 sensor_fp_rate: float = 0.05,
+                 sensor_fn_rate: float = 0.05,
                  allow_fp_codetection: bool = False,
                  num_robots: Optional[int] = None,
-                 num_targets: Optional[int] = None):
+                 num_targets: Optional[int] = None,
+                 legitimate_mode: str = 'optimal',
+                 adversarial_mode: str = 'normal'):
         """
         Initialize simulation environment
 
@@ -63,11 +73,16 @@ class SimulationEnvironment:
             target_density: Ground-truth targets per unit area (used when num_targets not provided)
             adversarial_ratio: Fraction of robots that are adversarial
             proximal_range: Maximum distance for robots to be considered proximal
-            fov_range: Field of view range for robots (default: 20.0)
+            fov_range: Field of view range for robots (default: 30.0)
             fov_angle: Field of view angle in radians (default: π/3, 60 degrees)
-            false_positive_rate: Rate of false positive detections (default: 0.5)
-            false_negative_rate: Rate of false negative detections (default: 0.0)
+            adversarial_fp_injection_rate: Rate determining number of persistent adversarial FP objects
+                                          (num_fp_objects = rate × num_gt_objects)
+            adversarial_fn_suppression_rate: Rate of transient adversarial FN suppression (only for 'normal' mode)
+            sensor_fp_rate: Sensor false positive rate (transient, for realistic detectors)
+            sensor_fn_rate: Sensor false negative rate (transient, for realistic detectors)
             allow_fp_codetection: If True, allows adversarial robots to co-detect FP objects (default: False)
+            legitimate_mode: Mode for legitimate robots ('optimal' or 'realistic')
+            adversarial_mode: Mode for adversarial robots ('normal', 'optimized', or 'deceptive')
         """
         self.world_size = world_size
         self.area = self.world_size[0] * self.world_size[1]
@@ -90,14 +105,18 @@ class SimulationEnvironment:
         self.proximal_range = proximal_range
         self.fov_range = fov_range
         self.fov_angle = fov_angle
-        self.false_positive_rate = false_positive_rate
-        self.false_negative_rate = false_negative_rate
+        self.adversarial_fp_injection_rate = adversarial_fp_injection_rate
+        self.adversarial_fn_suppression_rate = adversarial_fn_suppression_rate
+        self.sensor_fp_rate = sensor_fp_rate
+        self.sensor_fn_rate = sensor_fn_rate
         self.allow_fp_codetection = allow_fp_codetection
+        self.legitimate_mode = legitimate_mode
+        self.adversarial_mode = adversarial_mode
 
         self.robots: List[Robot] = []
         self.ground_truth_objects: List[GroundTruthObject] = []
         # Track management is now handled directly by each Robot instance
-        
+
         self.time = 0.0
         self.dt = 0.1  # 10Hz simulation rate
         self.next_object_id = 0  # For generating unique object IDs
@@ -137,26 +156,26 @@ class SimulationEnvironment:
         adversarial_ids = set(random.sample(range(self.num_robots), num_adversarial))
         
         for i in range(self.num_robots):
-            
+
             # Start position (home base)
             start_pos = np.array([
                 random.uniform(5, self.world_size[0] - 5),
                 random.uniform(5, self.world_size[1] - 5),
                 random.uniform(15, 25)  # Altitude
             ])
-            
+
             # Generate random goal position for patrol
             goal_pos = np.array([
                 random.uniform(5, self.world_size[0] - 5),
                 random.uniform(5, self.world_size[1] - 5),
                 start_pos[2]  # Keep same altitude
             ])
-            
+
             # Ensure goal is at reasonable distance from start
             min_patrol_distance = min(self.world_size) * 0.3
             max_attempts = 20
             attempts = 0
-            
+
             while np.linalg.norm(goal_pos[:2] - start_pos[:2]) < min_patrol_distance and attempts < max_attempts:
                 goal_pos = np.array([
                     random.uniform(5, self.world_size[0] - 5),
@@ -164,27 +183,53 @@ class SimulationEnvironment:
                     start_pos[2]
                 ])
                 attempts += 1
-            
-            robot = Robot(
-                robot_id=i,
-                position=start_pos.copy(),
-                velocity=np.array([0.0, 0.0, 0.0]),
-                fov_range=self.fov_range,
-                fov_angle=self.fov_angle
-            )
-            
+
+            # Create robot with specialized type
+            is_adversarial = (i in adversarial_ids)
+            if is_adversarial:
+                robot = AdversarialRobot(
+                    robot_id=i,
+                    position=start_pos.copy(),
+                    velocity=np.array([0.0, 0.0, 0.0]),
+                    fov_range=self.fov_range,
+                    fov_angle=self.fov_angle,
+                    mode=self.adversarial_mode,
+                    adversarial_fp_injection_rate=self.adversarial_fp_injection_rate,
+                    adversarial_fn_suppression_rate=self.adversarial_fn_suppression_rate,
+                    sensor_fp_rate=self.sensor_fp_rate,
+                    sensor_fn_rate=self.sensor_fn_rate
+                )
+                # Initialize persistent false hypotheses for optimized/deceptive modes
+                if self.adversarial_mode in ['optimized', 'deceptive']:
+                    num_fp_hypotheses = int(self.adversarial_fp_injection_rate * self.num_targets)
+                    robot.initialize_persistent_false_hypotheses(
+                        num_hypotheses=max(1, num_fp_hypotheses),
+                        world_size=self.world_size,
+                        time=self.time
+                    )
+            else:
+                robot = LegitimateRobot(
+                    robot_id=i,
+                    position=start_pos.copy(),
+                    velocity=np.array([0.0, 0.0, 0.0]),
+                    fov_range=self.fov_range,
+                    fov_angle=self.fov_angle,
+                    mode=self.legitimate_mode,
+                    sensor_fp_rate=self.sensor_fp_rate,
+                    sensor_fn_rate=self.sensor_fn_rate
+                )
+
             # Set additional attributes for patrol behavior
-            robot.is_adversarial = (i in adversarial_ids)
             robot.start_position = start_pos
             robot.goal_position = goal_pos
             robot.patrol_speed = random.uniform(1.5, 2.5)
             robot.orientation = 0.0
             robot.is_returning_home = False
             robot.position_tolerance = 3.0
-            
+
             # Initialize velocity and orientation toward goal
             self._update_robot_navigation(robot)
-            
+
             self.robots.append(robot)
         
         # Initialize ground truth objects
@@ -192,15 +237,15 @@ class SimulationEnvironment:
             obj = self._create_ground_truth_object(self.time)
             self.ground_truth_objects.append(obj)
 
-        # Initialize false positive objects - each adversarial robot gets at least one
-        # Number of FP objects = false_positive_rate * number of ground truth objects
+        # Initialize persistent adversarial false positive objects - each adversarial robot gets at least one
+        # Number of FP objects = adversarial_fp_injection_rate * number of ground truth objects
         adversarial_robots = [r for r in self.robots if r.is_adversarial]
         num_adversarial = len(adversarial_robots)
 
         # Only create FP objects if there are adversarial robots
         if num_adversarial > 0:
-            # Calculate total FP objects needed based on false positive rate
-            num_fp_objects_needed = int(self.false_positive_rate * len(self.ground_truth_objects))
+            # Calculate total FP objects needed based on adversarial FP injection rate
+            num_fp_objects_needed = int(self.adversarial_fp_injection_rate * len(self.ground_truth_objects))
 
             # Ensure we have at least one FP object per adversarial robot
             num_fp_objects = max(num_adversarial, num_fp_objects_needed)
@@ -228,7 +273,7 @@ class SimulationEnvironment:
         # Initialize trust algorithm
         print(f"Simulation initialized with {len(self.robots)} robots and {len(self.ground_truth_objects)} objects")
         print(f"  - Ground truth objects: {len(self.ground_truth_objects)}")
-        print(f"  - False positive objects: {len(self.shared_fp_objects)} (FP_rate={self.false_positive_rate:.2f})")
+        print(f"  - Persistent adversarial FP objects: {len(self.shared_fp_objects)} (adversarial_fp_injection_rate={self.adversarial_fp_injection_rate:.2f})")
         print(f"  - Adversarial robots: {num_adversarial}")
         print(f"  - FP objects per adversarial robot: avg={len(self.shared_fp_objects)/max(1,num_adversarial):.2f}")
     
@@ -462,7 +507,40 @@ class SimulationEnvironment:
 
             # Directly set position to target (guarantees FP stays in FoV)
             fp_obj.position = target_position.copy()
-    
+
+    def _update_fp_object_timestamps(self):
+        """Update FP object timestamps based on which robots are currently reporting them.
+
+        This tracks when FP objects are first detected and last supported by ANY robot
+        (legitimate or adversarial) based on their current tracks.
+        """
+        for fp_obj in self.shared_fp_objects:
+            # Check all robots' tracks to see if any robot is reporting this FP object
+            is_currently_supported = False
+
+            for robot in self.robots:
+                # Check all tracks from this robot
+                for track in robot.get_all_tracks():
+                    # Check if this track corresponds to our FP object
+                    # Match by position (within 5m tolerance)
+                    if hasattr(track, 'position'):
+                        distance = np.linalg.norm(np.array(track.position) - fp_obj.position)
+                        if distance < 5.0:
+                            is_currently_supported = True
+                            break
+
+                if is_currently_supported:
+                    break
+
+            # Update timestamps if this FP is being reported
+            if is_currently_supported:
+                # Set first_detected_time if this is the first time it's been detected
+                if fp_obj.first_detected_time is None:
+                    fp_obj.first_detected_time = self.time
+
+                # Always update last_supported_time
+                fp_obj.last_supported_time = self.time
+
     def _update_robot_navigation(self, robot: Robot):
         """Update robot's velocity and orientation based on current patrol target"""
         # Determine current target (goal or home)
@@ -487,11 +565,45 @@ class SimulationEnvironment:
     
     
     def generate_detections(self, robot: Robot, noise_std: float = 1.0) -> List[Track]:
-        """Generate detections for a robot based on whether it's legitimate or adversarial"""
+        """
+        Generate detections for a robot using its specialized detection method.
+
+        For backward compatibility with 'normal' adversarial mode and the old approach.
+        """
         if robot.is_adversarial:
-            return self._generate_adversarial_detections(robot, noise_std)
+            # For normal mode, use the old implementation with assigned FP objects
+            if hasattr(robot, 'mode') and robot.mode == 'normal':
+                # Get FP objects assigned to this robot
+                assigned_fps = [fp for fp in self.shared_fp_objects
+                              if self.fp_object_assignments.get(fp.id) == robot.id]
+                return robot.generate_detections(
+                    ground_truth_objects=self.ground_truth_objects,
+                    time=self.time,
+                    noise_std=noise_std,
+                    world_size=self.world_size,
+                    neighbor_robots=None,  # Will use neighbor_information instead
+                    assigned_fp_objects=assigned_fps
+                )
+            else:
+                # For optimized/deceptive modes, also pass assigned FP objects (unified movement)
+                assigned_fps = [fp for fp in self.shared_fp_objects
+                              if self.fp_object_assignments.get(fp.id) == robot.id]
+                return robot.generate_detections(
+                    ground_truth_objects=self.ground_truth_objects,
+                    time=self.time,
+                    noise_std=noise_std,
+                    world_size=self.world_size,
+                    neighbor_robots=None,  # Will use neighbor_information instead
+                    assigned_fp_objects=assigned_fps
+                )
         else:
-            return self._generate_legitimate_detections(robot, noise_std)
+            # Legitimate robot
+            return robot.generate_detections(
+                ground_truth_objects=self.ground_truth_objects,
+                time=self.time,
+                noise_std=noise_std,
+                world_size=self.world_size
+            )
     
     def _generate_legitimate_detections(self, robot: Robot, noise_std: float) -> List[Track]:
         """Generate perfect detections for legitimate robots"""
@@ -661,15 +773,18 @@ class SimulationEnvironment:
         # Start new timestep for all robots
         for robot in self.robots:
             robot.start_new_timestep(self.time)
-        
+
         # Update ground truth objects
         self._update_ground_truth_objects()
-        
+
+        # Note: FP objects now follow their assigned robots automatically via _update_fp_objects()
+        # No need to update persistent_false_hypotheses separately for optimized/deceptive modes
+
         # Update robot positions and navigation
         for robot in self.robots:
             self._update_robot_navigation(robot)
             robot.position += robot.velocity * self.dt
-            
+
             # Boundary conditions
             if robot.position[0] < 0 or robot.position[0] > self.world_size[0]:
                 robot.velocity[0] *= -1
@@ -677,12 +792,34 @@ class SimulationEnvironment:
             if robot.position[1] < 0 or robot.position[1] > self.world_size[1]:
                 robot.velocity[1] *= -1
                 robot.position[1] = np.clip(robot.position[1], 0, self.world_size[1])
-        
+
+        # NEIGHBOR COMMUNICATION PHASE: Share information with proximal robots
+        # This happens BEFORE detection generation so adversarial robots can use neighbor
+        # information to compute strategic scores
+        # Step 1: Clear previous neighbor information
+        for robot in self.robots:
+            if hasattr(robot, 'clear_neighbor_information'):
+                robot.clear_neighbor_information()
+
+        # Step 2: Share current state with all proximal neighbors
+        for ego_robot in self.robots:
+            # Get proximal robots for this ego robot
+            proximal_robots = self.get_proximal_robots(ego_robot)
+
+            # Receive information from each proximal neighbor
+            if hasattr(ego_robot, 'receive_neighbor_information'):
+                for neighbor_robot in proximal_robots:
+                    # Each robot shares its current state (position, FoV, tracks from previous timestep)
+                    ego_robot.receive_neighbor_information(neighbor_robot)
+
         # Generate detections for each robot
+        # Now adversarial robots can use neighbor_information for strategic decision-making
         for robot in self.robots:
             self.generate_detections(robot)
-        
-        
+
+        # Update FP object timestamps based on robot detections
+        self._update_fp_object_timestamps()
+
         self.time += self.dt
         
         return {

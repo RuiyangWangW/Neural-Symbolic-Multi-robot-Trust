@@ -37,6 +37,8 @@ class TrustMethodComparison:
                  fov_angle: float = np.pi/3,
                  fixed_step_scale: float = 0.5,
                  allow_fp_codetection: bool = True,
+                 legitimate_mode: str = 'optimal',
+                 adversarial_mode: str = 'normal',
                  ):
         """
         Initialize comparison with all three trust methods
@@ -53,6 +55,8 @@ class TrustMethodComparison:
             fov_angle: Field of view angle for robots
             fixed_step_scale: Step scale for baseline fixed-step method (default: 0.5)
             allow_fp_codetection: Whether to allow FP codetection (default: True)
+            legitimate_mode: Mode for legitimate robots ('optimal' or 'realistic')
+            adversarial_mode: Mode for adversarial robots ('normal', 'optimized', or 'deceptive')
         """
         self.supervised_model_path = Path(supervised_model_path) if supervised_model_path else None
         self.world_size = float(world_size)
@@ -91,10 +95,14 @@ class TrustMethodComparison:
 
         # Simulation parameters (can be overridden)
         self.adversarial_ratio = 0.3
-        self.false_positive_rate = 0.5
-        self.false_negative_rate = 0.0
+        self.adversarial_fp_injection_rate = 0.5  # Persistent FP injection
+        self.adversarial_fn_suppression_rate = 0.0  # Transient FN suppression
+        self.sensor_fp_rate = 0.05  # Transient sensor FPs
+        self.sensor_fn_rate = 0.05  # Transient sensor FNs
         self.proximal_range = 50.0
         self.allow_fp_codetection = allow_fp_codetection  # Can be set to True for FP codetection experiments
+        self.legitimate_mode = legitimate_mode
+        self.adversarial_mode = adversarial_mode
 
         # Try to load supervised model after proximal_range is set
         try:
@@ -134,9 +142,13 @@ class TrustMethodComparison:
                 proximal_range=self.proximal_range,
                 fov_range=self.fov_range,
                 fov_angle=self.fov_angle,
-                false_positive_rate=self.false_positive_rate,
-                false_negative_rate=self.false_negative_rate,
-                allow_fp_codetection=self.allow_fp_codetection
+                adversarial_fp_injection_rate=self.adversarial_fp_injection_rate,
+                adversarial_fn_suppression_rate=self.adversarial_fn_suppression_rate,
+                sensor_fp_rate=self.sensor_fp_rate,
+                sensor_fn_rate=self.sensor_fn_rate,
+                allow_fp_codetection=self.allow_fp_codetection,
+                legitimate_mode=self.legitimate_mode,
+                adversarial_mode=self.adversarial_mode
             )
             envs.append(env)
         return envs
