@@ -202,8 +202,9 @@ class BayesianEgoGraphTrust:
         for graph_track in all_graph_tracks:
             object_id_to_graph_track[graph_track.object_id] = graph_track
 
-        # ONLY update tracks detected by the ego robot in the CURRENT timestep
-        ego_tracks = ego_robot.get_all_current_tracks()
+        # NEW ARCHITECTURE: Update tracks reported by the ego robot
+        # These are the tracks that were actually shared with neighbors
+        ego_tracks = ego_robot.get_reported_tracks_list()
 
         for ego_track in ego_tracks:
             # Find the corresponding track in the ego graph by object_id
@@ -244,8 +245,14 @@ class BayesianEgoGraphTrust:
                     track_edges = (fov_only_edges[1] == track_node_idx).sum()
                     track_negative = int(track_edges.item())
 
-            # Update the EGO ROBOT'S ORIGINAL track (not the graph copy)
+            # NEW ARCHITECTURE: Forward trust update to all_tracks (persistent storage)
             if track_positive > 0 or track_negative > 0:
+                ego_robot.forward_trust_update_to_all_tracks(
+                    object_id=ego_track.object_id,
+                    delta_alpha=float(track_positive),
+                    delta_beta=float(track_negative)
+                )
+                # Also update the reported track for immediate use
                 ego_track.update_trust(
                     delta_alpha=float(track_positive),
                     delta_beta=float(track_negative)

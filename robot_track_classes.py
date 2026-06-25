@@ -2,13 +2,8 @@
 """
 Clean robot and track class definitions for multi-robot trust system.
 
-This module provides organized data structures to replace the confusing
-multiple track types (local tracks, fused tracks, current updated tracks).
-
-New in this version:
-- Integrated RL dual-horizon trust buffers (fast/slow) directly in Robot and Track classes
-- RL trust methods (rl_trust_value, update_rl_trust, etc.) for seamless integration
-- Maintains backward compatibility with original trust_alpha/trust_beta parameters
+This module provides organized data structures for the supervised trust algorithm.
+Each robot maintains its own tracks with Beta distribution trust parameters.
 """
 
 import numpy as np
@@ -56,13 +51,6 @@ class Track:
         self.trust_alpha = trust_alpha
         self.trust_beta = trust_beta
 
-        # RL dual-horizon trust buffers (for RL trust system)
-        self.rl_fast_alpha = trust_alpha
-        self.rl_fast_beta = trust_beta
-        self.rl_slow_alpha = trust_alpha
-        self.rl_slow_beta = trust_beta
-        self.rl_lambda_mix = 0.7  # Mixing parameter (70% fast, 30% slow)
-        
         # Metadata
         self.timestamp = timestamp or time.time()
         self.last_updated = self.timestamp
@@ -77,65 +65,6 @@ class Track:
         """Update trust distribution parameters."""
         self.trust_alpha += delta_alpha
         self.trust_beta += delta_beta
-
-    # RL dual-horizon trust methods
-    @property
-    def rl_effective_alpha(self) -> float:
-        """Compute effective alpha from dual-horizon buffers."""
-        return self.rl_lambda_mix * self.rl_fast_alpha + (1 - self.rl_lambda_mix) * self.rl_slow_alpha
-
-    @property
-    def rl_effective_beta(self) -> float:
-        """Compute effective beta from dual-horizon buffers."""
-        return self.rl_lambda_mix * self.rl_fast_beta + (1 - self.rl_lambda_mix) * self.rl_slow_beta
-
-    @property
-    def rl_trust_value(self) -> float:
-        """Compute RL trust value from effective dual-horizon parameters."""
-        effective_alpha = self.rl_effective_alpha
-        effective_beta = self.rl_effective_beta
-        return effective_alpha / (effective_alpha + effective_beta)
-
-    @property
-    def rl_confidence(self) -> float:
-        """Compute RL trust confidence (strength of belief)."""
-        return self.rl_effective_alpha + self.rl_effective_beta
-
-    def update_rl_trust(self, delta_alpha: float, delta_beta: float, fast_ratio: float = 0.8):
-        """Update RL dual-horizon trust buffers."""
-        # Update fast buffer with higher proportion
-        self.rl_fast_alpha += delta_alpha * fast_ratio
-        self.rl_fast_beta += delta_beta * fast_ratio
-
-        # Update slow buffer with remaining proportion
-        self.rl_slow_alpha += delta_alpha * (1 - fast_ratio)
-        self.rl_slow_beta += delta_beta * (1 - fast_ratio)
-
-    def apply_rl_forgetting(self, gamma_forget: float = 0.01):
-        """Apply forgetting toward (1,1) for RL trust buffers."""
-        # Fast buffer forgetting
-        self.rl_fast_alpha = (1 - gamma_forget) * self.rl_fast_alpha + gamma_forget * 1.0
-        self.rl_fast_beta = (1 - gamma_forget) * self.rl_fast_beta + gamma_forget * 1.0
-
-        # Slow buffer forgetting
-        self.rl_slow_alpha = (1 - gamma_forget) * self.rl_slow_alpha + gamma_forget * 1.0
-        self.rl_slow_beta = (1 - gamma_forget) * self.rl_slow_beta + gamma_forget * 1.0
-
-    def apply_rl_strength_cap(self, strength_max: float = 50.0):
-        """Apply strength caps to prevent over-confidence in RL buffers."""
-        # Cap fast buffer
-        fast_strength = self.rl_fast_alpha + self.rl_fast_beta
-        if fast_strength > strength_max:
-            scale = strength_max / fast_strength
-            self.rl_fast_alpha *= scale
-            self.rl_fast_beta *= scale
-
-        # Cap slow buffer
-        slow_strength = self.rl_slow_alpha + self.rl_slow_beta
-        if slow_strength > strength_max:
-            scale = strength_max / slow_strength
-            self.rl_slow_alpha *= scale
-            self.rl_slow_beta *= scale
 
     def update_state(self, position: np.ndarray, velocity: np.ndarray, timestamp: float):
         """Update track state estimates."""
@@ -219,13 +148,6 @@ class Robot:
         self.trust_alpha = trust_alpha
         self.trust_beta = trust_beta
 
-        # RL dual-horizon trust buffers (for RL trust system)
-        self.rl_fast_alpha = trust_alpha
-        self.rl_fast_beta = trust_beta
-        self.rl_slow_alpha = trust_alpha
-        self.rl_slow_beta = trust_beta
-        self.rl_lambda_mix = 0.7  # Mixing parameter (70% fast, 30% slow)
-        
         # Field of view parameters
         self.fov_range = fov_range
         self.fov_angle = fov_angle
@@ -239,12 +161,40 @@ class Robot:
         if occ_grid is not None:
             self.grid_height, self.grid_width = occ_grid.shape
 
-        # Local tracks maintained by this robot
+        # NEW TRACK ARCHITECTURE (4 separate dictionaries):
+
+        # 1. all_tracks: Complete history of all tracks ever detected (for trust accumulation & metrics)
+        #    - Never cleared during episode
+        #    - Trust updates accumulate here
+        #    - Used for final metric calculations
+        self.all_tracks: Dict[str, Track] = {}  # object_id -> Track
+
+        # 2. current_timestep_tracks: Raw sensor observations THIS timestep (pre-manipulation)
+        #    - Rewritten every timestep from sensor
+        #    - Inherits trust values from all_tracks if object_id exists
+        #    - Input to adversarial policy decisions
+        #    - Both legitimate AND adversarial robots have this
+        self.current_timestep_tracks: Dict[str, Track] = {}  # object_id -> Track
+
+        # 3. last_reported_tracks: What neighbors reported in PREVIOUS timestep
+        #    - Maps neighbor robot_id to list of object_ids they reported
+        #    - Used to count supporting/contradicting neighbors
+        #    - Updated during neighbor communication
+        self.last_reported_tracks: Dict[int, List[str]] = {}  # robot_id -> [object_id, ...]
+
+        # 4. reported_tracks: What THIS robot reports to neighbors THIS timestep
+        #    - Adversarial: Manipulated tracks (after FP injection, GT suppression)
+        #    - Legitimate: Same as current_timestep_tracks (no manipulation)
+        #    - What gets communicated to neighbors
+        #    - Used for trust updates and graph building
+        self.reported_tracks: Dict[str, Track] = {}  # object_id -> Track
+
+        # LEGACY: Keep local_tracks for backward compatibility during transition
+        # TODO: Remove after full migration to new architecture
         self.local_tracks: Dict[str, Track] = {}  # object_id -> Track
-        
+
         # Current timestep tracking
         self.current_timestep: float = 0.0
-        self.current_timestep_tracks: Dict[str, Track] = {}  # Tracks updated in current timestep
         
         # Metadata
         self.timestamp = time.time()
@@ -260,65 +210,6 @@ class Robot:
         """Update robot trust distribution parameters."""
         self.trust_alpha += delta_alpha
         self.trust_beta += delta_beta
-
-    # RL dual-horizon trust methods
-    @property
-    def rl_effective_alpha(self) -> float:
-        """Compute effective alpha from dual-horizon buffers."""
-        return self.rl_lambda_mix * self.rl_fast_alpha + (1 - self.rl_lambda_mix) * self.rl_slow_alpha
-
-    @property
-    def rl_effective_beta(self) -> float:
-        """Compute effective beta from dual-horizon buffers."""
-        return self.rl_lambda_mix * self.rl_fast_beta + (1 - self.rl_lambda_mix) * self.rl_slow_beta
-
-    @property
-    def rl_trust_value(self) -> float:
-        """Compute RL trust value from effective dual-horizon parameters."""
-        effective_alpha = self.rl_effective_alpha
-        effective_beta = self.rl_effective_beta
-        return effective_alpha / (effective_alpha + effective_beta)
-
-    @property
-    def rl_confidence(self) -> float:
-        """Compute RL trust confidence (strength of belief)."""
-        return self.rl_effective_alpha + self.rl_effective_beta
-
-    def update_rl_trust(self, delta_alpha: float, delta_beta: float, fast_ratio: float = 0.8):
-        """Update RL dual-horizon trust buffers."""
-        # Update fast buffer with higher proportion
-        self.rl_fast_alpha += delta_alpha * fast_ratio
-        self.rl_fast_beta += delta_beta * fast_ratio
-
-        # Update slow buffer with remaining proportion
-        self.rl_slow_alpha += delta_alpha * (1 - fast_ratio)
-        self.rl_slow_beta += delta_beta * (1 - fast_ratio)
-
-    def apply_rl_forgetting(self, gamma_forget: float = 0.01):
-        """Apply forgetting toward (1,1) for RL trust buffers."""
-        # Fast buffer forgetting
-        self.rl_fast_alpha = (1 - gamma_forget) * self.rl_fast_alpha + gamma_forget * 1.0
-        self.rl_fast_beta = (1 - gamma_forget) * self.rl_fast_beta + gamma_forget * 1.0
-
-        # Slow buffer forgetting
-        self.rl_slow_alpha = (1 - gamma_forget) * self.rl_slow_alpha + gamma_forget * 1.0
-        self.rl_slow_beta = (1 - gamma_forget) * self.rl_slow_beta + gamma_forget * 1.0
-
-    def apply_rl_strength_cap(self, strength_max: float = 50.0):
-        """Apply strength caps to prevent over-confidence in RL buffers."""
-        # Cap fast buffer
-        fast_strength = self.rl_fast_alpha + self.rl_fast_beta
-        if fast_strength > strength_max:
-            scale = strength_max / fast_strength
-            self.rl_fast_alpha *= scale
-            self.rl_fast_beta *= scale
-
-        # Cap slow buffer
-        slow_strength = self.rl_slow_alpha + self.rl_slow_beta
-        if slow_strength > strength_max:
-            scale = strength_max / slow_strength
-            self.rl_slow_alpha *= scale
-            self.rl_slow_beta *= scale 
 
     def update_state(self, position: np.ndarray, velocity: np.ndarray = None):
         """Update robot position, velocity, and orientation."""
@@ -349,8 +240,13 @@ class Robot:
         return self.local_tracks.get(object_id)
     
     def get_all_tracks(self) -> List[Track]:
-        """Get all tracks maintained by this robot."""
-        return list(self.local_tracks.values())
+        """
+        Get all tracks maintained by this robot.
+
+        NEW ARCHITECTURE: Returns all_tracks (persistent storage with accumulated trust).
+        This is used for final metric calculations and analysis.
+        """
+        return list(self.all_tracks.values())
 
     def get_all_current_tracks(self) -> List[Track]:
         """Get all tracks that are currently active (updated in the current timestep)."""
@@ -403,7 +299,21 @@ class Robot:
 
         If use_spot_fov is True, uses SPOT dual-camera FoV.
         Otherwise uses default single-camera FoV.
+
+        Args:
+            target_position: Position to check (numpy array with at least 2 elements)
+
+        Returns:
+            True if position is in FoV, False otherwise
+
+        Raises:
+            AssertionError: If target_position is invalid
         """
+        # Input validation
+        assert target_position is not None, "target_position cannot be None"
+        assert isinstance(target_position, np.ndarray), f"target_position must be numpy array, got {type(target_position)}"
+        assert len(target_position) >= 2, f"target_position must have at least 2 elements, got {len(target_position)}"
+
         if self.use_spot_fov:
             # Use SPOT dual-camera FoV for Webots environment
             return self.is_in_spot_dual_camera_fov(target_position, self.fov_angle, self.fov_range)
@@ -734,7 +644,148 @@ class Robot:
         for object_id, track in self.local_tracks.items():
             if track.was_updated_at_timestep(self.current_timestep):
                 self.current_timestep_tracks[object_id] = track
-    
+
+    # ========================================================================
+    # NEW TRACK ARCHITECTURE METHODS
+    # ========================================================================
+
+    def add_sensor_detection(self, object_id: str, position: np.ndarray,
+                           velocity: np.ndarray, timestamp: float) -> Track:
+        """
+        Add a raw sensor detection to current_timestep_tracks.
+
+        This method:
+        1. Creates a new Track instance for this detection
+        2. If object_id exists in all_tracks, inherits trust values
+        3. Adds to current_timestep_tracks (will be cleared next timestep)
+
+        Args:
+            object_id: Unique identifier for the detected object
+            position: Detected position
+            velocity: Detected velocity
+            timestamp: Detection timestamp
+
+        Returns:
+            Track instance added to current_timestep_tracks
+        """
+        track_id = f"robot_{self.id}_obj_{object_id}"
+
+        # Inherit trust from all_tracks if this object was seen before
+        if object_id in self.all_tracks:
+            existing_track = self.all_tracks[object_id]
+            trust_alpha = existing_track.trust_alpha
+            trust_beta = existing_track.trust_beta
+        else:
+            # New object - use neutral prior
+            trust_alpha = 1.0
+            trust_beta = 1.0
+
+        # Create new track instance for this timestep
+        track = Track(
+            track_id=track_id,
+            robot_id=self.id,
+            object_id=object_id,
+            position=position,
+            velocity=velocity,
+            trust_alpha=trust_alpha,
+            trust_beta=trust_beta,
+            timestamp=timestamp
+        )
+
+        # Add to current_timestep_tracks
+        self.current_timestep_tracks[object_id] = track
+
+        return track
+
+    def set_reported_tracks_from_current(self):
+        """
+        For legitimate robots: Set reported_tracks = current_timestep_tracks.
+
+        This should be called after sensor detections are populated.
+        """
+        self.reported_tracks = self.current_timestep_tracks.copy()
+
+    def set_reported_tracks_from_manipulated(self, manipulated_tracks: Dict[str, Track]):
+        """
+        For adversarial robots: Set reported_tracks from manipulated detections.
+
+        Args:
+            manipulated_tracks: Dictionary of tracks after FP injection and GT suppression
+        """
+        self.reported_tracks = manipulated_tracks.copy()
+
+    def update_neighbor_reported_tracks(self, neighbor_id: int, reported_object_ids: List[str]):
+        """
+        Update what a neighbor reported in the previous timestep.
+
+        Args:
+            neighbor_id: ID of the neighbor robot
+            reported_object_ids: List of object_ids the neighbor reported
+        """
+        self.last_reported_tracks[neighbor_id] = reported_object_ids
+
+    def forward_trust_update_to_all_tracks(self, object_id: str, delta_alpha: float, delta_beta: float):
+        """
+        Forward a trust update from reported_tracks to all_tracks.
+
+        This should be called when supervised algorithm updates trust for a reported track.
+        If object_id exists in all_tracks, update it. Otherwise, create new entry.
+
+        Args:
+            object_id: Object ID that received trust update
+            delta_alpha: Change in alpha parameter
+            delta_beta: Change in beta parameter
+        """
+        if object_id in self.all_tracks:
+            # Update existing track in all_tracks
+            self.all_tracks[object_id].update_trust(delta_alpha, delta_beta)
+        else:
+            # Create new entry in all_tracks
+            # Find the track in reported_tracks to get position/velocity
+            if object_id in self.reported_tracks:
+                reported_track = self.reported_tracks[object_id]
+
+                # Create new track in all_tracks with updated trust
+                new_track = Track(
+                    track_id=reported_track.track_id,
+                    robot_id=self.id,
+                    object_id=object_id,
+                    position=reported_track.position.copy(),
+                    velocity=reported_track.velocity.copy(),
+                    trust_alpha=1.0 + delta_alpha,  # Start from prior + update
+                    trust_beta=1.0 + delta_beta,
+                    timestamp=reported_track.timestamp
+                )
+
+                self.all_tracks[object_id] = new_track
+
+    def clear_timestep_specific_tracks(self):
+        """
+        Clear timestep-specific track dictionaries at the start of a new timestep.
+
+        This clears:
+        - current_timestep_tracks (will be repopulated by sensor)
+        - reported_tracks (will be repopulated after policy decisions)
+
+        Does NOT clear:
+        - all_tracks (persistent for entire episode)
+        - last_reported_tracks (updated during neighbor communication)
+        """
+        self.current_timestep_tracks.clear()
+        self.reported_tracks.clear()
+
+    def get_reported_tracks_list(self) -> List[Track]:
+        """Get list of tracks this robot is reporting this timestep."""
+        return list(self.reported_tracks.values())
+
+    def get_reported_object_ids(self) -> List[str]:
+        """Get list of object IDs this robot is reporting this timestep."""
+        return list(self.reported_tracks.keys())
+
+    # ========================================================================
+    # END NEW TRACK ARCHITECTURE METHODS
+    # ========================================================================
+
     def __repr__(self):
         return (f"Robot(id={self.id}, pos={self.position}, "
                 f"tracks={len(self.local_tracks)}, "

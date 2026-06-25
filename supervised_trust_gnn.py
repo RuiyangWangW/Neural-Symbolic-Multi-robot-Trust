@@ -550,7 +550,7 @@ class SupervisedTrustPredictor:
         Identify tracks to update for inference
 
         A track is included if:
-        1. It's currently detected by ego robot (in get_all_current_tracks())
+        1. It's currently reported by ego robot (in get_reported_tracks_list())
         2. It has edges to at least one OTHER robot besides ego (cross-validation)
            - Ego robot is always at index 0
            - Track must have edges to >= 2 robots total (ego + at least 1 other)
@@ -565,10 +565,10 @@ class SupervisedTrustPredictor:
         """
         track_indices = []
 
-        # Get tracks currently detected by ego robot
-        ego_current_tracks = ego_robot.get_all_current_tracks()
+        # NEW ARCHITECTURE: Get tracks currently reported by ego robot
+        ego_reported_tracks = ego_robot.get_reported_tracks_list()
         # IMPORTANT: Match by object_id, not track_id, because track fusion changes track_id
-        ego_object_ids = set(track.object_id for track in ego_current_tracks)
+        ego_object_ids = set(track.object_id for track in ego_reported_tracks)
 
         # Get fused and individual tracks from ego graph
         if hasattr(graph_data, '_fused_tracks') and hasattr(graph_data, '_individual_tracks'):
@@ -795,9 +795,10 @@ class EgoGraphBuilder:
                     proximal_robots.append(robot)
 
         # Step 2: Get tracks only from proximal robots (ego + proximal)
+        # NEW ARCHITECTURE: Use reported_tracks (what robots are sharing with neighbors)
         proximal_robot_tracks = {}
         for robot in proximal_robots:
-            robot_tracks = robot.get_all_current_tracks()
+            robot_tracks = robot.get_reported_tracks_list()
             proximal_robot_tracks[robot.id] = robot_tracks
 
         # Step 3: Perform track fusion only among proximal robots

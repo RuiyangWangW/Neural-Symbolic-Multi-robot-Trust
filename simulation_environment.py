@@ -52,8 +52,8 @@ class SimulationEnvironment:
                  robot_density: float = 0.0005,
                  target_density: float = 0.002,
                  adversarial_ratio: float = 0.3,
-                 proximal_range: float = 100.0,
-                 fov_range: float = 30.0,
+                 proximal_range: float = 80.0,
+                 fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
                  adversarial_fp_injection_rate: float = 0.5,
                  adversarial_fn_suppression_rate: float = 0.0,
@@ -115,7 +115,7 @@ class SimulationEnvironment:
 
         self.robots: List[Robot] = []
         self.ground_truth_objects: List[GroundTruthObject] = []
-        # Track management is now handled directly by each Robot instance
+        # Tracks are stored locally in each Robot instance (not centralized here)
 
         self.time = 0.0
         self.dt = 0.1  # 10Hz simulation rate
@@ -199,14 +199,8 @@ class SimulationEnvironment:
                     sensor_fp_rate=self.sensor_fp_rate,
                     sensor_fn_rate=self.sensor_fn_rate
                 )
-                # Initialize persistent false hypotheses for optimized/deceptive modes
-                if self.adversarial_mode in ['optimized', 'deceptive']:
-                    num_fp_hypotheses = int(self.adversarial_fp_injection_rate * self.num_targets)
-                    robot.initialize_persistent_false_hypotheses(
-                        num_hypotheses=max(1, num_fp_hypotheses),
-                        world_size=self.world_size,
-                        time=self.time
-                    )
+                # Note: Persistent FP objects are now managed globally in shared_fp_objects
+                # and assigned to adversaries in generate_detections() via assigned_fp_objects parameter
             else:
                 robot = LegitimateRobot(
                     robot_id=i,
@@ -568,194 +562,32 @@ class SimulationEnvironment:
         """
         Generate detections for a robot using its specialized detection method.
 
-        For backward compatibility with 'normal' adversarial mode and the old approach.
+        Delegates to robot-specific detection methods which handle all mode-specific logic.
         """
         if robot.is_adversarial:
-            # For normal mode, use the old implementation with assigned FP objects
-            if hasattr(robot, 'mode') and robot.mode == 'normal':
-                # Get FP objects assigned to this robot
-                assigned_fps = [fp for fp in self.shared_fp_objects
-                              if self.fp_object_assignments.get(fp.id) == robot.id]
-                return robot.generate_detections(
-                    ground_truth_objects=self.ground_truth_objects,
-                    time=self.time,
-                    noise_std=noise_std,
-                    world_size=self.world_size,
-                    neighbor_robots=None,  # Will use neighbor_information instead
-                    assigned_fp_objects=assigned_fps
-                )
-            else:
-                # For optimized/deceptive modes, also pass assigned FP objects (unified movement)
-                assigned_fps = [fp for fp in self.shared_fp_objects
-                              if self.fp_object_assignments.get(fp.id) == robot.id]
-                return robot.generate_detections(
-                    ground_truth_objects=self.ground_truth_objects,
-                    time=self.time,
-                    noise_std=noise_std,
-                    world_size=self.world_size,
-                    neighbor_robots=None,  # Will use neighbor_information instead
-                    assigned_fp_objects=assigned_fps
-                )
+            # Adversarial robot: pass assigned FP objects for all modes
+            assigned_fps = [fp for fp in self.shared_fp_objects
+                          if self.fp_object_assignments.get(fp.id) == robot.id]
+            return robot.generate_detections(
+                ground_truth_objects=self.ground_truth_objects,
+                time=self.time,
+                noise_std=noise_std,
+                world_size=self.world_size,
+                neighbor_robots=None,  # Will use neighbor_information instead
+                assigned_fp_objects=assigned_fps
+            )
         else:
-            # Legitimate robot
+            # Legitimate robot: no FP objects needed
             return robot.generate_detections(
                 ground_truth_objects=self.ground_truth_objects,
                 time=self.time,
                 noise_std=noise_std,
                 world_size=self.world_size
             )
-    
-    def _generate_legitimate_detections(self, robot: Robot, noise_std: float) -> List[Track]:
-        """Generate perfect detections for legitimate robots"""
-        detections = []
-        
-        for gt_obj in self.ground_truth_objects:
-            if robot.is_in_fov(gt_obj.position):
-                object_id = f"gt_obj_{gt_obj.id}"
-                
-                # Legitimate robots detect with minimal noise
-                noisy_pos = gt_obj.position
-                noisy_vel = gt_obj.velocity
-                
-                # Initialize with neutral Beta(1,1) prior
-                trust_alpha = 1.0
-                trust_beta = 1.0
-                
-                # Create track ID
-                track_key = f"{robot.id}_{object_id}"
-                
-                # Check if track already exists in robot's local tracks
-                existing_track = robot.get_track(object_id)
-                if existing_track:
-                    # Update existing track with new observation
-                    existing_track.update_state(noisy_pos, noisy_vel, self.time)
-                    # DO NOT update trust here - trust is managed by the trust algorithm
-                    # Set additional attributes that are used by the simulation
-                    track = existing_track
-                else:
-                    # Create new track using the new Track class
-                    track = Track(
-                        track_id=track_key,
-                        robot_id=robot.id,
-                        object_id=object_id,
-                        position=noisy_pos,
-                        velocity=noisy_vel,
-                        trust_alpha=trust_alpha,
-                        trust_beta=trust_beta,
-                        timestamp=self.time
-                    )
-                    # Set additional attributes that are used by the simulation
-                    # Add new track to robot's local tracks
-                    robot.add_track(track)
-                detections.append(track)
-        
-        return detections
-    
-    def _generate_adversarial_detections(self, robot: Robot, noise_std: float) -> List[Track]:
-        """Generate malicious detections for adversarial robots"""
-        tracks = []
-        
-        # Parameters for adversarial behavior
-        false_negative_rate = self.false_negative_rate
-        
-        # True objects in FOV
-        true_objects_in_fov = [gt for gt in self.ground_truth_objects if robot.is_in_fov(gt.position)]
-        
-        # Generate tracks for true objects (with possible false negatives)
-        for gt_obj in true_objects_in_fov:
-            if random.random() < false_negative_rate:
-                continue
-            
-            object_id = f"gt_obj_{gt_obj.id}"
-            noisy_pos = gt_obj.position
-            noisy_vel = gt_obj.velocity
 
-            # Initialize trust values
-            trust_alpha = 1.0
-            trust_beta = 1.0
-            
-            track_key = f"{robot.id}_{object_id}"
-            
-            # Check if track already exists in robot's local tracks
-            existing_track = robot.get_track(object_id)
-            if existing_track:
-                # Update existing track with new observation
-                existing_track.update_state(noisy_pos, noisy_vel, self.time)
-                # Mark track as current for this timestep
-                robot.mark_track_as_current(object_id)
-                # DO NOT update trust here - trust is managed by the trust algorithm
-                # Set additional attributes that are used by the simulation
-                track = existing_track
-            else:
-                # Create new track using the new Track class
-                track = Track(
-                    track_id=track_key,
-                    robot_id=robot.id,
-                    object_id=object_id,
-                    position=noisy_pos,
-                    velocity=noisy_vel,
-                    trust_alpha=trust_alpha,
-                    trust_beta=trust_beta,
-                    timestamp=self.time
-                )
-                # Set additional attributes that are used by the simulation
-                # Add new track to robot's local tracks
-                robot.add_track(track)
-            tracks.append(track)
-                
-        # Generate tracks for FP objects assigned to this specific robot
-        # Each adversarial robot ALWAYS detects its assigned FP objects (no probability)
-        for fp_obj in self.shared_fp_objects:
-            # Check if this FP object should be detected by this robot
-            assigned_robot_id = self.fp_object_assignments.get(fp_obj.id)
+    # Legacy detection functions removed - detection is now handled by robot-specific methods
+    # See robot.generate_detections() in robot_types.py for current implementation
 
-            # Determine if this robot can detect this FP object
-            if assigned_robot_id == robot.id:
-                # This robot is assigned to this FP object - always detect
-                can_detect = True
-            elif self.allow_fp_codetection and robot.is_adversarial:
-                # FP codetection enabled and this is an adversarial robot - allow codetection
-                can_detect = True
-            else:
-                # Not assigned and codetection disabled - skip
-                continue
-
-            # Check if FP object is in FoV
-            if can_detect and robot.is_in_fov(fp_obj.position):
-                # ALWAYS detect assigned FP object (no probability check)
-                fp_object_id = f"fp_obj_{fp_obj.id}"
-                fp_track_key = f"{robot.id}_{fp_object_id}"
-
-                # Initialize trust values
-                trust_alpha = 1.0
-                trust_beta = 1.0
-
-                # Check if track already exists in robot's local tracks
-                existing_track = robot.get_track(fp_object_id)
-                if existing_track:
-                    # Update existing track with new observation
-                    existing_track.update_state(fp_obj.position.copy(), fp_obj.velocity.copy(), self.time)
-                    # Mark track as current for this timestep
-                    robot.mark_track_as_current(fp_object_id)
-                    track = existing_track
-                else:
-                    # Create new track using the new Track class
-                    track = Track(
-                        track_id=fp_track_key,
-                        robot_id=robot.id,
-                        object_id=fp_object_id,
-                        position=fp_obj.position.copy(),
-                        velocity=fp_obj.velocity.copy(),
-                        trust_alpha=trust_alpha,
-                        trust_beta=trust_beta,
-                        timestamp=self.time
-                    )
-                    # Add new track to robot's local tracks
-                    robot.add_track(track)
-                tracks.append(track)
-        
-        return tracks
-    
     def get_proximal_robots(self, ego_robot: 'Robot') -> List['Robot']:
         """Get robots within proximal range of the ego robot"""
         proximal_robots = []
@@ -793,15 +625,24 @@ class SimulationEnvironment:
                 robot.velocity[1] *= -1
                 robot.position[1] = np.clip(robot.position[1], 0, self.world_size[1])
 
+        # DETECTION GENERATION PHASE
+        # Generate detections for each robot FIRST
+        # Adversarial robots use neighbor_information from PREVIOUS timestep (T-1)
+        # to make strategic decisions about what to report in current timestep (T)
+        for robot in self.robots:
+            self.generate_detections(robot)
+
         # NEIGHBOR COMMUNICATION PHASE: Share information with proximal robots
-        # This happens BEFORE detection generation so adversarial robots can use neighbor
-        # information to compute strategic scores
-        # Step 1: Clear previous neighbor information
+        # This happens AFTER detection generation so that:
+        # 1. Adversaries use T-1 neighbor info to decide what to report in T
+        # 2. Then we share T's reports for use in T+1
+
+        # Step 1: Clear previous neighbor information (from T-1)
         for robot in self.robots:
             if hasattr(robot, 'clear_neighbor_information'):
                 robot.clear_neighbor_information()
 
-        # Step 2: Share current state with all proximal neighbors
+        # Step 2: Share current timestep tracks with all proximal neighbors
         for ego_robot in self.robots:
             # Get proximal robots for this ego robot
             proximal_robots = self.get_proximal_robots(ego_robot)
@@ -809,13 +650,9 @@ class SimulationEnvironment:
             # Receive information from each proximal neighbor
             if hasattr(ego_robot, 'receive_neighbor_information'):
                 for neighbor_robot in proximal_robots:
-                    # Each robot shares its current state (position, FoV, tracks from previous timestep)
+                    # Each robot shares what it just reported in THIS timestep
+                    # This will be stored and used for decision-making in NEXT timestep
                     ego_robot.receive_neighbor_information(neighbor_robot)
-
-        # Generate detections for each robot
-        # Now adversarial robots can use neighbor_information for strategic decision-making
-        for robot in self.robots:
-            self.generate_detections(robot)
 
         # Update FP object timestamps based on robot detections
         self._update_fp_object_timestamps()

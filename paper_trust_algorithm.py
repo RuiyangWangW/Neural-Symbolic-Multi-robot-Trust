@@ -72,8 +72,8 @@ class DataAggregator:
         if ego_robot is None:
             return {}
 
-        # Use ONLY current-time detected tracks
-        ego_current_tracks = ego_robot.get_all_current_tracks()
+        # NEW ARCHITECTURE: Use reported tracks (what robots are sharing)
+        ego_current_tracks = ego_robot.get_reported_tracks_list()
 
         if not ego_current_tracks:
             return {}
@@ -94,8 +94,8 @@ class DataAggregator:
                 if other_robot.id == ego_robot_id:
                     continue
 
-                # Get current tracks only
-                other_current_tracks = other_robot.get_all_current_tracks()
+                # NEW ARCHITECTURE: Get reported tracks only
+                other_current_tracks = other_robot.get_reported_tracks_list()
 
                 # Match by object ID directly (no Hungarian needed!)
                 for other_track in other_current_tracks:
@@ -204,8 +204,8 @@ class PaperTrustAlgorithm:
 
         # OUTER LOOP: For each ego robot, create ego fused tracks from CURRENT tracks
         for ego_robot in robots:
-            # Use CURRENT tracks only
-            ego_robot_tracks = ego_robot.get_all_current_tracks()
+            # NEW ARCHITECTURE: Use reported tracks only
+            ego_robot_tracks = ego_robot.get_reported_tracks_list()
 
             if not ego_robot_tracks:
                 continue
@@ -226,8 +226,8 @@ class PaperTrustAlgorithm:
 
             for proximal_robot in proximal_robots_in_range:
 
-                # Use proximal robot's CURRENT tracks only
-                proximal_robot_tracks = proximal_robot.get_all_current_tracks()
+                # NEW ARCHITECTURE: Use proximal robot's reported tracks only
+                proximal_robot_tracks = proximal_robot.get_reported_tracks_list()
                 if not proximal_robot_tracks:
                     continue
 
@@ -241,11 +241,25 @@ class PaperTrustAlgorithm:
             if robot_psms[robot.id]:
                 self.trust_estimator.update_agent_trust(robot, robot_psms[robot.id])
             
-            # Update track trust for all CURRENT tracks that have PSMs
+            # NEW ARCHITECTURE: Update track trust and forward to all_tracks
             track_updates_count = 0
-            for track in robot.get_all_current_tracks():
+            for track in robot.get_reported_tracks_list():
                 if track.track_id in all_track_psms:
+                    # Get trust deltas before update
+                    old_alpha = track.trust_alpha
+                    old_beta = track.trust_beta
+
+                    # Update the reported track
                     self.trust_estimator.update_track_trust(track, all_track_psms[track.track_id])
+
+                    # Forward to all_tracks (persistent storage)
+                    delta_alpha = track.trust_alpha - old_alpha
+                    delta_beta = track.trust_beta - old_beta
+                    robot.forward_trust_update_to_all_tracks(
+                        object_id=track.object_id,
+                        delta_alpha=delta_alpha,
+                        delta_beta=delta_beta
+                    )
                     track_updates_count += 1
             # Debug: show how many tracks were updated
             # if track_updates_count > 0:
@@ -265,7 +279,7 @@ class PaperTrustAlgorithm:
                         'num_psms': len(all_track_psms.get(track.track_id, [])),
                         'object_id': track.object_id
                     }
-                    for track in robot.get_all_current_tracks()
+                    for track in robot.get_reported_tracks_list()
                 }
             }
         

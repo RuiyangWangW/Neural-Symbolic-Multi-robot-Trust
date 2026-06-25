@@ -133,8 +133,9 @@ class SupervisedTrustAlgorithm:
         for robot in robots:
             track_trust_info = {}
 
-            # Collect track information
-            for track in robot.get_all_current_tracks():
+            # NEW ARCHITECTURE: Collect track information from reported_tracks
+            # (these are the tracks that were actually shared with neighbors)
+            for track in robot.get_reported_tracks_list():
                 was_meaningful = (
                     robot.id in updated_tracks and
                     track.track_id in updated_tracks[robot.id]
@@ -193,7 +194,10 @@ class SupervisedTrustAlgorithm:
             # Ego robot is always at index 0
             ego_idx = 0
             if ego_idx < len(agent_probs):
-                p = agent_probs[ego_idx][0]  # Extract probability from array
+                raw_p = agent_probs[ego_idx][0]  # Extract raw probability from array
+
+                # Use raw probability from model (no calibration)
+                p = raw_p
 
                 # Convert probability to alpha/beta update
                 # High probability (p ≥ 0.5) → increase alpha (positive evidence)
@@ -222,7 +226,8 @@ class SupervisedTrustAlgorithm:
             # Update only meaningful tracks
             for track_idx in meaningful_track_indices:
                 if track_idx < len(track_probs):
-                    p = track_probs[track_idx][0]  # Extract probability from array
+                    raw_p = track_probs[track_idx][0]  # Extract raw probability from array
+                    p = raw_p  # Use raw probability (no calibration)
 
                     # Convert probability to alpha/beta update
                     if p >= 0.5:
@@ -240,9 +245,17 @@ class SupervisedTrustAlgorithm:
                         # IMPORTANT: Only update ego robot's track (index 0)
                         # Each robot manages its own tracks independently
                         ego_robot = graph_data._proximal_robots[0]
-                        for track in ego_robot.get_all_current_tracks():
+
+                        # NEW ARCHITECTURE: Use reported_tracks and forward to all_tracks
+                        for track in ego_robot.get_reported_tracks_list():
                             if track.track_id == track_id:
-                                track.update_trust(delta_alpha, delta_beta)
+                                object_id = track.object_id
+                                # Forward trust update to all_tracks (persistent storage)
+                                ego_robot.forward_trust_update_to_all_tracks(
+                                    object_id=object_id,
+                                    delta_alpha=delta_alpha,
+                                    delta_beta=delta_beta
+                                )
                                 updated_track_ids.add(track_id)
                                 break
 
