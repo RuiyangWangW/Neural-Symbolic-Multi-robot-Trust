@@ -1134,36 +1134,39 @@ class EgoGraphBuilder:
             if agent_idx != 0 and agent_idx not in agents_with_edges:
                 isolated_agents.append(agent_idx)
 
-        # If no isolated agents, return unchanged
-        if not isolated_agents:
-            return graph_data
-
         # Create mapping from old indices to new indices
+        # Keep ego robot and all non-isolated agents.
         kept_agents = [i for i in range(num_agents) if i not in isolated_agents]
         old_to_new_agent = {old_idx: new_idx for new_idx, old_idx in enumerate(kept_agents)}
 
-        # Identify tracks that should be removed (only connected to isolated agents)
+        # Identify tracks that should be removed.
+        # A track should be removed if:
+        #   1. It has no agent -> track edges at all, or
+        #   2. It is only connected to agents that will be removed.
         tracks_to_remove = set()
 
-        # Check which tracks are only connected to isolated agents
         for track_idx in range(len(all_tracks)):
             connected_agents = set()
 
-            # Check in_fov_and_observed edges (agent->track)
+            # Check in_fov_and_observed edges (agent -> track)
             edges = graph_data.edge_index_dict.get(('agent', 'in_fov_and_observed', 'track'), None)
             if edges is not None and edges.numel() > 0:
                 mask = edges[1] == track_idx
                 connected_agents.update(edges[0][mask].tolist())
 
-            # Check in_fov_only edges (agent->track)
+            # Check in_fov_only edges (agent -> track)
             edges = graph_data.edge_index_dict.get(('agent', 'in_fov_only', 'track'), None)
             if edges is not None and edges.numel() > 0:
                 mask = edges[1] == track_idx
                 connected_agents.update(edges[0][mask].tolist())
 
-            # If track is only connected to isolated agents, remove it
-            if connected_agents and all(agent_idx in isolated_agents for agent_idx in connected_agents):
+            # Remove fully disconnected tracks, or tracks only connected to removed agents.
+            if (not connected_agents) or all(agent_idx in isolated_agents for agent_idx in connected_agents):
                 tracks_to_remove.add(track_idx)
+
+        # If no agents or tracks need filtering, return unchanged
+        if not isolated_agents and not tracks_to_remove:
+            return graph_data
 
         # Create mapping from old track indices to new track indices
         kept_tracks = [i for i in range(len(all_tracks)) if i not in tracks_to_remove]

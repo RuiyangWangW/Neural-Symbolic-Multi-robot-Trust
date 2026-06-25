@@ -501,6 +501,7 @@ class TrustMethodComparison:
             }
 
             # Collect track trust values
+            # BASELINE FIX: Use reported_tracks since no trust updates means all_tracks is empty
             for robot in env.robots:
                 step_result['track_trust_values'][robot.id] = {
                     track.track_id: {
@@ -509,7 +510,7 @@ class TrustMethodComparison:
                         'beta': track.trust_beta,
                         'object_id': track.object_id
                     }
-                    for track in robot.get_all_tracks()
+                    for track in robot.get_reported_tracks_list()
                 }
 
             # Store per-frame robot state and detections
