@@ -66,8 +66,8 @@ class SupervisedDataGenerator:
                  adversarial_fn_suppression_rate: Union[float, Tuple[float, float]] = 0.0,
                  sensor_fp_rate: float = 0.05,
                  sensor_fn_rate: float = 0.05,
-                 proximal_range: float = 50.0,
-                 fov_range: float = 30.0,
+                 proximal_range: float = 80.0,
+                 fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
                  max_steps_per_episode: int = 100,
                  legitimate_mode: str = 'optimal',
@@ -1009,8 +1009,8 @@ def main():
                        help='Sensor FN rate (fixed, default: 0.05)')
     parser.add_argument('--world-size', type=float, default=100.0,
                        help='Side length of the square world (fixed, default: 100.0)')
-    parser.add_argument('--proximal-range', type=float, default=50.0,
-                       help='Proximal sensing range: fixed value (default: 50.0)')
+    parser.add_argument('--proximal-range', type=float, default=80.0,
+                       help='Proximal sensing range: fixed value (default: 80.0)')
     parser.add_argument('--steps', type=int, default=100,
                        help='Max steps per episode (default: 100)')
     parser.add_argument('--step-interval', type=int, default=10,
