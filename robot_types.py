@@ -11,7 +11,7 @@ import numpy as np
 import random
 from typing import List, Dict, Optional, Tuple, Set
 from dataclasses import dataclass
-from robot_track_classes import Robot, Track
+from robot_track_classes import Robot, Track, is_position_in_fov_2d
 from detector_sensor import DetectorSensor
 
 
@@ -54,6 +54,7 @@ class LegitimateRobot(Robot):
         # For realistic mode: use DetectorSensor class
         if mode == 'realistic':
             self.detector_sensor = DetectorSensor(
+                robot_id=robot_id,
                 sensor_fp_rate=sensor_fp_rate,
                 sensor_fn_rate=sensor_fn_rate
             )
@@ -281,6 +282,7 @@ class AdversarialRobot(Robot):
 
         # ALL adversarial robots use realistic detector sensor
         self.detector_sensor = DetectorSensor(
+            robot_id=robot_id,
             sensor_fp_rate=sensor_fp_rate,
             sensor_fn_rate=sensor_fn_rate
         )
@@ -731,7 +733,19 @@ class AdversarialRobot(Robot):
             # Convert trust value to Beta distribution parameters that produce desired mean
             # For a Beta(alpha, beta), mean = alpha / (alpha + beta)
 
-            if track.object_id.startswith('fp_obj_'):
+            # Match the FP/GT prefix classification used by the canonical reference
+            # implementation (comprehensive_trust_benchmark.py's
+            # compute_object_metrics_with_adversarial_lies): FP-like objects include
+            # persistent adversarial FPs (fp_obj_/fp_/adv_fp_) AND transient sensor FPs
+            # (sensor_fp_) - both are false detections that should be reported as
+            # credible under this deception strategy, not just the adversarially-injected
+            # ones.
+            is_fp_like = (track.object_id.startswith('fp_obj_') or
+                          track.object_id.startswith('fp_') or
+                          track.object_id.startswith('adv_fp_') or
+                          track.object_id.startswith('sensor_fp_'))
+
+            if is_fp_like:
                 # False positive: lie high (0.8 to 1.0)
                 # This makes FP objects appear highly credible
                 target_trust = random.uniform(0.8, 1.0)
@@ -761,6 +775,10 @@ class AdversarialRobot(Robot):
         """
         Check if a position is within a robot's field of view.
 
+        Delegates to the shared is_position_in_fov_2d (same 2D distance + angle-wedge
+        geometry as Robot.is_in_fov's default mode) rather than duplicating the math,
+        so the two can't silently drift apart again.
+
         Args:
             position: Position to check [x, y, z]
             robot_pos: Robot position [x, y, z]
@@ -771,20 +789,11 @@ class AdversarialRobot(Robot):
         Returns:
             True if position is in FoV, False otherwise
         """
-        # Calculate vector from robot to position
-        to_position = position - robot_pos
-        distance = np.linalg.norm(to_position)
-
-        # Check range
-        if distance > fov_range or distance < 0.1:
+        distance = np.linalg.norm((position - robot_pos)[:2])
+        if distance < 0.1:
             return False
 
-        # Check angle
-        angle_to_position = np.arctan2(to_position[1], to_position[0])
-        angle_diff = np.abs(np.arctan2(np.sin(angle_to_position - robot_orientation),
-                                       np.cos(angle_to_position - robot_orientation)))
-
-        return angle_diff <= fov_angle / 2
+        return is_position_in_fov_2d(position, robot_pos, robot_orientation, fov_range, fov_angle)
 
     def _count_neighbors_in_fov_and_supporting(self, object_data: Dict) -> tuple:
         """

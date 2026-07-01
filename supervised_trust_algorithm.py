@@ -91,7 +91,7 @@ class SupervisedTrustAlgorithm:
         updated_as_ego = set()
 
         # Track which tracks were updated (for statistics)
-        updated_tracks = {}  # robot_id -> set of track_ids
+        updated_tracks = {}  # robot_id -> set of object_ids
 
         # For each robot, build its ego-graph and update its trust
         for ego_robot in robots:
@@ -138,7 +138,7 @@ class SupervisedTrustAlgorithm:
             for track in robot.get_reported_tracks_list():
                 was_meaningful = (
                     robot.id in updated_tracks and
-                    track.track_id in updated_tracks[robot.id]
+                    track.object_id in updated_tracks[robot.id]
                 )
 
                 track_trust_info[track.track_id] = {
@@ -214,18 +214,22 @@ class SupervisedTrustAlgorithm:
                 ego_robot.update_trust(delta_alpha, delta_beta)
 
         # Update ONLY meaningful tracks (those that pass cross-validation)
-        if 'track' in predictions and hasattr(graph_data, 'track_nodes') and meaningful_track_indices:
+        if 'track' in predictions and hasattr(graph_data, '_fused_tracks') and hasattr(graph_data, '_individual_tracks') and meaningful_track_indices:
             track_probs = predictions['track']['probabilities']
 
-            # Get reverse mapping: graph_index -> track_id
-            index_to_track_id = {
-                node_idx: track_id
-                for track_id, node_idx in graph_data.track_nodes.items()
-            }
+            # Index directly into the graph's own track list (same order as track_nodes/
+            # edge_index_dict). IMPORTANT: Do NOT look up by track_id via ego_robot's
+            # reported_tracks - for fused tracks (>=2 robots observing the same object),
+            # graph_data.track_nodes keys are the synthesized "fused_..." id, which never
+            # matches any individual robot's own track_id. Since cross-validated
+            # ("meaningful") tracks are fused tracks by construction, matching on track_id
+            # silently dropped trust updates for exactly the tracks this algorithm targets.
+            # object_id is the stable identifier preserved through fusion, so use that.
+            all_tracks = graph_data._fused_tracks + graph_data._individual_tracks
 
             # Update only meaningful tracks
             for track_idx in meaningful_track_indices:
-                if track_idx < len(track_probs):
+                if track_idx < len(track_probs) and track_idx < len(all_tracks):
                     raw_p = track_probs[track_idx][0]  # Extract raw probability from array
                     p = raw_p  # Use raw probability (no calibration)
 
@@ -239,25 +243,23 @@ class SupervisedTrustAlgorithm:
                         delta_alpha = 0.0
                         delta_beta = (1 - p)
 
-                    # Find the track object using the mapping
-                    track_id = index_to_track_id.get(track_idx)
-                    if track_id:
-                        # IMPORTANT: Only update ego robot's track (index 0)
-                        # Each robot manages its own tracks independently
-                        ego_robot = graph_data._proximal_robots[0]
+                    # Find the track object using the graph's own track list
+                    object_id = all_tracks[track_idx].object_id
 
-                        # NEW ARCHITECTURE: Use reported_tracks and forward to all_tracks
-                        for track in ego_robot.get_reported_tracks_list():
-                            if track.track_id == track_id:
-                                object_id = track.object_id
-                                # Forward trust update to all_tracks (persistent storage)
-                                ego_robot.forward_trust_update_to_all_tracks(
-                                    object_id=object_id,
-                                    delta_alpha=delta_alpha,
-                                    delta_beta=delta_beta
-                                )
-                                updated_track_ids.add(track_id)
-                                break
+                    # IMPORTANT: Only update ego robot's track (index 0)
+                    # Each robot manages its own tracks independently
+                    ego_robot = graph_data._proximal_robots[0]
+
+                    # Only forward the update if ego robot is actually reporting this
+                    # object (i.e. it's one of ego's own tracks, fused or not)
+                    if object_id in ego_robot.get_reported_object_ids():
+                        # Forward trust update to all_tracks (persistent storage)
+                        ego_robot.forward_trust_update_to_all_tracks(
+                            object_id=object_id,
+                            delta_alpha=delta_alpha,
+                            delta_beta=delta_beta
+                        )
+                        updated_track_ids.add(object_id)
 
         return updated_track_ids
 

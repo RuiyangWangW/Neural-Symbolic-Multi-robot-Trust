@@ -840,6 +840,12 @@ class EgoGraphBuilder:
 
         fused_tracks = []
         individual_tracks = []
+        # Maps fused_track_id -> set of contributing robot_ids. NOTE: this intentionally
+        # does NOT go through track_id string parsing (see _robot_observes_track) because
+        # track_id formats are inconsistent across the codebase: legitimate/base sensor
+        # detections use "robot_{id}_obj_{object_id}" (robot_track_classes.py) while
+        # adversarial FP-injection/optimized-mode reports use "{id}_{object_id}"
+        # (robot_types.py). Storing robot_ids directly avoids that fragile parsing.
         track_fusion_map = {}
 
         # Collect all tracks from all robots
@@ -863,14 +869,13 @@ class EgoGraphBuilder:
                 fused_track = self._create_fused_track(tracks_list, robots)
                 fused_tracks.append(fused_track)
 
-                # Map all constituent tracks to the fused track
-                for robot_id, track in tracks_list:
-                    track_fusion_map[track.track_id] = fused_track.track_id
+                # Record which robots contributed to the fused track
+                track_fusion_map[fused_track.track_id] = set(robot_id for robot_id, _ in tracks_list)
             else:
                 # Only one robot sees this object - keep as individual track
                 robot_id, individual_track = tracks_list[0]
                 individual_tracks.append(individual_track)
-                track_fusion_map[individual_track.track_id] = individual_track.track_id
+                track_fusion_map[individual_track.track_id] = {robot_id}
 
         return fused_tracks, individual_tracks, track_fusion_map
 
@@ -980,13 +985,18 @@ class EgoGraphBuilder:
                     in_fov_only_by_edges.append([track_idx, robot_idx])
 
         # Create agent-to-agent co-detection edges (TRUST-FREE)
-        # Two robots are connected if they detected the same object at current timestep
+        # Two robots are connected if they both REPORTED the same object this timestep.
+        # IMPORTANT: Use reported_tracks (not current_timestep_tracks/raw sensor data) since
+        # reported_tracks reflects adversarial manipulation (FP injection, FN suppression).
+        # Persistent adversarial FP objects only ever appear in reported_tracks, never in
+        # current_timestep_tracks, so using raw sensor data here would make colluding
+        # adversaries injecting the same fabricated object invisible to this edge type.
         agent_codetection_edges = []
 
-        # Build object detection map: object_id -> [robot indices that detected it]
+        # Build object detection map: object_id -> [robot indices that reported it]
         object_detectors = {}
         for idx, robot in enumerate(robots):
-            current_tracks = robot.get_current_timestep_tracks()
+            current_tracks = robot.get_reported_tracks_list()
             for track in current_tracks:
                 if hasattr(track, 'object_id'):
                     obj_id = track.object_id
@@ -1009,15 +1019,19 @@ class EgoGraphBuilder:
                                 codetection_pairs.add(pair)
 
         # Create agent-to-agent contradiction edges
-        # Robot A contradicts Robot B if A detects a track that B should see (in B's FoV) but doesn't
+        # Robot A contradicts Robot B if A reports a track that B should see (in B's FoV) but doesn't report
         # DEDUPLICATED: Only one edge per pair, regardless of how many tracks they contradict on
         # Make each contradiction bidirectional for symmetric inconsistency signaling
+        # IMPORTANT: Use reported_tracks (not current_timestep_tracks/raw sensor data). A robot
+        # that suppresses (doesn't report) a real detection is only inconsistent in reported_tracks -
+        # it still shows up in current_timestep_tracks, so using raw sensor data here would make
+        # FN suppression invisible to this edge type.
         agent_contradiction_edges = []
         contradiction_pairs = set()  # Track (robot_a, robot_b) pairs to avoid duplicates
 
         for robot_a_idx, robot_a in enumerate(robots):
-            # Get tracks that robot A detects
-            tracks_detected_by_a = robot_a.get_current_timestep_tracks()
+            # Get tracks that robot A reports
+            tracks_detected_by_a = robot_a.get_reported_tracks_list()
 
             for robot_b_idx, robot_b in enumerate(robots):
                 if robot_a_idx == robot_b_idx:
@@ -1027,8 +1041,8 @@ class EgoGraphBuilder:
                 if (robot_a_idx, robot_b_idx) in contradiction_pairs:
                     continue
 
-                # Get tracks that robot B detects
-                tracks_detected_by_b = robot_b.get_current_timestep_tracks()
+                # Get tracks that robot B reports
+                tracks_detected_by_b = robot_b.get_reported_tracks_list()
 
                 # Check if A detects any track that B should see but doesn't
                 found_contradiction = False
@@ -1290,16 +1304,9 @@ class EgoGraphBuilder:
 
         # Check if this is a fused track and robot contributed to it
         if track in fused_tracks:
-            # Check if this robot contributed to the fused track
-            found_contribution = False
-            for original_id, fused_id in track_fusion_map.items():
-                if fused_id == track.track_id:
-                    # Check if this robot contributed to the fused track
-                    if original_id.startswith(f"{robot.id}_"):
-                        found_contribution = True
-                        break
-
-            return found_contribution
+            # track_fusion_map maps track_id -> set of contributing robot_ids directly,
+            # so no track_id string parsing is needed (see _perform_track_fusion).
+            return robot.id in track_fusion_map.get(track.track_id, set())
 
         return False
 

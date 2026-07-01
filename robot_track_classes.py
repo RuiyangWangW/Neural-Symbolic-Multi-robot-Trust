@@ -11,6 +11,44 @@ from typing import Dict, List, Optional, Any
 import time
 
 
+def is_position_in_fov_2d(position: np.ndarray,
+                           observer_position: np.ndarray,
+                           observer_orientation: float,
+                           fov_range: float,
+                           fov_angle: float) -> bool:
+    """
+    Check if a position is within a 2D field-of-view wedge (distance + angle only).
+
+    This is the single source of truth for ground-plane FoV geometry: robots and
+    targets in simulation_environment.py all sit at/near ground level, so a 2D
+    (x, y) distance + angle-wedge check is sufficient and must stay identical
+    everywhere it's used (Robot.is_in_fov's default mode, and the adversarial
+    policy's neighbor-visibility estimate in robot_types.py) - duplicating this
+    math in multiple places risks them silently drifting apart.
+
+    Args:
+        position: Position to check [x, y, ...] (only [0], [1] are used)
+        observer_position: Observer position [x, y, ...]
+        observer_orientation: Observer heading angle (radians)
+        fov_range: Field of view range
+        fov_angle: Field of view angle (radians)
+
+    Returns:
+        True if position is within range and within the angle wedge
+    """
+    rel_pos = position - observer_position
+    distance = np.linalg.norm(rel_pos[:2])
+
+    if distance > fov_range:
+        return False
+
+    target_angle = np.arctan2(rel_pos[1], rel_pos[0])
+    angle_diff = abs(target_angle - observer_orientation)
+    angle_diff = min(angle_diff, 2 * np.pi - angle_diff)  # Wrap around
+
+    return angle_diff <= fov_angle / 2
+
+
 class Track:
     """
     Clean track class that describes a robot's observation of an object.
@@ -77,10 +115,15 @@ class Track:
         """Compute distance to another track."""
         return np.linalg.norm(self.position - other_track.position)
     
-    def is_same_object(self, other_track: 'Track', distance_threshold: float = 5.0) -> bool:
-        """Check if this track and another track refer to the same object."""
-        return (self.object_id == other_track.object_id and 
-                self.distance_to(other_track) < distance_threshold)
+    def is_same_object(self, other_track: 'Track') -> bool:
+        """Check if this track and another track refer to the same object.
+
+        Identity is determined purely by object_id, matching how track fusion and
+        FP/GT matching work everywhere else in the codebase. Position is not part of
+        object identity - two tracks with the same object_id are the same object even
+        if their position estimates differ (e.g. sensor noise, staleness).
+        """
+        return self.object_id == other_track.object_id
     
     def was_updated_at_timestep(self, timestep: float, tolerance: float = 1e-6) -> bool:
         """Check if this track was updated at a specific simulation timestep."""
@@ -318,20 +361,9 @@ class Robot:
             # Use SPOT dual-camera FoV for Webots environment
             return self.is_in_spot_dual_camera_fov(target_position, self.fov_angle, self.fov_range)
 
-        # Default single-camera FoV
-        # Calculate relative position
-        rel_pos = target_position - self.position
-        distance = np.linalg.norm(rel_pos[:2])  # 2D distance
-
-        if distance > self.fov_range:
-            return False
-
-        # Check angle constraint
-        target_angle = np.arctan2(rel_pos[1], rel_pos[0])
-        angle_diff = abs(target_angle - self.orientation)
-        angle_diff = min(angle_diff, 2*np.pi - angle_diff)  # Wrap around
-
-        if angle_diff > self.fov_angle / 2:
+        # Default single-camera FoV: 2D distance + angle wedge
+        if not is_position_in_fov_2d(target_position, self.position, self.orientation,
+                                      self.fov_range, self.fov_angle):
             return False
 
         # Geometric FoV check passed, now check line of sight

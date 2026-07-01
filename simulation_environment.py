@@ -509,21 +509,17 @@ class SimulationEnvironment:
         (legitimate or adversarial) based on their current tracks.
         """
         for fp_obj in self.shared_fp_objects:
-            # Check all robots' tracks to see if any robot is reporting this FP object
+            # Check all robots' tracks to see if any robot is reporting this FP object.
+            # Match by object_id (not position) - the FP's identity is f"fp_obj_{fp_obj.id}"
+            # (see robot_types.py), which every reporting robot uses consistently. Matching
+            # by position instead would incorrectly match unrelated tracks (e.g. a genuine
+            # GT object or a different FP) that merely happen to pass within tolerance.
+            fp_object_id = f"fp_obj_{fp_obj.id}"
             is_currently_supported = False
 
             for robot in self.robots:
-                # Check all tracks from this robot
-                for track in robot.get_all_tracks():
-                    # Check if this track corresponds to our FP object
-                    # Match by position (within 5m tolerance)
-                    if hasattr(track, 'position'):
-                        distance = np.linalg.norm(np.array(track.position) - fp_obj.position)
-                        if distance < 5.0:
-                            is_currently_supported = True
-                            break
-
-                if is_currently_supported:
+                if fp_object_id in robot.reported_tracks:
+                    is_currently_supported = True
                     break
 
             # Update timestamps if this FP is being reported
@@ -565,9 +561,19 @@ class SimulationEnvironment:
         Delegates to robot-specific detection methods which handle all mode-specific logic.
         """
         if robot.is_adversarial:
-            # Adversarial robot: pass assigned FP objects for all modes
-            assigned_fps = [fp for fp in self.shared_fp_objects
-                          if self.fp_object_assignments.get(fp.id) == robot.id]
+            # Adversarial robot: pass assigned FP objects for all modes.
+            # If allow_fp_codetection is True, any adversarial robot may also report FP
+            # objects assigned to OTHER adversarial robots, enabling collusion on the same
+            # fabricated object. The FP object is still geometrically glued to its
+            # originally assigned robot's position/heading (_update_fp_objects), so this
+            # only matters when robot.is_in_fov() (checked downstream in
+            # robot_types.py's detection generation) actually passes for a non-owning
+            # robot - matching webots_trust_environment.py's precedent.
+            if self.allow_fp_codetection:
+                assigned_fps = self.shared_fp_objects
+            else:
+                assigned_fps = [fp for fp in self.shared_fp_objects
+                              if self.fp_object_assignments.get(fp.id) == robot.id]
             return robot.generate_detections(
                 ground_truth_objects=self.ground_truth_objects,
                 time=self.time,

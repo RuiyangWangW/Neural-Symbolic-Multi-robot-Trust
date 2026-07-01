@@ -25,15 +25,24 @@ class DetectorSensor:
     """
 
     def __init__(self,
+                 robot_id: int,
                  sensor_fp_rate: float = 0.05,
                  sensor_fn_rate: float = 0.05):
         """
         Initialize a realistic detector sensor.
 
         Args:
+            robot_id: ID of the robot that owns this sensor. Used to namespace transient
+                sensor FP object_ids so they're globally unique - every robot has its own
+                DetectorSensor instance with its own independent next_natural_fp_id
+                counter starting at 0, so without this, two robots' unrelated artifacts
+                could collide on the same object_id (e.g. both producing "sensor_fp_0"),
+                causing them to be incorrectly fused/co-detected as if they were the same
+                object.
             sensor_fp_rate: Natural false positive rate (probability of spurious detections)
             sensor_fn_rate: Natural false negative rate (probability of missing real objects)
         """
+        self.robot_id = robot_id
         self.sensor_fp_rate = sensor_fp_rate
         self.sensor_fn_rate = sensor_fn_rate
 
@@ -106,7 +115,7 @@ class DetectorSensor:
 
                 detected_sensor_fp_objects.append({
                     'type': 'sensor_fp',
-                    'object_id': f"sensor_fp_{fp_obj['id']}",
+                    'object_id': f"sensor_fp_{self.robot_id}_{fp_obj['id']}",
                     'position': noisy_pos,
                     'velocity': noisy_vel,
                     'spawn_time': fp_obj['spawn_time']

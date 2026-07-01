@@ -477,17 +477,20 @@ class SupervisedDataGenerator:
 
         # Generate labels for ALL tracks in ego graph
         track_labels = []
-        # Get all proximal robot tracks (what they're reporting)
-        proximal_robot_tracks = {}
-        for robot in proximal_robots:
-            # NEW ARCHITECTURE: Use reported_tracks (what robots are sharing)
-            robot_tracks = robot.get_reported_tracks_list()
-            proximal_robot_tracks[robot.id] = robot_tracks
 
-        # Get tracks in same order as ego graph builder
-        fused_tracks, individual_tracks, _ = self.ego_graph_builder._perform_track_fusion(
-            proximal_robots, proximal_robot_tracks)
-        all_tracks = fused_tracks + individual_tracks
+        # IMPORTANT: Use the ego graph's own stored track lists instead of recomputing
+        # fusion from scratch. EgoGraphBuilder._remove_isolated_agents (called inside
+        # build_ego_graph) filters out tracks only connected to isolated agents and
+        # updates _fused_tracks/_individual_tracks to match the actual graph structure
+        # (edge_index_dict, x_dict). This is also exactly what SupervisedTrustPredictor
+        # uses at inference time (supervised_trust_gnn.py), so matching it here keeps
+        # training labels consistent with how the trained model is actually used.
+        # Recomputing fusion independently could yield a different track count/order
+        # than the graph, causing track_labels to mismatch edge_index_dict.
+        if hasattr(ego_graph, '_fused_tracks') and hasattr(ego_graph, '_individual_tracks'):
+            all_tracks = ego_graph._fused_tracks + ego_graph._individual_tracks
+        else:
+            all_tracks = []
 
         if len(all_tracks) > 0:
             ground_truth_objects = getattr(self.sim_env, 'ground_truth_objects', [])
