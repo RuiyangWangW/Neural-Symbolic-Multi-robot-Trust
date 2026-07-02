@@ -71,7 +71,8 @@ class SupervisedDataGenerator:
                  fov_angle: float = np.pi/3,
                  max_steps_per_episode: int = 100,
                  legitimate_mode: str = 'optimal',
-                 adversarial_mode: str = 'normal'):
+                 adversarial_mode: str = 'normal',
+                 optimized_mode_probability: float = 0.0):
         """
         Initialize data generator with ground truth trust assignment
 
@@ -88,6 +89,13 @@ class SupervisedDataGenerator:
             fov_range: Field of view range (kept constant)
             fov_angle: Field of view angle (kept constant)
             max_steps_per_episode: Maximum steps per episode
+            adversarial_mode: Default/base adversarial mode used when optimized_mode_probability is 0
+                (or as the "not optimized" branch when it's > 0)
+            optimized_mode_probability: Per-episode probability of using 'optimized' adversarial mode
+                instead of adversarial_mode. E.g. 0.5 means each episode independently has a 50%
+                chance of using the MILP-based 'optimized' policy instead of 'normal', so the
+                training distribution covers both adversarial strategies. Default 0.0 preserves the
+                original fixed-mode behavior.
         """
         self.max_steps_per_episode = max_steps_per_episode
 
@@ -113,7 +121,8 @@ class SupervisedDataGenerator:
 
         # Robot modes (FIXED for training data consistency)
         self.legitimate_mode = legitimate_mode  # Should be 'optimal'
-        self.adversarial_mode = adversarial_mode  # Should be 'normal'
+        self.adversarial_mode = adversarial_mode  # Base mode (e.g. 'normal')
+        self.optimized_mode_probability = optimized_mode_probability  # Per-episode chance of 'optimized' instead
 
         # Initialize simulation environment (will be recreated for each episode with sampled parameters)
         self.sim_env = None
@@ -189,6 +198,15 @@ class SupervisedDataGenerator:
         else:
             adversarial_fn_suppression_rate = min_fn
 
+        # Sample adversarial mode per-episode: with optimized_mode_probability chance, use the
+        # MILP-based 'optimized' policy instead of the base adversarial_mode (e.g. 'normal'). This
+        # gives the training distribution coverage of both adversarial strategies rather than only
+        # ever training on one, so the model doesn't overfit to 'normal'-mode's random FP/FN pattern.
+        if random.random() < self.optimized_mode_probability:
+            episode_adversarial_mode = 'optimized'
+        else:
+            episode_adversarial_mode = self.adversarial_mode
+
         return {
             'robot_density': robot_density,
             'target_density': target_density,
@@ -201,7 +219,8 @@ class SupervisedDataGenerator:
             'sensor_fp_rate': self.sensor_fp_rate,
             'sensor_fn_rate': self.sensor_fn_rate,
             'world_size': self.world_size,
-            'proximal_range': self.proximal_range  # Fixed value
+            'proximal_range': self.proximal_range,  # Fixed value
+            'adversarial_mode': episode_adversarial_mode
         }
 
     def _create_simulation_environment(self, params: Dict) -> None:
@@ -225,7 +244,7 @@ class SupervisedDataGenerator:
             fov_angle=self.fov_angle,
             allow_fp_codetection=True,
             legitimate_mode=self.legitimate_mode,  # 'optimal' for training
-            adversarial_mode=self.adversarial_mode  # 'normal' for training
+            adversarial_mode=params['adversarial_mode']  # sampled per-episode
         )
 
         # Update ego graph builder with fixed proximal range
@@ -732,7 +751,12 @@ class SupervisedDataGenerator:
         log_print(f"   - Sensor FN rate (fixed): {self.sensor_fn_rate}")
         log_print(f"   - World size (square): {self.world_size[0]} x {self.world_size[1]}")
         log_print(f"   - Proximal range (fixed): {self.proximal_range}")
-        log_print(f"   - Robot modes: Legitimate={self.legitimate_mode}, Adversarial={self.adversarial_mode}")
+        if self.optimized_mode_probability > 0:
+            log_print(f"   - Robot modes: Legitimate={self.legitimate_mode}, "
+                      f"Adversarial={self.adversarial_mode} ({(1-self.optimized_mode_probability)*100:.0f}%) / "
+                      f"optimized ({self.optimized_mode_probability*100:.0f}%)")
+        else:
+            log_print(f"   - Robot modes: Legitimate={self.legitimate_mode}, Adversarial={self.adversarial_mode}")
         log_print(f"⏱️  Max steps per episode: {self.max_steps_per_episode}")
         log_print(f"📊 Sampling strategy:")
         log_print(f"   - Step interval: every {step_interval} steps")
@@ -952,7 +976,8 @@ class SupervisedDataGenerator:
                 'world_size': self.world_size,
                 'proximal_range': self.proximal_range,  # Fixed value
                 'legitimate_mode': self.legitimate_mode,  # Fixed value
-                'adversarial_mode': self.adversarial_mode  # Fixed value
+                'adversarial_mode': self.adversarial_mode,  # Base mode
+                'optimized_mode_probability': self.optimized_mode_probability  # Per-episode chance of 'optimized'
             },
             'statistics': {
                 'total_samples': len(all_data),
@@ -961,7 +986,11 @@ class SupervisedDataGenerator:
                 'codetection_edge_samples': codetection_edge_samples,
                 'avg_agents_per_sample': avg_agents_per_sample,
                 'avg_tracks_per_sample': avg_tracks_per_sample,
-                'parameter_diversity': param_stats if all_episode_params else {}
+                'parameter_diversity': param_stats if all_episode_params else {},
+                'adversarial_mode_episode_counts': {
+                    mode: sum(1 for p in all_episode_params if p.get('adversarial_mode') == mode)
+                    for mode in set(p.get('adversarial_mode', self.adversarial_mode) for p in all_episode_params)
+                } if all_episode_params else {}
             }
         }
 
@@ -1020,6 +1049,10 @@ def main():
                        help='Sample ego graphs every N steps to reduce duplicates (default: 10)')
     parser.add_argument('--output', type=str, default='supervised_trust_dataset.pkl',
                        help='Output file path (default: supervised_trust_dataset.pkl)')
+    parser.add_argument('--optimized-mode-probability', type=float, default=0.0,
+                       help='Per-episode probability of using the MILP-based "optimized" adversarial '
+                            'mode instead of "normal" (default: 0.0, i.e. always normal). '
+                            'E.g. 0.5 means each episode independently has a 50%% chance of optimized.')
     args = parser.parse_args()
 
     # Parse parameter ranges
@@ -1044,7 +1077,11 @@ def main():
     print(f"   - Sensor FN rate (fixed): {args.sensor_fn_rate}")
     print(f"   - World size (square): {world_size_value} x {world_size_value}")
     print(f"   - Proximal range (fixed): {args.proximal_range}")
-    print(f"   - Robot modes: Legitimate=optimal, Adversarial=normal")
+    if args.optimized_mode_probability > 0:
+        print(f"   - Robot modes: Legitimate=optimal, Adversarial=normal "
+              f"({(1-args.optimized_mode_probability)*100:.0f}%) / optimized ({args.optimized_mode_probability*100:.0f}%)")
+    else:
+        print(f"   - Robot modes: Legitimate=optimal, Adversarial=normal")
 
     # Create data generator
     generator = SupervisedDataGenerator(
@@ -1059,7 +1096,8 @@ def main():
         proximal_range=args.proximal_range,
         max_steps_per_episode=args.steps,
         legitimate_mode='optimal',  # Fixed for training data consistency
-        adversarial_mode='normal'   # Fixed for training data consistency
+        adversarial_mode='normal',  # Base mode for training data consistency
+        optimized_mode_probability=args.optimized_mode_probability
     )
 
     # Generate dataset
