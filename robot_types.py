@@ -254,7 +254,9 @@ class AdversarialRobot(Robot):
                  adversarial_fp_injection_rate: float = 0.5,
                  adversarial_fn_suppression_rate: float = 0.0,
                  sensor_fp_rate: float = 0.05,
-                 sensor_fn_rate: float = 0.05):
+                 sensor_fn_rate: float = 0.05,
+                 delta_plus: float = 5.0,
+                 delta_minus: float = 1.0):
         """
         Initialize an adversarial robot.
 
@@ -270,6 +272,14 @@ class AdversarialRobot(Robot):
             adversarial_fn_suppression_rate: Rate of transient FN suppression (only for 'normal' mode)
             sensor_fp_rate: Sensor false positive rate (transient, baseline sensor noise)
             sensor_fn_rate: Sensor false negative rate (transient, baseline sensor noise)
+            delta_plus: Corroboration factor in the optimized/deceptive MILP objective - scales
+                how much reporting a persistent FP object is worth (FP gain) relative to its
+                contradiction cost. Higher values make the policy report FPs more readily/more
+                often, even with fewer supporting neighbors. Only used by 'optimized' and
+                'deceptive' modes (see _estimate_objective_change).
+            delta_minus: Dilution factor in the same objective - scales how much suppressing a
+                GT object is worth (GT-suppression gain). Only used by 'optimized' and
+                'deceptive' modes.
         """
         super().__init__(robot_id, position, velocity, fov_range=fov_range, fov_angle=fov_angle)
 
@@ -287,14 +297,10 @@ class AdversarialRobot(Robot):
             sensor_fn_rate=sensor_fn_rate
         )
 
-        # For optimized/deceptive modes: persistent false hypotheses (adversarial injection)
-
-        # Thresholds for optimized mode (old heuristic approach)
-
-        # NEW: Objective-driven policy parameters (cost-benefit analysis)
+        # NEW: Objective-driven policy parameters (cost-benefit analysis, 'optimized'/'deceptive' modes)
         self.use_objective_policy = True  # Enable objective-based decisions for optimized mode
-        self.alpha = 1.0  # Weight per supporting/contradicting neighbor for FP objects
-        self.beta = 1.0   # Weight per supporting/contradicting neighbor for GT objects
+        self.delta_plus = delta_plus    # Corroboration factor for FP reports
+        self.delta_minus = delta_minus  # Dilution factor for GT suppression
         self.max_adversarial_operations = 5  # Maximum adversarial operations per timestep
 
         # Local information state: I_i(t) = (Z_i^nat(t), {(x_j(t), A_j(t), Z_j(t))}_{r_j in N_i(t)})
@@ -887,8 +893,8 @@ class AdversarialRobot(Robot):
         # Delta factors (corroboration/dilution effects)
         # δ+ amplifies trust gain when neighbors corroborate (more supporting neighbors)
         # δ- amplifies trust reduction when neighbors dilute (fewer supporting neighbors)
-        delta_plus = 2.0   # Corroboration factor
-        delta_minus = 1.0  # Dilution factor
+        delta_plus = self.delta_plus
+        delta_minus = self.delta_minus
 
         # Calculate cost-benefit based on action and object type
         # UNIFIED OBJECTIVE: (Delta * Trust Impact) - (Consistency Cost)

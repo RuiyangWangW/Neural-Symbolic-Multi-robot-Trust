@@ -63,7 +63,9 @@ class SimulationEnvironment:
                  num_robots: Optional[int] = None,
                  num_targets: Optional[int] = None,
                  legitimate_mode: str = 'optimal',
-                 adversarial_mode: str = 'normal'):
+                 adversarial_mode: str = 'normal',
+                 delta_plus: float = 5.0,
+                 delta_minus: float = 1.0):
         """
         Initialize simulation environment
 
@@ -83,6 +85,12 @@ class SimulationEnvironment:
             allow_fp_codetection: If True, allows adversarial robots to co-detect FP objects (default: False)
             legitimate_mode: Mode for legitimate robots ('optimal' or 'realistic')
             adversarial_mode: Mode for adversarial robots ('normal', 'optimized', or 'deceptive')
+            delta_plus: Corroboration factor (FP-gain coefficient) in the 'optimized'/'deceptive'
+                MILP cost-benefit objective. Higher values push adversarial robots to report
+                persistent FP objects more readily/more often. Only affects 'optimized'/'deceptive'
+                modes (see AdversarialRobot._estimate_objective_change in robot_types.py).
+            delta_minus: Dilution factor (GT-suppression coefficient) in the same objective.
+                Only affects 'optimized'/'deceptive' modes.
         """
         self.world_size = world_size
         self.area = self.world_size[0] * self.world_size[1]
@@ -112,6 +120,8 @@ class SimulationEnvironment:
         self.allow_fp_codetection = allow_fp_codetection
         self.legitimate_mode = legitimate_mode
         self.adversarial_mode = adversarial_mode
+        self.delta_plus = delta_plus
+        self.delta_minus = delta_minus
 
         self.robots: List[Robot] = []
         self.ground_truth_objects: List[GroundTruthObject] = []
@@ -197,7 +207,9 @@ class SimulationEnvironment:
                     adversarial_fp_injection_rate=self.adversarial_fp_injection_rate,
                     adversarial_fn_suppression_rate=self.adversarial_fn_suppression_rate,
                     sensor_fp_rate=self.sensor_fp_rate,
-                    sensor_fn_rate=self.sensor_fn_rate
+                    sensor_fn_rate=self.sensor_fn_rate,
+                    delta_plus=self.delta_plus,
+                    delta_minus=self.delta_minus
                 )
                 # Note: Persistent FP objects are now managed globally in shared_fp_objects
                 # and assigned to adversaries in generate_detections() via assigned_fp_objects parameter

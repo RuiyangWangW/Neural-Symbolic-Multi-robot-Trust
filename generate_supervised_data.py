@@ -72,7 +72,7 @@ class SupervisedDataGenerator:
                  max_steps_per_episode: int = 100,
                  legitimate_mode: str = 'optimal',
                  adversarial_mode: str = 'normal',
-                 optimized_mode_probability: float = 0.0):
+                 optimized_mode_probability: float = 0.5):
         """
         Initialize data generator with ground truth trust assignment
 
@@ -1049,10 +1049,10 @@ def main():
                        help='Sample ego graphs every N steps to reduce duplicates (default: 10)')
     parser.add_argument('--output', type=str, default='supervised_trust_dataset.pkl',
                        help='Output file path (default: supervised_trust_dataset.pkl)')
-    parser.add_argument('--optimized-mode-probability', type=float, default=0.0,
+    parser.add_argument('--optimized-mode-probability', type=float, default=0.5,
                        help='Per-episode probability of using the MILP-based "optimized" adversarial '
-                            'mode instead of "normal" (default: 0.0, i.e. always normal). '
-                            'E.g. 0.5 means each episode independently has a 50%% chance of optimized.')
+                            'mode instead of "normal" (default: 0.5, i.e. each episode independently '
+                            'has a 50%% chance of optimized). Pass 0.0 to always use normal mode.')
     args = parser.parse_args()
 
     # Parse parameter ranges
