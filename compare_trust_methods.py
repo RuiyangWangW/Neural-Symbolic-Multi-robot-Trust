@@ -54,7 +54,7 @@ class TrustMethodComparison:
                  world_size: float = 100.0,
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
-                 fixed_step_scale: float = 0.5,
+                 proximal_range: float = 80.0,
                  allow_fp_codetection: bool = True,
                  legitimate_mode: str = 'optimal',
                  adversarial_mode: str = 'normal',
@@ -70,9 +70,15 @@ class TrustMethodComparison:
             num_timesteps: Number of simulation steps
             random_seed: Random seed for reproducibility
             world_size: Side length of the (square) simulation world
-            fov_range: Field of view range for robots
+            fov_range: Field of view range for robots (detection range)
             fov_angle: Field of view angle for robots
-            fixed_step_scale: Step scale for baseline fixed-step method (default: 0.5)
+            proximal_range: Communication/proximal range for ego-graph construction. Must be
+                set here (constructor time), not via `instance.proximal_range = ...` afterward -
+                supervised_algorithm/bayesian_algorithm are built during __init__ using this
+                value, so setting the attribute post-construction silently has no effect on
+                them (only create_identical_environments, called later, would pick it up,
+                leaving the environment and the two algorithms using different ranges).
+                Default 80.0 matches generate_supervised_data.py's training-time value.
             allow_fp_codetection: Whether to allow FP codetection (default: True)
             legitimate_mode: Mode for legitimate robots ('optimal' or 'realistic')
             adversarial_mode: Mode for adversarial robots ('normal', 'optimized', or 'deceptive')
@@ -99,7 +105,6 @@ class TrustMethodComparison:
         self.random_seed = random_seed
         self.fov_range = fov_range
         self.fov_angle = fov_angle
-        self.fixed_step_scale = max(0.0, min(1.0, fixed_step_scale))
 
         # Initialize trust methods
         self.paper_algorithm = PaperTrustAlgorithm()
@@ -112,13 +117,15 @@ class TrustMethodComparison:
         self.bayesian_results = []
         self.baseline_results = []
 
-        # Simulation parameters (can be overridden)
+        # Simulation parameters (can be overridden after construction - unlike proximal_range,
+        # these are only read later inside create_identical_environments/run_comparison, not
+        # baked into an algorithm object during __init__)
         self.adversarial_ratio = 0.3
         self.adversarial_fp_injection_rate = 0.5  # Persistent FP injection
         self.adversarial_fn_suppression_rate = 0.0  # Transient FN suppression
         self.sensor_fp_rate = 0.05  # Transient sensor FPs
         self.sensor_fn_rate = 0.05  # Transient sensor FNs
-        self.proximal_range = 50.0
+        self.proximal_range = proximal_range
         self.allow_fp_codetection = allow_fp_codetection  # Can be set to True for FP codetection experiments
         self.legitimate_mode = legitimate_mode
         self.adversarial_mode = adversarial_mode
@@ -213,11 +220,11 @@ class TrustMethodComparison:
                 'trust_updates': trust_updates,
                 'adversarial_robots': [r.id for r in env.robots if r.is_adversarial],
                 'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial],
-                # True environment-wide object sets (not derived from any robot's accumulated
-                # tracks), so object-level metrics can use a denominator that's identical
-                # across all four methods on the same environment. Transient sensor_fp_*
-                # objects are intentionally excluded - they're ephemeral, per-robot artifacts
-                # with no environment-level registry, unlike persistent GT/FP objects.
+                # Placeholder object sets (full environment list) - overwritten by
+                # run_comparison() after all four methods finish, with baseline's
+                # ever-observed set (see run_baseline_simulation), which is the real
+                # denominator used for object-level metrics. Kept here only so this
+                # step_result has the keys populated if inspected before that happens.
                 'all_gt_object_ids': [f"gt_obj_{obj.id}" for obj in env.ground_truth_objects],
                 'all_fp_object_ids': [f"fp_obj_{obj.id}" for obj in env.shared_fp_objects],
             }
@@ -318,11 +325,11 @@ class TrustMethodComparison:
                 'track_trust_values': {},
                 'adversarial_robots': [r.id for r in env.robots if r.is_adversarial],
                 'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial],
-                # True environment-wide object sets (not derived from any robot's accumulated
-                # tracks), so object-level metrics can use a denominator that's identical
-                # across all four methods on the same environment. Transient sensor_fp_*
-                # objects are intentionally excluded - they're ephemeral, per-robot artifacts
-                # with no environment-level registry, unlike persistent GT/FP objects.
+                # Placeholder object sets (full environment list) - overwritten by
+                # run_comparison() after all four methods finish, with baseline's
+                # ever-observed set (see run_baseline_simulation), which is the real
+                # denominator used for object-level metrics. Kept here only so this
+                # step_result has the keys populated if inspected before that happens.
                 'all_gt_object_ids': [f"gt_obj_{obj.id}" for obj in env.ground_truth_objects],
                 'all_fp_object_ids': [f"fp_obj_{obj.id}" for obj in env.shared_fp_objects],
             }
@@ -422,11 +429,11 @@ class TrustMethodComparison:
                 'track_trust_values': {},
                 'adversarial_robots': [r.id for r in env.robots if r.is_adversarial],
                 'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial],
-                # True environment-wide object sets (not derived from any robot's accumulated
-                # tracks), so object-level metrics can use a denominator that's identical
-                # across all four methods on the same environment. Transient sensor_fp_*
-                # objects are intentionally excluded - they're ephemeral, per-robot artifacts
-                # with no environment-level registry, unlike persistent GT/FP objects.
+                # Placeholder object sets (full environment list) - overwritten by
+                # run_comparison() after all four methods finish, with baseline's
+                # ever-observed set (see run_baseline_simulation), which is the real
+                # denominator used for object-level metrics. Kept here only so this
+                # step_result has the keys populated if inspected before that happens.
                 'all_gt_object_ids': [f"gt_obj_{obj.id}" for obj in env.ground_truth_objects],
                 'all_fp_object_ids': [f"fp_obj_{obj.id}" for obj in env.shared_fp_objects],
             }
@@ -488,6 +495,17 @@ class TrustMethodComparison:
 
         results = []
 
+        # Accumulate the set of GT/FP objects any robot has EVER reported across the whole
+        # episode (baseline never filters/cross-validates, so this is a pure detection-coverage
+        # signal, independent of any trust algorithm's behavior). Used as the fixed denominator
+        # for object-level metrics across all four methods - see run_comparison(), which copies
+        # this set into every method's results. Using the full environment object list instead
+        # (as before) counted GT objects that no robot could ever physically detect (out of
+        # FoV/range for the whole episode) against every method equally, creating an artificial
+        # recall ceiling that had nothing to do with trust-algorithm quality.
+        ever_observed_gt_ids = set()
+        ever_observed_fp_ids = set()
+
         for step in range(self.num_timesteps):
             # CRITICAL: Reset random seed for each step to ensure identical randomness
             step_seed = self.random_seed + step
@@ -503,6 +521,14 @@ class TrustMethodComparison:
 
             # NO TRUST UPDATES - robots and tracks keep initial trust (0.5)
 
+            # Update the running ever-observed sets from this step's reports
+            for robot in env.robots:
+                for object_id in robot.get_reported_object_ids():
+                    if object_id.startswith("gt_"):
+                        ever_observed_gt_ids.add(object_id)
+                    elif object_id.startswith("fp_obj_"):
+                        ever_observed_fp_ids.add(object_id)
+
             # Collect results (same structure as other algorithms)
             step_result = {
                 'step': step,
@@ -517,13 +543,10 @@ class TrustMethodComparison:
                 'track_trust_values': {},
                 'adversarial_robots': [r.id for r in env.robots if r.is_adversarial],
                 'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial],
-                # True environment-wide object sets (not derived from any robot's accumulated
-                # tracks), so object-level metrics can use a denominator that's identical
-                # across all four methods on the same environment. Transient sensor_fp_*
-                # objects are intentionally excluded - they're ephemeral, per-robot artifacts
-                # with no environment-level registry, unlike persistent GT/FP objects.
-                'all_gt_object_ids': [f"gt_obj_{obj.id}" for obj in env.ground_truth_objects],
-                'all_fp_object_ids': [f"fp_obj_{obj.id}" for obj in env.shared_fp_objects],
+                # Fixed denominator for object-level metrics: GT/FP objects observed by ANY
+                # robot at ANY point up to and including this step (see comment above).
+                'all_gt_object_ids': sorted(ever_observed_gt_ids),
+                'all_fp_object_ids': sorted(ever_observed_fp_ids),
             }
 
             # Collect track trust values
@@ -606,6 +629,19 @@ class TrustMethodComparison:
 
         print("\n" + "="*50)
         self.baseline_results = self.run_baseline_simulation(baseline_env)
+
+        # Propagate baseline's ever-observed GT/FP object sets (see run_baseline_simulation)
+        # into every other method's results, so object-level metrics use one shared, detectable
+        # denominator across all four methods rather than each method's own view (paper/
+        # supervised/bayesian previously kept the full environment object list, which counted
+        # physically-undetectable objects against every method equally).
+        if self.baseline_results:
+            final_gt_ids = self.baseline_results[-1]['all_gt_object_ids']
+            final_fp_ids = self.baseline_results[-1]['all_fp_object_ids']
+            for method_results in (self.paper_results, self.supervised_results, self.bayesian_results):
+                for step_result in method_results:
+                    step_result['all_gt_object_ids'] = final_gt_ids
+                    step_result['all_fp_object_ids'] = final_fp_ids
 
         # Generate comparison results
         comparison_results = {
@@ -965,8 +1001,8 @@ def main():
     # Environment Parameters
     WORLD_SIZE = 100.0
     ADVERSARIAL_RATIO = 0.3
-    PROXIMAL_RANGE = 50.0
-    FOV_RANGE = 50.0
+    PROXIMAL_RANGE = 80.0  # Matches generate_supervised_data.py and the other benchmark files
+    FOV_RANGE = 50.0  # Detection range
     FOV_ANGLE = np.pi/3
 
     WORLD_AREA = WORLD_SIZE * WORLD_SIZE
@@ -1030,14 +1066,14 @@ def main():
             random_seed=RANDOM_SEED,
             world_size=WORLD_SIZE,
             fov_range=FOV_RANGE,
-            fov_angle=FOV_ANGLE
+            fov_angle=FOV_ANGLE,
+            proximal_range=PROXIMAL_RANGE,
         )
 
         # Set global and scenario-specific parameters
         comparison.adversarial_ratio = ADVERSARIAL_RATIO
-        comparison.false_positive_rate = scenario['false_positive_rate']
-        comparison.false_negative_rate = scenario['false_negative_rate']
-        comparison.proximal_range = PROXIMAL_RANGE
+        comparison.adversarial_fp_injection_rate = scenario['false_positive_rate']
+        comparison.adversarial_fn_suppression_rate = scenario['false_negative_rate']
 
         try:
             # Run comparison

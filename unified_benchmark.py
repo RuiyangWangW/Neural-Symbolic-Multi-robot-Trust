@@ -210,6 +210,7 @@ def run_scenario(
         world_size=WORLD_SIZE,
         fov_range=FOV_RANGE,
         fov_angle=FOV_ANGLE,
+        proximal_range=PROXIMAL_RANGE,
         allow_fp_codetection=True,  # Allow adversarial robots to co-detect FPs
         legitimate_mode=scenario.get("legitimate_mode", LEGITIMATE_MODE),
         adversarial_mode=scenario.get("adversarial_mode", ADVERSARIAL_MODE),
@@ -219,7 +220,6 @@ def run_scenario(
     comparison.adversarial_fn_suppression_rate = scenario["adversarial_fn_suppression_rate"]
     comparison.sensor_fp_rate = scenario["sensor_fp_rate"]
     comparison.sensor_fn_rate = scenario["sensor_fn_rate"]
-    comparison.proximal_range = PROXIMAL_RANGE
 
     results = comparison.run_comparison()
     evaluation = evaluate_methods(results, threshold=threshold, adversarial_lie=adversarial_lie, object_threshold=threshold)

@@ -296,30 +296,36 @@ def compute_robot_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str,
     return metrics, stats
 
 
-def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str, float], Dict[str, float]]:
+def _compute_object_metrics_impl(final_step: Dict, threshold: float, apply_adversarial_lies: bool) -> Tuple[Dict[str, float], Dict[str, float]]:
     """
-    Compute object-level accuracy with FIXED denominator (all objects in environment).
+    Shared implementation for compute_object_metrics / compute_object_metrics_with_adversarial_lies.
+
+    Both variants use IDENTICAL denominator, trusted-robot filtering, and weighted-fusion logic -
+    the only difference is whether each adversarial robot's track_trust is overridden with a lie
+    before fusion. This guarantees the "lies" scenario is a true apples-to-apples variant of the
+    normal scenario (same rules, one substituted input) rather than a separately-maintained
+    algorithm that could silently drift (e.g. previously the lies variant used ALL robots instead
+    of trusted-robots-only, and a different object_id prefix set, for no principled reason).
 
     Algorithm:
-    1. DENOMINATOR: ALL persistent objects that actually exist in the environment (GT + FP),
-       taken from the environment's own object lists (all_gt_object_ids/all_fp_object_ids),
-       NOT derived from any robot's accumulated track data. This denominator is identical
-       across all four methods since they all run on identical environments (same seed).
-       Deriving it from track_data instead (as this function previously did) would make the
-       denominator method-dependent: paper/supervised only accumulate all_tracks entries for
-       cross-validated objects, while bayesian/baseline accumulate one for every object ever
-       detected, so the "same object universe" the docstring promises silently wasn't true.
-    2. For each object, aggregate trust from TRUSTED robots only (robot_trust >= threshold)
+    1. DENOMINATOR: GT/FP objects any robot has ever reported (all_gt_object_ids/
+       all_fp_object_ids - see step_result construction in compare_trust_methods.py). Identical
+       across all four methods since they share the same seeded environment.
+    2. For each object, aggregate trust from TRUSTED robots only (robot_trust >= threshold).
+       If apply_adversarial_lies: an adversarial robot lies about every object in its own
+       all_tracks (track_data) - i.e. everything it has a trust value for and has reported at
+       some point in the episode, matching the same all_tracks scope the normal (non-lie)
+       aggregation already uses. Track trust is replaced with a lie (low for GT, high for
+       FP-like) before aggregation.
     3. Objects with fused trust >= threshold are "trusted objects" (numerator)
     4. Objects with fused trust < threshold OR not reported by any trusted robot are "not
        trusted" (counted as rejected, fused_trust defaults to 0.0)
-
-    Numerator (trusted objects):
-    - Baseline/Bayesian/Paper: All objects with fused trust >= threshold
-    - Supervised: Only cross-validated objects with fused trust >= threshold
     """
+    import random
+
     track_data = final_step.get("track_trust_values", {})
     robot_trust_data = final_step.get("robot_trust_values", {})
+    adversarial_robots = set(final_step.get("adversarial_robots", []))
 
     # FIXED DENOMINATOR: the environment's true persistent object sets (see step_result
     # construction in compare_trust_methods.py). Falls back to the old track_data-derived
@@ -347,9 +353,22 @@ def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str
         if robot_trust < threshold:
             continue  # Skip low-trust robots for object trust aggregation
 
+        is_adversarial = robot_id in adversarial_robots
+
         for _, track_info in robot_tracks.items():
             object_id = track_info.get("object_id", "")
             track_trust = float(track_info.get("trust_value", 0.5))
+
+            # ADVERSARIAL TRACK LIES: lie about every object in this robot's all_tracks
+            # (track_data) - everything it has a trust value for and has reported at some
+            # point in the episode, matching the same all_tracks scope the normal
+            # (non-lie) aggregation already uses.
+            if apply_adversarial_lies and is_adversarial:
+                if object_id.startswith("gt_"):
+                    track_trust = random.uniform(0.0, 0.2)
+                elif (object_id.startswith("fp_obj_") or
+                      object_id.startswith("sensor_fp_")):
+                    track_trust = random.uniform(0.8, 1.0)
 
             # Include ground truth objects
             if object_id.startswith("gt_"):
@@ -404,122 +423,23 @@ def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str
     return metrics, stats
 
 
+def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Compute object-level metrics with normal (unmanipulated) track trust values."""
+    return _compute_object_metrics_impl(final_step, threshold, apply_adversarial_lies=False)
+
+
 def compute_object_metrics_with_adversarial_lies(final_step: Dict, threshold: float) -> Tuple[Dict[str, float], Dict[str, float]]:
     """
-    Compute object-level metrics with ADVERSARIAL TRACK LIES.
-
-    Adversarial robots lie about track trust values:
-    - GT objects: lie low (random uniform 0.0 to 0.2)
-    - FP objects: lie high (random uniform 0.8 to 1.0)
-
-    This affects the weighted averaging calculation and thus the final metrics.
-
-    Algorithm (same as compute_object_metrics but with adversarial track lies):
-    1. Collect ALL objects from all robots
-    2. Aggregate tracks with adversarial lies applied to track trust values (from ALL robots)
-    3. Objects NOT seen by any robot receive score = 0.0
-    4. Objects with aggregated trust >= threshold are "believed to be true"
-
-    NOTE: Uses ALL robots (not filtered by trust) to measure swarm-wide perception.
+    Compute object-level metrics identically to compute_object_metrics, except each adversarial
+    robot's track_trust is replaced with a lie for objects it is CURRENTLY reporting:
+    - GT objects: lie low (random uniform 0.0 to 0.2) - make real objects look untrustworthy
+    - FP-like objects (persistent adversarial FP or transient sensor FP): lie high (random
+      uniform 0.8 to 1.0) - make fabricated objects look credible
 
     Use this version for benchmarks that test robustness against adversarial manipulation
-    of track-level trust values (e.g., deceptive mode with trust manipulation).
+    of track-level trust values (e.g. deceptive mode with trust manipulation).
     """
-    import random
-
-    track_data = final_step.get("track_trust_values", {})
-    robot_trust_data = final_step.get("robot_trust_values", {})
-    adversarial_robots = set(final_step.get("adversarial_robots", []))
-
-    # FIXED DENOMINATOR: use the environment's true persistent object sets, same as
-    # compute_object_metrics, so the denominator is identical across all four methods
-    # rather than depending on what each method happened to accumulate in its own tracks.
-    if "all_gt_object_ids" in final_step or "all_fp_object_ids" in final_step:
-        all_objects = set(final_step.get("all_gt_object_ids", [])) | set(final_step.get("all_fp_object_ids", []))
-    else:
-        all_objects = set()
-        for robot_id, robot_tracks in track_data.items():
-            for _, track_info in robot_tracks.items():
-                object_id = track_info.get("object_id", "")
-                if object_id.startswith("gt_"):
-                    all_objects.add(object_id)
-                elif (object_id.startswith("fp_obj_") or
-                      object_id.startswith("sensor_fp_")):
-                    all_objects.add(object_id)
-
-    # Second pass: Aggregate tracks by object_id from ALL robots (not filtered by trust)
-    object_weighted_trusts = {}  # object_id -> list of (robot_trust, track_trust) tuples
-
-    for robot_id, robot_tracks in track_data.items():
-        # Use ALL robots (removed trust threshold filter)
-        robot_trust = float(robot_trust_data.get(robot_id, 0.5))
-        is_adversarial = robot_id in adversarial_robots
-
-        for _, track_info in robot_tracks.items():
-            object_id = track_info.get("object_id", "")
-            track_trust = float(track_info.get("trust_value", 0.5))
-
-            # ADVERSARIAL TRACK LIES: Override track trust if robot is adversarial
-            if is_adversarial:
-                if object_id.startswith("gt_"):
-                    track_trust = random.uniform(0.0, 0.2)
-                elif (object_id.startswith("fp_") or
-                      object_id.startswith("adv_fp_") or
-                      object_id.startswith("sensor_fp_") or
-                      object_id.startswith("natural_fp_")):
-                    track_trust = random.uniform(0.8, 1.0)
-
-            if object_id.startswith("gt_"):
-                if object_id not in object_weighted_trusts:
-                    object_weighted_trusts[object_id] = []
-                object_weighted_trusts[object_id].append((robot_trust, track_trust))
-            elif (object_id.startswith("fp_") or          # Persistent adversarial FP (normal mode)
-                  object_id.startswith("adv_fp_") or      # Persistent adversarial FP (optimized/deceptive)
-                  object_id.startswith("sensor_fp_") or   # Transient sensor FP
-                  object_id.startswith("natural_fp_")):   # Legacy natural FP
-                if object_id not in object_weighted_trusts:
-                    object_weighted_trusts[object_id] = []
-                object_weighted_trusts[object_id].append((robot_trust, track_trust))
-
-    # Calculate weighted average trust per object and evaluate
-    labels = []
-    scores = []
-    gt_trust = []
-    fp_trust = []
-
-    # Evaluate ALL objects, including those not seen by any robot
-    for object_id in all_objects:
-        if object_id in object_weighted_trusts:
-            weighted_values = object_weighted_trusts[object_id]
-            # Calculate weighted average: sum(robot_trust * track_trust) / sum(robot_trust)
-            sum_weighted = sum(robot_trust * track_trust for robot_trust, track_trust in weighted_values)
-            sum_weights = sum(robot_trust for robot_trust, _ in weighted_values)
-            fused_trust = float(sum_weighted / sum_weights) if sum_weights > 0 else 0.0
-        else:
-            # Object not in all_tracks of any trusted robot
-            fused_trust = 0.0
-
-        if object_id.startswith("gt_"):
-            # Ground truth object (positive class)
-            labels.append(1)
-            gt_trust.append(fused_trust)
-            scores.append(fused_trust)
-        elif (object_id.startswith("fp_obj_") or      # Persistent adversarial FP (all modes)
-              object_id.startswith("sensor_fp_")):    # Transient sensor FP
-            # False positive object (negative class)
-            labels.append(0)
-            fp_trust.append(fused_trust)
-            scores.append(fused_trust)
-        else:
-            # Unknown object type - skip
-            continue
-
-    metrics = classification_metrics(labels, scores, threshold)
-    stats = {
-        "mean_true_object_trust": float(np.mean(gt_trust)) if gt_trust else 0.0,
-        "mean_false_object_trust": float(np.mean(fp_trust)) if fp_trust else 0.0,
-    }
-    return metrics, stats
+    return _compute_object_metrics_impl(final_step, threshold, apply_adversarial_lies=True)
 
 
 
@@ -654,7 +574,7 @@ def print_summary_statistics(summary: List[Dict]):
     print("\n" + "=" * 80)
     print("COMPREHENSIVE BENCHMARK RESULTS")
     print("=" * 80)
-    print("\nROBOT PRECISION (Adversarial Rejection):")
+    print("\nROBOT PRECISION (Trustworthy Predictive Value):")
     print("-" * 80)
     print(f"{'Method':<25} {'Mean':<15} {'Std Dev':<15} {'N':<10}")
     print("-" * 80)
@@ -687,7 +607,7 @@ def print_summary_statistics(summary: List[Dict]):
             std_acc = np.std(accs)
             print(f"{METHOD_DISPLAY_NAMES[method]:<25} {mean_acc:.4f}          {std_acc:.4f}          {len(accs)}")
 
-    print("\nOBJECT PRECISION (FP Rejection):")
+    print("\nOBJECT PRECISION (Ground-Truth Predictive Value):")
     print("-" * 80)
     print(f"{'Method':<25} {'Mean':<15} {'Std Dev':<15} {'N':<10}")
     print("-" * 80)
@@ -735,11 +655,11 @@ def run_scenario(scenario: Dict, args: argparse.Namespace, output_dir: Path) -> 
         world_size=scenario["world_size"],
         fov_range=50.0,
         fov_angle=np.pi / 3,
+        proximal_range=80.0,
     )
     comparison.adversarial_ratio = scenario["adversarial_ratio"]
-    comparison.false_positive_rate = scenario["false_positive_rate"]
-    comparison.false_negative_rate = scenario["false_negative_rate"]
-    comparison.proximal_range = 80.0
+    comparison.adversarial_fp_injection_rate = scenario["false_positive_rate"]
+    comparison.adversarial_fn_suppression_rate = scenario["false_negative_rate"]
 
     print(f"\n=== Running scenario: {scenario['name']} ===")
     results = comparison.run_comparison()
@@ -761,7 +681,7 @@ def main() -> None:
         "benchmark_parameters": {
             "threshold": args.threshold,
             "supervised_model": str(args.supervised_model),
-            "methods": ["paper_algorithm", "supervised_gnn"],
+            "methods": METHOD_ORDER,
         },
         "scenarios": [],
     }
