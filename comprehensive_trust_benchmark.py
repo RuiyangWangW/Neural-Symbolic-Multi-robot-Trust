@@ -301,15 +301,18 @@ def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str
     Compute object-level accuracy with FIXED denominator (all objects in environment).
 
     Algorithm:
-    1. DENOMINATOR: ALL objects in environment (GT + FP) - collected from all robots
+    1. DENOMINATOR: ALL persistent objects that actually exist in the environment (GT + FP),
+       taken from the environment's own object lists (all_gt_object_ids/all_fp_object_ids),
+       NOT derived from any robot's accumulated track data. This denominator is identical
+       across all four methods since they all run on identical environments (same seed).
+       Deriving it from track_data instead (as this function previously did) would make the
+       denominator method-dependent: paper/supervised only accumulate all_tracks entries for
+       cross-validated objects, while bayesian/baseline accumulate one for every object ever
+       detected, so the "same object universe" the docstring promises silently wasn't true.
     2. For each object, aggregate trust from TRUSTED robots only (robot_trust >= threshold)
-    3. Objects in all_tracks with fused trust >= threshold are "trusted objects" (numerator)
-    4. Objects with fused trust < threshold OR not in all_tracks are "not trusted" (counted as rejected)
-
-    This ensures:
-    - Baseline methods: Update all objects without cross-validation, so all objects appear in all_tracks
-    - Supervised method: Only cross-validated objects appear in all_tracks with updated trust
-    - Fair comparison: Same denominator for all methods (all objects that exist)
+    3. Objects with fused trust >= threshold are "trusted objects" (numerator)
+    4. Objects with fused trust < threshold OR not reported by any trusted robot are "not
+       trusted" (counted as rejected, fused_trust defaults to 0.0)
 
     Numerator (trusted objects):
     - Baseline/Bayesian/Paper: All objects with fused trust >= threshold
@@ -318,19 +321,21 @@ def compute_object_metrics(final_step: Dict, threshold: float) -> Tuple[Dict[str
     track_data = final_step.get("track_trust_values", {})
     robot_trust_data = final_step.get("robot_trust_values", {})
 
-    # FIXED DENOMINATOR: Collect ALL objects that exist in the environment
-    # This is the complete set of objects (GT + FP) that any robot has seen
-    all_objects = set()
-    for robot_id, robot_tracks in track_data.items():
-        for _, track_info in robot_tracks.items():
-            object_id = track_info.get("object_id", "")
-            # Include ground truth objects
-            if object_id.startswith("gt_"):
-                all_objects.add(object_id)
-            # Include ALL types of false positives (persistent adversarial + transient sensor)
-            elif (object_id.startswith("fp_obj_") or      # Persistent adversarial FP (all modes)
-                  object_id.startswith("sensor_fp_")):    # Transient sensor FP
-                all_objects.add(object_id)
+    # FIXED DENOMINATOR: the environment's true persistent object sets (see step_result
+    # construction in compare_trust_methods.py). Falls back to the old track_data-derived
+    # set only if these keys are missing (e.g. older cached result files).
+    if "all_gt_object_ids" in final_step or "all_fp_object_ids" in final_step:
+        all_objects = set(final_step.get("all_gt_object_ids", [])) | set(final_step.get("all_fp_object_ids", []))
+    else:
+        all_objects = set()
+        for robot_id, robot_tracks in track_data.items():
+            for _, track_info in robot_tracks.items():
+                object_id = track_info.get("object_id", "")
+                if object_id.startswith("gt_"):
+                    all_objects.add(object_id)
+                elif (object_id.startswith("fp_obj_") or
+                      object_id.startswith("sensor_fp_")):
+                    all_objects.add(object_id)
 
     # Aggregate tracks by object_id from TRUSTED robots only
     # This gives us the fused trust value for each object
@@ -426,16 +431,21 @@ def compute_object_metrics_with_adversarial_lies(final_step: Dict, threshold: fl
     robot_trust_data = final_step.get("robot_trust_values", {})
     adversarial_robots = set(final_step.get("adversarial_robots", []))
 
-    # First pass: Collect ALL objects from all robots
-    all_objects = set()  # All object_ids that exist in the simulation
-    for robot_id, robot_tracks in track_data.items():
-        for _, track_info in robot_tracks.items():
-            object_id = track_info.get("object_id", "")
-            if object_id.startswith("gt_"):
-                all_objects.add(object_id)
-            elif (object_id.startswith("fp_obj_") or      # Persistent adversarial FP (all modes)
-                  object_id.startswith("sensor_fp_")):    # Transient sensor FP
-                all_objects.add(object_id)
+    # FIXED DENOMINATOR: use the environment's true persistent object sets, same as
+    # compute_object_metrics, so the denominator is identical across all four methods
+    # rather than depending on what each method happened to accumulate in its own tracks.
+    if "all_gt_object_ids" in final_step or "all_fp_object_ids" in final_step:
+        all_objects = set(final_step.get("all_gt_object_ids", [])) | set(final_step.get("all_fp_object_ids", []))
+    else:
+        all_objects = set()
+        for robot_id, robot_tracks in track_data.items():
+            for _, track_info in robot_tracks.items():
+                object_id = track_info.get("object_id", "")
+                if object_id.startswith("gt_"):
+                    all_objects.add(object_id)
+                elif (object_id.startswith("fp_obj_") or
+                      object_id.startswith("sensor_fp_")):
+                    all_objects.add(object_id)
 
     # Second pass: Aggregate tracks by object_id from ALL robots (not filtered by trust)
     object_weighted_trusts = {}  # object_id -> list of (robot_trust, track_trust) tuples
@@ -589,10 +599,16 @@ def plot_metrics(summary: List[Dict], output_dir: Path) -> None:
                     color=color, alpha=0.8, edgecolor='black', linewidth=0.5)
 
     # Configure each subplot
+    # NOTE: positive class is "legitimate" for robots and "ground truth" for objects
+    # (see compute_robot_metrics/compute_object_metrics label assignment: 1=legit/GT, 0=adversarial/FP).
+    # So Precision = "of robots/objects predicted trustworthy, how many actually are" (trustworthy
+    # predictive value), NOT adversarial/FP rejection rate (that would require flipping the positive
+    # class to compute, e.g., specificity). Recall = "of actually legitimate/GT robots/objects, how
+    # many were correctly identified as such" - this one does match "identification" framing.
     for ax, title, ylabel in zip(
         (ax_robot_prec, ax_robot_rec, ax_robot_acc, ax_object_prec, ax_object_rec, ax_object_acc),
-        ("Robot Precision (Adversarial Rejection)", "Robot Recall (Legitimate Robot Identification)", "Robot Accuracy",
-         "Object Precision (FP Rejection)", "Object Recall (GT Object Identification)", "Object Accuracy"),
+        ("Robot Precision (Trustworthy Predictive Value)", "Robot Recall (Legitimate Robot Identification)", "Robot Accuracy",
+         "Object Precision (Ground-Truth Predictive Value)", "Object Recall (GT Object Identification)", "Object Accuracy"),
         ("Precision", "Recall", "Accuracy", "Precision", "Recall", "Accuracy")
     ):
         ax.set_xticks(x)
@@ -731,8 +747,7 @@ def run_scenario(scenario: Dict, args: argparse.Namespace, output_dir: Path) -> 
     detailed_path = scenario_dir / f"{scenario['name']}_results.json"
     comparison.save_results(str(detailed_path))
 
-    # Use threshold 0.5 for both robots and objects
-    evaluation = evaluate_methods(results, threshold=0.5, adversarial_lie=False, object_threshold=0.5)
+    evaluation = evaluate_methods(results, threshold=args.threshold, adversarial_lie=False, object_threshold=args.threshold)
     return results, evaluation
 
 

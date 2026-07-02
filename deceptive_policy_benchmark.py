@@ -2,25 +2,23 @@
 """
 Deceptive Policy Benchmark System for Multi-Robot Trust Methods
 
-This benchmark tests trust methods against DECEPTIVE adversarial mode (NEW 5-ACTION POLICY):
-- Adversarial robots use strategic per-object policy-based attacks (same as optimized)
-- 5 Actions: Introduce FP, Support FP, Ignore FP, Suppress GT, Report GT
+This benchmark tests trust methods against DECEPTIVE adversarial mode
+(see AdversarialRobot._generate_deceptive_adversarial_detections in robot_types.py):
+- Runs the same MILP-based per-object report/ignore policy as optimized mode
+  (see optimized_policy_benchmark.py for details)
 - PLUS trust/confidence manipulation to deceive the trust inference system:
   - GT objects: lie low trust (0.0-0.2) to make them seem less credible
-  - FP objects: lie high trust (0.8-1.0) to make them seem more credible
-- Introduction window: First 5 timesteps after detection
-- Support based on neighbor corroboration (score = count of neighbors reporting it)
-- Multiple actions per timestep (one per object)
+  - FP-like objects (persistent adversarial FP or transient sensor FP): lie high
+    trust (0.8-1.0) to make them seem more credible
 
 Test scenarios:
 - In-sample (training distribution)
 - Higher adversarial ratio (0.4-0.5)
 - Higher FP injection (0.4-0.5) - more persistent false hypotheses
-- Varying policy thresholds (eta_f, eta_r)
 
 Robot modes:
 - Legitimate: realistic (natural sensor noise)
-- Adversarial: deceptive (policy-based attacks + trust manipulation with 5-action policy)
+- Adversarial: deceptive (MILP-based report/ignore policy + trust manipulation)
 """
 
 import argparse
@@ -218,8 +216,7 @@ def run_scenario(
     # Deceptive mode now uses objective-driven policy
 
     results = comparison.run_comparison()
-    # Use threshold 0.5 for both robots and objects
-    evaluation = evaluate_methods(results, threshold=0.5, adversarial_lie=adversarial_lie, object_threshold=0.5)
+    evaluation = evaluate_methods(results, threshold=threshold, adversarial_lie=adversarial_lie, object_threshold=threshold)
     return evaluation
 
 

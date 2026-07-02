@@ -222,8 +222,7 @@ def run_scenario(
     comparison.proximal_range = PROXIMAL_RANGE
 
     results = comparison.run_comparison()
-    # Use threshold 0.5 for both robots and objects
-    evaluation = evaluate_methods(results, threshold=0.5, adversarial_lie=adversarial_lie, object_threshold=0.5)
+    evaluation = evaluate_methods(results, threshold=threshold, adversarial_lie=adversarial_lie, object_threshold=threshold)
     return evaluation
 
 

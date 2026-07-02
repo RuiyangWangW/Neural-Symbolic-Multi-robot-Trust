@@ -2,22 +2,23 @@
 """
 Optimized Policy Benchmark System for Multi-Robot Trust Methods
 
-This benchmark tests trust methods against OPTIMIZED adversarial mode (NEW 5-ACTION POLICY):
-- Adversarial robots use strategic per-object policy-based attacks
-- 5 Actions: Introduce FP, Support FP, Ignore FP, Suppress GT, Report GT
-- Introduction window: First 5 timesteps after detection
-- Support based on neighbor corroboration (score = count of neighbors reporting it)
-- Multiple actions per timestep (one per object)
+This benchmark tests trust methods against OPTIMIZED adversarial mode
+(see AdversarialRobot._generate_optimized_adversarial_detections in robot_types.py):
+- Per-timestep binary report/ignore decision for every FP-in-FoV and sensed object,
+  solved as a MILP that maximizes J_adv = alpha * (FP trust gain) - beta * (GT trust loss)
+- FP trust gain/GT trust loss are driven by corroborating vs. contradicting proximal
+  neighbors (via last_reported_tracks from the previous timestep)
+- A single linear constraint caps the number of adversarial operations per timestep
+  (FP reports + GT suppressions <= max_adversarial_operations)
 
 Test scenarios:
 - In-sample (training distribution)
 - Higher adversarial ratio (0.4-0.5)
 - Higher FP injection (0.4-0.5) - more persistent false hypotheses
-- Varying policy thresholds (eta_f, eta_r)
 
 Robot modes:
 - Legitimate: realistic (natural sensor noise)
-- Adversarial: optimized (policy-based strategic attacks with 5-action policy)
+- Adversarial: optimized (MILP-based per-object report/ignore policy)
 """
 
 import argparse
@@ -214,8 +215,7 @@ def run_scenario(
     # Optimized mode now uses objective-driven policy
 
     results = comparison.run_comparison()
-    # Use threshold 0.5 for both robots and objects
-    evaluation = evaluate_methods(results, threshold=0.5, adversarial_lie=adversarial_lie, object_threshold=0.5)
+    evaluation = evaluate_methods(results, threshold=threshold, adversarial_lie=adversarial_lie, object_threshold=threshold)
     return evaluation
 
 

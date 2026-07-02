@@ -22,6 +22,25 @@ from bayesian_ego_graph_trust import BayesianEgoGraphTrust
 from robot_track_classes import Robot, Track
 
 
+def classify_track_object(object_id: str) -> str:
+    """
+    Classify a track's object_id as ground_truth or false_positive for display/visualization.
+
+    Must cover every object_id prefix actually produced by the simulation (see
+    detector_sensor.py / robot_types.py):
+    - "gt_obj_*": real ground-truth objects
+    - "fp_obj_*": persistent adversarial FP injections
+    - "sensor_fp_{robot_id}_*": transient sensor-noise FPs (DetectorSensor)
+    Matches the prefix set used by comprehensive_trust_benchmark.py's metrics functions,
+    so visualization and metrics agree on what counts as a false positive.
+    """
+    if object_id.startswith("gt_"):
+        return "ground_truth"
+    if object_id.startswith("fp_obj_") or object_id.startswith("sensor_fp_"):
+        return "false_positive"
+    return "unknown"
+
+
 class TrustMethodComparison:
     """Runs paper trust algorithm simulation"""
 
@@ -193,7 +212,14 @@ class TrustMethodComparison:
                 'track_trust_values': {},
                 'trust_updates': trust_updates,
                 'adversarial_robots': [r.id for r in env.robots if r.is_adversarial],
-                'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial]
+                'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial],
+                # True environment-wide object sets (not derived from any robot's accumulated
+                # tracks), so object-level metrics can use a denominator that's identical
+                # across all four methods on the same environment. Transient sensor_fp_*
+                # objects are intentionally excluded - they're ephemeral, per-robot artifacts
+                # with no environment-level registry, unlike persistent GT/FP objects.
+                'all_gt_object_ids': [f"gt_obj_{obj.id}" for obj in env.ground_truth_objects],
+                'all_fp_object_ids': [f"fp_obj_{obj.id}" for obj in env.shared_fp_objects],
             }
 
             # Collect track trust values
@@ -208,14 +234,7 @@ class TrustMethodComparison:
                     for track in robot.get_all_tracks()
                 }
 
-            # Add frame state for visualization
-            def classify_track_object(object_id: str) -> str:
-                if object_id.startswith("gt_"):
-                    return "ground_truth"
-                if object_id.startswith("fp_"):
-                    return "false_positive"
-                return "unknown"
-
+            # Add frame state for visualization (classify_track_object defined at module level)
             robot_states = []
             robot_detections = {}
             for robot in env.robots:
@@ -298,7 +317,14 @@ class TrustMethodComparison:
                 },
                 'track_trust_values': {},
                 'adversarial_robots': [r.id for r in env.robots if r.is_adversarial],
-                'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial]
+                'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial],
+                # True environment-wide object sets (not derived from any robot's accumulated
+                # tracks), so object-level metrics can use a denominator that's identical
+                # across all four methods on the same environment. Transient sensor_fp_*
+                # objects are intentionally excluded - they're ephemeral, per-robot artifacts
+                # with no environment-level registry, unlike persistent GT/FP objects.
+                'all_gt_object_ids': [f"gt_obj_{obj.id}" for obj in env.ground_truth_objects],
+                'all_fp_object_ids': [f"fp_obj_{obj.id}" for obj in env.shared_fp_objects],
             }
 
             # Collect track trust values
@@ -313,14 +339,7 @@ class TrustMethodComparison:
                     for track in robot.get_all_tracks()
                 }
 
-            # Add frame state for visualization
-            def classify_track_object(object_id: str) -> str:
-                if object_id.startswith("gt_"):
-                    return "ground_truth"
-                if object_id.startswith("fp_"):
-                    return "false_positive"
-                return "unknown"
-
+            # Add frame state for visualization (classify_track_object defined at module level)
             robot_states = []
             robot_detections = {}
             for robot in env.robots:
@@ -402,7 +421,14 @@ class TrustMethodComparison:
                 },
                 'track_trust_values': {},
                 'adversarial_robots': [r.id for r in env.robots if r.is_adversarial],
-                'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial]
+                'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial],
+                # True environment-wide object sets (not derived from any robot's accumulated
+                # tracks), so object-level metrics can use a denominator that's identical
+                # across all four methods on the same environment. Transient sensor_fp_*
+                # objects are intentionally excluded - they're ephemeral, per-robot artifacts
+                # with no environment-level registry, unlike persistent GT/FP objects.
+                'all_gt_object_ids': [f"gt_obj_{obj.id}" for obj in env.ground_truth_objects],
+                'all_fp_object_ids': [f"fp_obj_{obj.id}" for obj in env.shared_fp_objects],
             }
 
             # Collect track trust values
@@ -417,14 +443,7 @@ class TrustMethodComparison:
                     for track in robot.get_all_tracks()
                 }
 
-            # Add frame state for visualization
-            def classify_track_object(object_id: str) -> str:
-                if object_id.startswith("gt_"):
-                    return "ground_truth"
-                if object_id.startswith("fp_"):
-                    return "false_positive"
-                return "unknown"
-
+            # Add frame state for visualization (classify_track_object defined at module level)
             robot_states = []
             robot_detections = {}
             for robot in env.robots:
@@ -497,7 +516,14 @@ class TrustMethodComparison:
                 },
                 'track_trust_values': {},
                 'adversarial_robots': [r.id for r in env.robots if r.is_adversarial],
-                'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial]
+                'legitimate_robots': [r.id for r in env.robots if not r.is_adversarial],
+                # True environment-wide object sets (not derived from any robot's accumulated
+                # tracks), so object-level metrics can use a denominator that's identical
+                # across all four methods on the same environment. Transient sensor_fp_*
+                # objects are intentionally excluded - they're ephemeral, per-robot artifacts
+                # with no environment-level registry, unlike persistent GT/FP objects.
+                'all_gt_object_ids': [f"gt_obj_{obj.id}" for obj in env.ground_truth_objects],
+                'all_fp_object_ids': [f"fp_obj_{obj.id}" for obj in env.shared_fp_objects],
             }
 
             # Collect track trust values
@@ -531,12 +557,11 @@ class TrustMethodComparison:
 
                 detections = []
                 for track in robot.get_current_timestep_tracks():
-                    object_type = "ground_truth" if track.object_id.startswith("gt_") else "false_positive" if track.object_id.startswith("fp_") else "unknown"
                     detections.append({
                         'track_id': track.track_id,
                         'object_id': track.object_id,
                         'position': track.position[:2].tolist() if hasattr(track.position, '__iter__') else [float(track.position)],
-                        'type': object_type,
+                        'type': classify_track_object(track.object_id),
                         'trust_value': float(track.trust_value),
                     })
                 robot_detections[str(robot.id)] = detections
