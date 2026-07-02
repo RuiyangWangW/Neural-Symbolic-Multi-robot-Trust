@@ -46,7 +46,7 @@ class LegitimateRobot(Robot):
             sensor_fp_rate: Sensor false positive rate (only for 'realistic' mode, transient)
             sensor_fn_rate: Sensor false negative rate (only for 'realistic' mode, transient)
         """
-        super().__init__(robot_id, position, velocity, fov_range, fov_angle)
+        super().__init__(robot_id, position, velocity, fov_range=fov_range, fov_angle=fov_angle)
 
         self.is_adversarial = False
         self.mode = mode
@@ -271,7 +271,7 @@ class AdversarialRobot(Robot):
             sensor_fp_rate: Sensor false positive rate (transient, baseline sensor noise)
             sensor_fn_rate: Sensor false negative rate (transient, baseline sensor noise)
         """
-        super().__init__(robot_id, position, velocity, fov_range, fov_angle)
+        super().__init__(robot_id, position, velocity, fov_range=fov_range, fov_angle=fov_angle)
 
         self.is_adversarial = True
         self.mode = mode
