@@ -194,10 +194,6 @@ class TrustMethodComparison:
             # Step the simulation
             frame_data = env.step()
 
-            # Update current timestep tracks for all robots
-            for robot in env.robots:
-                robot.update_current_timestep_tracks()
-
             # Apply paper trust algorithm
             try:
                 trust_updates = self.paper_algorithm.update_trust(env.robots, env)
@@ -299,10 +295,6 @@ class TrustMethodComparison:
             # Step the simulation
             frame_data = env.step()
 
-            # Update current timestep tracks for all robots
-            for robot in env.robots:
-                robot.update_current_timestep_tracks()
-
             # Apply supervised trust algorithm
             # This internally loops over all robots as ego and updates their trust
             try:
@@ -403,10 +395,6 @@ class TrustMethodComparison:
 
             # Step the simulation
             frame_data = env.step()
-
-            # Update current timestep tracks for all robots
-            for robot in env.robots:
-                robot.update_current_timestep_tracks()
 
             # Apply Bayesian trust algorithm
             try:
@@ -514,10 +502,6 @@ class TrustMethodComparison:
 
             # Step the simulation WITHOUT any trust updates
             frame_data = env.step()
-
-            # Update current timestep tracks for all robots
-            for robot in env.robots:
-                robot.update_current_timestep_tracks()
 
             # NO TRUST UPDATES - robots and tracks keep initial trust (0.5)
 

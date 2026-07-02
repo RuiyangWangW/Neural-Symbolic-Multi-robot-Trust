@@ -671,12 +671,6 @@ class Robot:
         else:
             raise ValueError(f"Track with object_id {object_id} not found in local tracks")
     
-    def update_current_timestep_tracks(self):
-        """Check all tracks and mark those updated in current timestep as current."""
-        for object_id, track in self.local_tracks.items():
-            if track.was_updated_at_timestep(self.current_timestep):
-                self.current_timestep_tracks[object_id] = track
-
     # ========================================================================
     # NEW TRACK ARCHITECTURE METHODS
     # ========================================================================

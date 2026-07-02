@@ -860,11 +860,7 @@ def main():
     for step in range(500):
         # Step the simulation
         frame_data = env_paper.step()
-        
-        # Update current timestep tracks for all robots after step
-        for robot in env_paper.robots:
-            robot.update_current_timestep_tracks()
-        
+
         # Apply trust algorithm updates using the new simplified interface
         try:
             paper_algo.update_trust(env_paper.robots, env_paper)

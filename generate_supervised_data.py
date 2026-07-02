@@ -134,12 +134,7 @@ class SupervisedDataGenerator:
         """
         Execute a single environment step and apply ground truth trust assignment.
         """
-        frame_data = self.sim_env.step()
-
-        for robot in self.sim_env.robots:
-            robot.update_current_timestep_tracks()
-
-        return frame_data
+        return self.sim_env.step()
 
     @staticmethod
     def _sample_density(range_tuple: Tuple[float, float], step: float) -> float:
