@@ -4,126 +4,17 @@ Simplified Trust-Based Sensor Fusion Algorithm
 
 Simplified version using:
 - Current-time detections only (no historical tracks)
-- Direct object ID matching (no Hungarian assignment)
-- Agent-trust-weighted fusion
+- Direct object ID matching against ego's own reported tracks (no Hungarian
+  assignment, no position-based fusion - proximal reports are deduplicated by
+  object_id so each distinct object contributes at most one PSM per ego robot)
 
 Based on: "Trust-Based Assured Sensor Fusion in Distributed Aerial Autonomy"
 """
 
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 from trust_algorithm import TrustAlgorithm
 from robot_track_classes import Robot, Track
-
-class DataAggregator:
-    """Centralized data aggregator for weighted object state estimation"""
-    
-    def __init__(self, robots: List[Robot]):
-        self.robots = robots
-
-    def compute_weighted_object_state(self, track_group: List[Track]) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute weighted position and velocity for fused track group"""
-        if not track_group:
-            return None, None
-
-        weights, positions, velocities = [], [], []
-        for track in track_group:
-            source_robot = next((r for r in self.robots if r.id == track.robot_id), None)
-            if source_robot is None:
-                continue
-            agent_trust = source_robot.trust_value
-            track_trust = track.trust_value
-
-            weight = agent_trust * track_trust * getattr(track, 'confidence', 1.0)
-            weights.append(weight)
-            positions.append(track.position)
-            velocities.append(track.velocity)
-
-        if not weights:
-            return None, None
-
-        weights = np.array(weights)
-        positions = np.array(positions)
-        velocities = np.array(velocities)
-        weights = weights / np.sum(weights)
-        
-        fused_pos = np.sum(positions * weights[:, np.newaxis], axis=0)
-        fused_vel = np.sum(velocities * weights[:, np.newaxis], axis=0)
-        
-        return fused_pos, fused_vel
-
-    def fuse_tracks_for_ego_robot(
-        self,
-        ego_robot_id: int,
-        fusion_threshold: float = 2.0,
-        trust_threshold: float = 0.4
-    ) -> Dict[str, Track]:
-        """
-        Simplified fusion using ONLY current-time detections:
-        1) Use ego robot's CURRENT tracks only
-        2) Match other robots' tracks by object ID (no Hungarian assignment needed)
-        3) Weight contributions by agent trust values
-
-        Returns:
-            Dict mapping object_id to fused Track
-        """
-        # Get ego robot
-        ego_robot = next((r for r in self.robots if r.id == ego_robot_id), None)
-        if ego_robot is None:
-            return {}
-
-        # NEW ARCHITECTURE: Use reported tracks (what robots are sharing)
-        ego_current_tracks = ego_robot.get_reported_tracks_list()
-
-        if not ego_current_tracks:
-            return {}
-
-        fused_track_map: Dict[str, Track] = {}  # object_id -> fused track
-
-        # For each object ego robot currently observes
-        for ego_track in ego_current_tracks:
-            # Skip if we already processed this object
-            if ego_track.object_id in fused_track_map:
-                continue
-
-            # 1) Find tracks from other robots for the SAME object ID
-            proximal_tracks_for_object: List[Track] = [ego_track]
-
-            # Check all other robots for CURRENT tracks with matching object ID
-            for other_robot in self.robots:
-                if other_robot.id == ego_robot_id:
-                    continue
-
-                # NEW ARCHITECTURE: Get reported tracks only
-                other_current_tracks = other_robot.get_reported_tracks_list()
-
-                # Match by object ID directly (no Hungarian needed!)
-                for other_track in other_current_tracks:
-                    if other_track.object_id == ego_track.object_id:
-                        proximal_tracks_for_object.append(other_track)
-
-            # 2) Compute agent-trust-weighted fused state
-            fused_pos, fused_vel = self.compute_weighted_object_state(proximal_tracks_for_object)
-            if fused_pos is None or fused_vel is None:
-                # Fallback to ego track
-                fused_track_map[ego_track.object_id] = ego_track
-                continue
-
-            # 3) Create fused track with agent-trust weighting
-            track_id = f"{ego_robot_id}_fused_{ego_track.object_id}"
-            fused_track = Track(
-                track_id=track_id,
-                robot_id=ego_robot_id,
-                object_id=ego_track.object_id,
-                position=fused_pos,
-                velocity=fused_vel,
-                trust_alpha=ego_track.trust_alpha,
-                trust_beta=ego_track.trust_beta,
-                timestamp=ego_track.timestamp
-            )
-            fused_track_map[ego_track.object_id] = fused_track
-
-        return fused_track_map
 
 
 class TrustEstimator:
@@ -188,13 +79,9 @@ class PaperTrustAlgorithm:
     
     def __init__(self, negative_bias: float = 3.0, negative_threshold: float = 0.3):
         self.trust_estimator = TrustEstimator(negative_bias, negative_threshold)
-        self.data_aggregator: Optional[DataAggregator] = None
-    
-    def update_trust(self, robots: List[Robot], environment = None) -> Dict[int, Dict]:
-        """Update trust values using simplified object ID-based PSM generation"""
 
-        # Use current-time tracks only
-        self.data_aggregator = DataAggregator(robots)
+    def update_trust(self, robots: List[Robot], environment = None) -> Dict[int, Dict]:
+        """Update trust values using direct object ID matching against ego's own reports"""
 
         trust_updates = {}
 
@@ -202,21 +89,12 @@ class PaperTrustAlgorithm:
         robot_psms = {robot.id: [] for robot in robots}
         all_track_psms = {}
 
-        # OUTER LOOP: For each ego robot, create ego fused tracks from CURRENT tracks
+        # OUTER LOOP: For each ego robot, compare its own reported tracks against what
+        # proximal robots (fused by object ID, so each object counts once) report
         for ego_robot in robots:
-            # NEW ARCHITECTURE: Use reported tracks only
-            ego_robot_tracks = ego_robot.get_reported_tracks_list()
-
-            if not ego_robot_tracks:
+            if not ego_robot.reported_tracks:
                 continue
 
-            # Create ego robot's fused tracks (weighted by agent trust)
-            ego_fused_track_map = self.data_aggregator.fuse_tracks_for_ego_robot(ego_robot.id)
-
-            if not ego_fused_track_map:
-                continue
-
-            # INNER LOOP: For each proximal robot, compare its CURRENT tracks with ego fused tracks
             # Filter proximal robots by distance if environment is available
             if environment:
                 proximal_robots_in_range = environment.get_proximal_robots(ego_robot)
@@ -224,18 +102,20 @@ class PaperTrustAlgorithm:
                 # Fallback: consider all other robots as proximal
                 proximal_robots_in_range = [r for r in robots if r.id != ego_robot.id]
 
+            # Fuse proximal robots' reported tracks by object ID so each distinct object
+            # is only counted once, regardless of how many proximal robots report it
+            proximal_tracks_by_object: Dict[str, Track] = {}
             for proximal_robot in proximal_robots_in_range:
+                for track in proximal_robot.get_reported_tracks_list():
+                    proximal_tracks_by_object.setdefault(track.object_id, track)
 
-                # NEW ARCHITECTURE: Use proximal robot's reported tracks only
-                proximal_robot_tracks = proximal_robot.get_reported_tracks_list()
-                if not proximal_robot_tracks:
-                    continue
+            if not proximal_tracks_by_object:
+                continue
 
-                # Generate PSMs based on OBJECT ID matching (no Hungarian assignment!)
-                self._generate_psms_by_object_id(
-                    ego_fused_track_map, proximal_robot_tracks, ego_robot, proximal_robot,
-                    robot_psms, all_track_psms)
-        
+            # Generate PSMs based on direct object ID matching against ego's own reports
+            self._generate_psms_by_object_id(
+                proximal_tracks_by_object, ego_robot, robot_psms, all_track_psms)
+
         # Apply collected PSMs to update robot trust
         for robot in robots:
             if robot_psms[robot.id]:
@@ -285,89 +165,77 @@ class PaperTrustAlgorithm:
         
         return trust_updates
     
-    def _generate_psms_by_object_id(self, ego_fused_track_map: Dict[str, Track],
-                                    proximal_tracks: List[Track],
-                                    ego_robot: Robot, proximal_robot: Robot,
+    def _generate_psms_by_object_id(self, proximal_tracks_by_object: Dict[str, Track],
+                                    ego_robot: Robot,
                                     robot_psms: Dict, all_track_psms: Dict):
         """
-        Generate PSMs using direct object ID matching (simplified - no Hungarian needed!)
+        Generate PSMs by matching ego's own reported tracks directly against the set of
+        distinct objects proximal neighbors report (already fused/deduplicated by object_id,
+        one entry per object regardless of how many proximal robots reported it).
 
-        Logic:
-        - If proximal track's object_id exists in ego_fused_track_map: MATCH (positive PSM)
-        - If proximal track's object_id NOT in ego_fused_track_map and in ego's FoV: MISMATCH (negative PSM)
+        All evidence is applied to ego_robot's own agent trust and ego_robot's own track,
+        never to a proximal robot - we're asking "does ego's own reporting agree with what
+        its neighbors report?"
+
+        Logic (one PSM per distinct proximal object, not per proximal robot):
+        - If proximal object_id is also in ego_robot.reported_tracks: MATCH (positive PSM)
+          -> ego correctly reported something a neighbor corroborates
+        - If proximal object_id is NOT in ego_robot.reported_tracks but is in ego's FoV:
+          MISMATCH (negative PSM) -> ego failed to report something a neighbor sees in ego's FoV
         """
+        for obj_id, proximal_track in proximal_tracks_by_object.items():
+            ego_track = ego_robot.reported_tracks.get(obj_id)
 
-        if not ego_fused_track_map or not proximal_tracks:
-            return
-
-        # Process each proximal track
-        for proximal_track in proximal_tracks:
-            obj_id = proximal_track.object_id
-
-            # Check if this object exists in ego's fused tracks
-            if obj_id in ego_fused_track_map:
-                # MATCH: Same object ID - positive evidence
-                ego_fused_track = ego_fused_track_map[obj_id]
+            if ego_track is not None:
+                # MATCH: ego already reported this object - positive evidence for ego
                 self._generate_positive_psm(
-                    ego_fused_track, proximal_track, proximal_robot, robot_psms, all_track_psms
+                    ego_robot, ego_track, robot_psms, all_track_psms
                 )
-            else:
-                # Object not in ego's fused tracks - check if it's in ego's FoV
-                if ego_robot.is_in_fov(proximal_track.position):
-                    # MISMATCH: Proximal robot sees object that ego doesn't - negative evidence (false positive)
-                    self._generate_negative_psm(
-                        proximal_track, proximal_robot, robot_psms, all_track_psms
-                    )
-    
-    def _generate_positive_psm(self, ego_fused_track: Track, proximal_track: Track,
-                               proximal_robot: Robot, robot_psms: Dict, all_track_psms: Dict):
-        """Generate positive PSM when proximal track matches ego fused track by object ID"""
-        # Calculate ego fused track trust statistics (used in agent PSM)
-        ego_fused_track_expected_trust = self.trust_estimator.get_expected_trust(
-            ego_fused_track.trust_alpha, ego_fused_track.trust_beta)
-        ego_fused_track_trust_variance = self.trust_estimator.get_trust_variance(
-            ego_fused_track.trust_alpha, ego_fused_track.trust_beta)
+            elif ego_robot.is_in_fov(proximal_track.position):
+                # MISMATCH: Ego should have seen this (neighbor sees it, it's in ego's
+                # FoV) but didn't report it - negative evidence for ego
+                self._generate_negative_psm(
+                    ego_robot, robot_psms
+                )
 
-        # Calculate agent trust statistics (used in track PSM)
-        agent_expected_trust = proximal_robot.trust_value
+    def _generate_positive_psm(self, ego_robot: Robot, ego_track: Track,
+                               robot_psms: Dict, all_track_psms: Dict):
+        """Generate positive PSM for ego_robot when a proximal neighbor corroborates ego's own track"""
+        # Calculate ego's own track trust statistics (used in agent PSM)
+        ego_track_expected_trust = self.trust_estimator.get_expected_trust(
+            ego_track.trust_alpha, ego_track.trust_beta)
+        ego_track_trust_variance = self.trust_estimator.get_trust_variance(
+            ego_track.trust_alpha, ego_track.trust_beta)
 
-        # Agent PSM: value = E[ego_fused_track_trust], confidence = 1-V[ego_fused_track_trust]
-        agent_value = ego_fused_track_expected_trust
-        agent_confidence = 1.0 - ego_fused_track_trust_variance
-        robot_psms[proximal_robot.id].append((agent_value, agent_confidence))
+        # Calculate ego's own agent trust statistics (used in track PSM confidence)
+        agent_expected_trust = ego_robot.trust_value
 
-        # Track PSM: value = 1 (match), confidence = E[agent_trust]
+        # Agent PSM (for ego_robot): value = E[ego_track_trust], confidence = 1-V[ego_track_trust]
+        agent_value = ego_track_expected_trust
+        agent_confidence = 1.0 - ego_track_trust_variance
+        robot_psms[ego_robot.id].append((agent_value, agent_confidence))
+
+        # Track PSM (for ego's own track): value = 1 (match), confidence = E[ego agent_trust]
         track_value = 1.0
         track_confidence = agent_expected_trust
 
-        if proximal_track.track_id not in all_track_psms:
-            all_track_psms[proximal_track.track_id] = []
-        all_track_psms[proximal_track.track_id].append((track_value, track_confidence))
+        if ego_track.track_id not in all_track_psms:
+            all_track_psms[ego_track.track_id] = []
+        all_track_psms[ego_track.track_id].append((track_value, track_confidence))
 
-    def _generate_negative_psm(self, proximal_track: Track, proximal_robot: Robot,
-                               robot_psms: Dict, all_track_psms: Dict):
-        """Generate negative PSM when proximal track is a false positive (not in ego's fused tracks but in ego's FoV)"""
-        # Calculate proximal track trust statistics (used in agent PSM)
-        proximal_track_expected_trust = self.trust_estimator.get_expected_trust(
-            proximal_track.trust_alpha, proximal_track.trust_beta)
-        proximal_track_trust_variance = self.trust_estimator.get_trust_variance(
-            proximal_track.trust_alpha, proximal_track.trust_beta)
+    def _generate_negative_psm(self, ego_robot: Robot, robot_psms: Dict):
+        """
+        Generate negative PSM for ego_robot when it fails to report an object a proximal
+        neighbor sees in ego's FoV.
 
-        # Calculate agent trust statistics (used in track PSM)
-        agent_expected_trust = proximal_robot.trust_value
-
-        # Agent PSM: value = 1.0 - E[proximal_track_trust], confidence = 1-V[proximal_track_trust]
-        agent_value = 1.0 - proximal_track_expected_trust
-        agent_confidence = 1.0 - proximal_track_trust_variance
-        robot_psms[proximal_robot.id].append((agent_value, agent_confidence))
-
-        # Track PSM: value = 0 (no match/false positive), confidence = E[agent_trust]
-        track_value = 0.0
-        track_confidence = agent_expected_trust
-
-        if proximal_track.track_id not in all_track_psms:
-            all_track_psms[proximal_track.track_id] = []
-        all_track_psms[proximal_track.track_id].append((track_value, track_confidence))
+        Ego never created a track for this object (that's the whole point of the mismatch),
+        so there is no ego track to apply a track-level PSM to - only ego's agent trust is
+        penalized here.
+        """
+        # Agent PSM (for ego_robot): value = 0 (ego missed a real detection), full confidence
+        agent_value = 0.0
+        agent_confidence = 1.0
+        robot_psms[ego_robot.id].append((agent_value, agent_confidence))
     
     def get_expected_trust(self, alpha: float, beta: float) -> float:
         """Calculate expected value E[trust] = alpha / (alpha + beta)"""
