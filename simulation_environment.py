@@ -64,7 +64,7 @@ class SimulationEnvironment:
                  num_targets: Optional[int] = None,
                  legitimate_mode: str = 'optimal',
                  adversarial_mode: str = 'normal',
-                 delta_plus: float = 2.0,
+                 delta_plus: float = 3.0,
                  delta_minus: float = 1.0):
         """
         Initialize simulation environment
@@ -89,7 +89,7 @@ class SimulationEnvironment:
                 MILP cost-benefit objective. Higher values push adversarial robots to report
                 persistent FP objects more readily/more often. Only affects 'optimized'/'deceptive'
                 modes (see AdversarialRobot._estimate_objective_change in robot_types.py). Default
-                2.0 keeps contested FP objects (ones a legitimate neighbor could contradict) from
+                3.0 keeps contested FP objects (ones a legitimate neighbor could contradict) from
                 saturating to "always reported" - empirically, values >=5.0 make FP reporting
                 unconditional regardless of contradicting neighbors, while 1.4-2.0 leaves a real
                 mixed strategy (~50-60% contested-FP report rate, non-trivial GT suppression).
