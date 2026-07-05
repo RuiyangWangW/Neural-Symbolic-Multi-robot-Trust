@@ -7,6 +7,8 @@ This benchmark combines all test scenarios into a single configurable system:
 - Higher adversarial ratio (0.4-0.5)
 - Higher false positive rate (0.4-0.5)
 - Higher false negative rate (0.4-0.5)
+- In-sample parameter ranges, but with FP codetection disabled (adversarial robots
+  cannot corroborate each other's persistent FP objects)
 
 Robot modes:
 - Legitimate: realistic (natural sensor noise)
@@ -44,6 +46,7 @@ class BenchmarkConfig:
     adversarial_fn_suppression_rate_range: Tuple[float, float]
     sensor_fp_rate: float = 0.05  # Sensor FP rate (transient)
     sensor_fn_rate: float = 0.05  # Sensor FN rate (transient)
+    allow_fp_codetection: bool = True  # Whether adversarial robots may co-detect each other's FPs
     description: str = ""
 
 
@@ -92,6 +95,19 @@ BENCHMARK_CONFIGS = {
         sensor_fp_rate=0.05,
         sensor_fn_rate=0.05,
         description="Higher adversarial FN suppression rate (0.4-0.5)"
+    ),
+    "in_sample_no_fp_codetection": BenchmarkConfig(
+        name="in_sample_no_fp_codetection",
+        robot_density_range=(0.0005, 0.0020),
+        target_density_multiplier=2.0,
+        adversarial_ratio_range=(0.1, 0.3),
+        adversarial_fp_injection_rate_range=(0.1, 0.3),
+        adversarial_fn_suppression_rate_range=(0.0, 0.3),
+        sensor_fp_rate=0.05,
+        sensor_fn_rate=0.05,
+        allow_fp_codetection=False,  # Adversarial robots cannot co-detect each other's FPs
+        description="In-sample (training distribution) parameter ranges, but adversarial "
+                     "robots cannot corroborate each other's persistent FP objects"
     ),
 }
 
@@ -178,6 +194,7 @@ def sample_scenario_parameters(
         "adversarial_fn_suppression_rate": adversarial_fn_suppression_rate,
         "sensor_fp_rate": config.sensor_fp_rate,
         "sensor_fn_rate": config.sensor_fn_rate,
+        "allow_fp_codetection": config.allow_fp_codetection,
         "random_seed": simulation_seed,
         "legitimate_mode": LEGITIMATE_MODE,
         "adversarial_mode": ADVERSARIAL_MODE,
@@ -211,7 +228,7 @@ def run_scenario(
         fov_range=FOV_RANGE,
         fov_angle=FOV_ANGLE,
         proximal_range=PROXIMAL_RANGE,
-        allow_fp_codetection=True,  # Allow adversarial robots to co-detect FPs
+        allow_fp_codetection=scenario.get("allow_fp_codetection", True),
         legitimate_mode=scenario.get("legitimate_mode", LEGITIMATE_MODE),
         adversarial_mode=scenario.get("adversarial_mode", ADVERSARIAL_MODE),
     )
@@ -258,6 +275,7 @@ def run_benchmark(
     print(f"  Adversarial FP injection rate: {config.adversarial_fp_injection_rate_range} (persistent)")
     print(f"  Adversarial FN suppression rate: {config.adversarial_fn_suppression_rate_range} (transient)")
     print(f"  Sensor FP/FN rates: {config.sensor_fp_rate}/{config.sensor_fn_rate} (transient)")
+    print(f"  Allow FP codetection: {config.allow_fp_codetection}")
     print(f"Running {num_scenarios} scenarios...")
     print(f"{'=' * 80}\n")
 
@@ -333,6 +351,7 @@ def save_results(
                 "adversarial_fn_suppression_rate": config.adversarial_fn_suppression_rate_range,
                 "sensor_fp_rate": config.sensor_fp_rate,
                 "sensor_fn_rate": config.sensor_fn_rate,
+                "allow_fp_codetection": config.allow_fp_codetection,
             },
             "simulation_constants": {
                 "world_size": WORLD_SIZE,

@@ -374,12 +374,16 @@ class AdversarialRobot(Robot):
             return self._generate_normal_adversarial_detections(
                 ground_truth_objects, time, noise_std, assigned_fp_objects, world_size
             )
-        elif self.mode == 'optimized':
+        elif self.mode in ('optimized', 'deceptive'):
+            # 'deceptive' uses the exact same detection/reporting policy as 'optimized' -
+            # it only differs at evaluation time via compute_object_metrics_with_adversarial_lies,
+            # which substitutes a fresh lie for track trust when aggregating object metrics.
+            # It must NOT manipulate track.trust_alpha/trust_beta here: those live values feed
+            # directly into paper_trust_algorithm.py's agent-trust PSM (ego_track.trust_alpha/beta),
+            # so a simulation-time lie would corrupt every trust method's live computation, not
+            # just the object-metrics evaluation - making 'deceptive' behave differently from
+            # 'optimized' well beyond the intended "lies only at object-metrics time" scope.
             return self._generate_optimized_adversarial_detections(
-                ground_truth_objects, time, noise_std, world_size, neighbor_robots
-            )
-        elif self.mode == 'deceptive':
-            return self._generate_deceptive_adversarial_detections(
                 ground_truth_objects, time, noise_std, world_size, neighbor_robots
             )
         else:
@@ -713,67 +717,6 @@ class AdversarialRobot(Robot):
 
         # Return list of reported tracks
         return list(self.reported_tracks.values())
-
-    def _generate_deceptive_adversarial_detections(self,
-                                                  ground_truth_objects: List,
-                                                  time: float,
-                                                  noise_std: float,
-                                                  world_size: Tuple[float, float],
-                                                  neighbor_robots: Optional[List[Robot]]) -> List[Track]:
-        """
-        Deceptive adversarial mode: Optimized attacks + trust/confidence manipulation.
-
-        This mode extends optimized attacks by also manipulating the trust/confidence
-        values associated with local tracks to deceive the trust inference system.
-
-        Adversarial track lies strategy (matching compute_object_metrics_with_adversarial_lies):
-        - GT objects: lie low (random uniform 0.0 to 0.2)
-        - FP objects: lie high (random uniform 0.8 to 1.0)
-
-        This affects the weighted averaging calculation: sum(robot_trust * track_trust) / sum(robot_trust)
-        """
-        # First, generate tracks using optimized strategy
-        tracks = self._generate_optimized_adversarial_detections(
-            ground_truth_objects, time, noise_std, world_size, neighbor_robots
-        )
-
-        # Then, manipulate trust/confidence values to deceive the system
-        for track in tracks:
-            # Convert trust value to Beta distribution parameters that produce desired mean
-            # For a Beta(alpha, beta), mean = alpha / (alpha + beta)
-
-            # Match the FP/GT prefix classification used by the canonical reference
-            # implementation (comprehensive_trust_benchmark.py's
-            # compute_object_metrics_with_adversarial_lies): FP-like objects include
-            # persistent adversarial FPs (fp_obj_/fp_/adv_fp_) AND transient sensor FPs
-            # (sensor_fp_) - both are false detections that should be reported as
-            # credible under this deception strategy, not just the adversarially-injected
-            # ones.
-            is_fp_like = (track.object_id.startswith('fp_obj_') or
-                          track.object_id.startswith('fp_') or
-                          track.object_id.startswith('adv_fp_') or
-                          track.object_id.startswith('sensor_fp_'))
-
-            if is_fp_like:
-                # False positive: lie high (0.8 to 1.0)
-                # This makes FP objects appear highly credible
-                target_trust = random.uniform(0.8, 1.0)
-                # Use Beta parameters that give high trust
-                track.trust_alpha = target_trust * 10  # e.g., 8.0 to 10.0
-                track.trust_beta = (1.0 - target_trust) * 10  # e.g., 0.0 to 2.0
-            elif track.object_id.startswith('gt_'):
-                # Real object (GT): lie low (0.0 to 0.2)
-                # This makes GT objects appear less credible
-                target_trust = random.uniform(0.0, 0.2)
-                # Use Beta parameters that give low trust
-                track.trust_alpha = target_trust * 10  # e.g., 0.0 to 2.0
-                track.trust_beta = (1.0 - target_trust) * 10  # e.g., 8.0 to 10.0
-            else:
-                # Other objects: maintain normal confidence
-                track.trust_alpha = 1.0
-                track.trust_beta = 1.0
-
-        return tracks
 
     def _is_position_in_fov(self,
                            position: np.ndarray,

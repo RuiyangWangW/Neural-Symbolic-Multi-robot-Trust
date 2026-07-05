@@ -2,14 +2,20 @@
 """
 Deceptive Policy Benchmark System for Multi-Robot Trust Methods
 
-This benchmark tests trust methods against DECEPTIVE adversarial mode
-(see AdversarialRobot._generate_deceptive_adversarial_detections in robot_types.py):
-- Runs the same MILP-based per-object report/ignore policy as optimized mode
-  (see optimized_policy_benchmark.py for details)
-- PLUS trust/confidence manipulation to deceive the trust inference system:
-  - GT objects: lie low trust (0.0-0.2) to make them seem less credible
-  - FP-like objects (persistent adversarial FP or transient sensor FP): lie high
-    trust (0.8-1.0) to make them seem more credible
+This benchmark tests trust methods against DECEPTIVE adversarial mode. 'deceptive'
+runs the exact same MILP-based per-object report/ignore policy as 'optimized' mode
+(see AdversarialRobot.generate_detections in robot_types.py - 'optimized' and
+'deceptive' share the same code path) - it does NOT manipulate simulated track
+trust/confidence values, since that would leak into every trust method's live
+agent-trust computation (e.g. paper_trust_algorithm.py reads a robot's own reported
+track trust as PSM evidence), making 'deceptive' diverge from 'optimized' far beyond
+the intended scope.
+
+Instead, 'deceptive' is evaluated with adversarial_lie=True (see evaluate_methods in
+comprehensive_trust_benchmark.py / compute_object_metrics_with_adversarial_lies):
+purely at object-metrics time, each adversarial robot's track trust is substituted
+with a fresh lie before aggregation - GT objects lied low (0.0-0.2), FP-like objects
+lied high (0.8-1.0) - without affecting the simulated robots' actual trust state.
 
 Test scenarios:
 - In-sample (training distribution)
@@ -18,7 +24,8 @@ Test scenarios:
 
 Robot modes:
 - Legitimate: realistic (natural sensor noise)
-- Adversarial: deceptive (MILP-based report/ignore policy + trust manipulation)
+- Adversarial: deceptive (MILP-based report/ignore policy, same as optimized;
+  lies only applied at object-metrics evaluation time)
 """
 
 import argparse
