@@ -467,7 +467,12 @@ def evaluate_methods(results: Dict, threshold: float, adversarial_lie: bool = Fa
             continue
         final_step = method_results[-1]
         robot_metrics, robot_stats = compute_robot_metrics(final_step, threshold)  # Use robot threshold
-        if adversarial_lie:
+        # Baseline never filters robots by trust (everyone stays at the neutral 0.5 prior), so
+        # it has no notion of "trusted vs untrusted reporter" for the lie to corrupt selectively -
+        # every adversarial robot's report is already taken at face value. Applying the lie here
+        # doesn't test anything about baseline's (nonexistent) trust defense, it just replaces
+        # real track trust with noise, so baseline always uses the unmanipulated object metrics.
+        if adversarial_lie and method_key != "baseline":
             object_metrics, object_stats = compute_object_metrics_with_adversarial_lies(final_step, object_threshold)  # Use object threshold
         else:
             object_metrics, object_stats = compute_object_metrics(final_step, object_threshold)  # Use object threshold
