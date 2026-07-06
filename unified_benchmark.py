@@ -440,7 +440,7 @@ def main():
         "--threshold",
         type=float,
         default=0.3,
-        help="Trust threshold for binary classification (default: 0.5, consistent across all benchmarks)"
+        help="Trust threshold for binary classification (default: 0.3, consistent across all benchmarks)"
     )
 
     # Adversarial behavior
