@@ -412,8 +412,8 @@ def main():
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.5,
-        help="Trust threshold for binary classification (default: 0.5, consistent across all benchmarks)"
+        default=0.3,
+        help="Trust threshold for binary classification (default: 0.3, consistent across all benchmarks)"
     )
 
     # Adversarial behavior

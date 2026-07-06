@@ -229,7 +229,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.5,
+        default=0.3,
         help="Trust threshold used to convert trust values into binary labels.",
     )
     return parser.parse_args()
