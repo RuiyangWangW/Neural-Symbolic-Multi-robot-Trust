@@ -533,8 +533,13 @@ class TrustMethodComparison:
                 'all_fp_object_ids': sorted(ever_observed_fp_ids),
             }
 
-            # Collect track trust values
-            # BASELINE FIX: Use reported_tracks since no trust updates means all_tracks is empty
+            # Collect track trust values from all_tracks (every object this robot has ever
+            # reported across the whole episode so far, at its neutral/no-trust-update
+            # value - see register_reported_tracks_in_all_tracks in
+            # simulation_environment.py's generate_detections). Using all_tracks instead of
+            # just this step's reported_tracks means object-level recall isn't penalized for
+            # an object that was genuinely detected earlier but happens to be out of every
+            # robot's FoV at this exact step.
             for robot in env.robots:
                 step_result['track_trust_values'][robot.id] = {
                     track.track_id: {
@@ -543,7 +548,7 @@ class TrustMethodComparison:
                         'beta': track.trust_beta,
                         'object_id': track.object_id
                     }
-                    for track in robot.get_reported_tracks_list()
+                    for track in robot.get_all_tracks()
                 }
 
             # Store per-frame robot state and detections

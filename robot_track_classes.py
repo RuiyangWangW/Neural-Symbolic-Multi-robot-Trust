@@ -785,6 +785,32 @@ class Robot:
 
                 self.all_tracks[object_id] = new_track
 
+    def register_reported_tracks_in_all_tracks(self):
+        """
+        Ensure every currently-reported track has a corresponding all_tracks entry, even if
+        no trust algorithm ever runs an update on it (e.g. the no-trust baseline). Without
+        this, all_tracks stays completely empty whenever update_trust is never called, so
+        anything computed from all_tracks (e.g. "every object this robot has ever reported,
+        across the whole episode" for object-level recall) would see nothing - even though
+        the robot did genuinely report the object at some point.
+
+        Only creates a NEW entry (at the neutral prior) for object_ids not already in
+        all_tracks; existing entries are left untouched so this never clobbers real trust
+        updates already applied by a trust algorithm.
+        """
+        for object_id, track in self.reported_tracks.items():
+            if object_id not in self.all_tracks:
+                self.all_tracks[object_id] = Track(
+                    track_id=track.track_id,
+                    robot_id=self.id,
+                    object_id=object_id,
+                    position=track.position.copy(),
+                    velocity=track.velocity.copy(),
+                    trust_alpha=track.trust_alpha,
+                    trust_beta=track.trust_beta,
+                    timestamp=track.timestamp
+                )
+
     def clear_timestep_specific_tracks(self):
         """
         Clear timestep-specific track dictionaries at the start of a new timestep.

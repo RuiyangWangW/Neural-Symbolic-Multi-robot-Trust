@@ -590,7 +590,7 @@ class SimulationEnvironment:
             else:
                 assigned_fps = [fp for fp in self.shared_fp_objects
                               if self.fp_object_assignments.get(fp.id) == robot.id]
-            return robot.generate_detections(
+            tracks = robot.generate_detections(
                 ground_truth_objects=self.ground_truth_objects,
                 time=self.time,
                 noise_std=noise_std,
@@ -600,12 +600,20 @@ class SimulationEnvironment:
             )
         else:
             # Legitimate robot: no FP objects needed
-            return robot.generate_detections(
+            tracks = robot.generate_detections(
                 ground_truth_objects=self.ground_truth_objects,
                 time=self.time,
                 noise_std=noise_std,
                 world_size=self.world_size
             )
+
+        # Ensure every reported object_id has an all_tracks entry, independent of whether
+        # any trust algorithm runs an update on it this step (e.g. the no-trust baseline
+        # never calls update_trust at all, so without this all_tracks would stay empty for
+        # the whole episode - see register_reported_tracks_in_all_tracks docstring).
+        robot.register_reported_tracks_in_all_tracks()
+
+        return tracks
 
     # Legacy detection functions removed - detection is now handled by robot-specific methods
     # See robot.generate_detections() in robot_types.py for current implementation
