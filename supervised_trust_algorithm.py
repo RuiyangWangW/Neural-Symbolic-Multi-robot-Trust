@@ -250,9 +250,14 @@ class SupervisedTrustAlgorithm:
                     # Each robot manages its own tracks independently
                     ego_robot = graph_data._proximal_robots[0]
 
-                    # Only forward the update if ego robot is actually reporting this
-                    # object (i.e. it's one of ego's own tracks, fused or not)
-                    if object_id in ego_robot.get_reported_object_ids():
+                    # Forward the update if ego robot is either currently reporting this
+                    # object, OR has detected it before (missed-detection case: ego saw
+                    # this object at some point but isn't reporting it this timestep even
+                    # though a proximal robot currently corroborates it - see
+                    # _identify_meaningful_tracks criterion 1b). Both cases have a real
+                    # all_tracks entry to update; anything else was never a track ego owns.
+                    if (object_id in ego_robot.get_reported_object_ids()
+                            or object_id in ego_robot.all_tracks):
                         # Forward trust update to all_tracks (persistent storage)
                         ego_robot.forward_trust_update_to_all_tracks(
                             object_id=object_id,

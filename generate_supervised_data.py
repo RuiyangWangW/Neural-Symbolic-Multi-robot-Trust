@@ -285,11 +285,28 @@ class SupervisedDataGenerator:
         """
         Identify meaningful tracks for loss computation.
 
-        A track is meaningful if:
-        1. It's currently reported by ego robot (in get_reported_tracks_list())
-        2. It has edges to at least one OTHER robot besides ego (cross-validation)
-           - Ego robot is always at index 0
-           - Track must have edges to >= 2 robots total (ego + at least 1 other)
+        A track is meaningful if ego robot (index 0) has SOME edge to it (either
+        in_fov_and_observed - ego reported it - or in_fov_only - it was in ego's FoV but
+        ego didn't report it) AND at least one OTHER (proximal) robot also has an edge to
+        it. This is a purely structural/graph-presence criterion - it does NOT require ego
+        to currently be reporting the object, only that ego is relevant to it (detected it,
+        or could plausibly have detected it since it was in ego's own FoV).
+
+        This intentionally includes the "missed detection" case: a track in ego's own FoV
+        that a proximal robot corroborates but ego itself did NOT report this timestep.
+        Training on these teaches the model that ego failing to report something it could
+        see, that a neighbor confirms, is negative evidence for ego's reliability -
+        mirroring what paper_trust_algorithm.py's negative PSM already penalizes. The
+        track's ground-truth label is unaffected either way (still reflects whether the
+        object is genuinely real).
+
+        NOTE: at INFERENCE time (supervised_trust_algorithm.py), a track being
+        "meaningful" here is necessary but not sufficient to actually apply a trust
+        update to ego's own all_tracks - that additionally requires ego to have a real
+        all_tracks entry for this object (i.e. ego has detected it at some point). A
+        track ego was only ever in-FoV of but never actually detected/reported has
+        nothing in all_tracks to update, even though it's still valid to train on (see
+        _update_trust_from_predictions).
 
         Args:
             ego_robot: The ego robot
@@ -297,14 +314,9 @@ class SupervisedDataGenerator:
             num_tracks: Total number of tracks in ego graph
 
         Returns:
-            List of track indices that meet both criteria
+            List of track indices that meet the cross-validation criterion
         """
         meaningful_indices = []
-
-        # NEW ARCHITECTURE: Get tracks currently reported by ego robot
-        ego_reported_tracks = ego_robot.get_reported_tracks_list()
-        # IMPORTANT: Match by object_id, not track_id, because track fusion changes track_id
-        ego_object_ids = set(track.object_id for track in ego_reported_tracks)
 
         # Get fused and individual tracks from ego graph (in same order as track nodes)
         if hasattr(ego_graph, '_fused_tracks') and hasattr(ego_graph, '_individual_tracks'):
@@ -313,31 +325,25 @@ class SupervisedDataGenerator:
             # Fallback: can't identify tracks without stored track list
             return []
 
-        # Check each track for both criteria
         for track_idx, track in enumerate(all_tracks[:num_tracks]):
-            # Criterion 1: Is this track currently detected by ego robot?
-            # Match by object_id (not track_id) since fusion changes track_id
-            if track.object_id not in ego_object_ids:
-                continue
-
-            # Criterion 2: Does this track have edges to at least one OTHER robot?
-            # Count total robots with edges - should be >= 2 (ego + at least 1 other)
-            num_robots_with_edges = self._count_robots_with_edges_to_track(ego_graph, track_idx)
-            if num_robots_with_edges >= 2:
+            robots_with_edges = self._get_robots_with_edges_to_track(ego_graph, track_idx)
+            # Ego robot is always at index 0 - must be one of the robots with an edge,
+            # AND at least one other (non-ego) robot must also have an edge
+            if 0 in robots_with_edges and len(robots_with_edges) >= 2:
                 meaningful_indices.append(track_idx)
 
         return meaningful_indices
 
-    def _count_robots_with_edges_to_track(self, ego_graph: HeteroData, track_idx: int) -> int:
+    def _get_robots_with_edges_to_track(self, ego_graph: HeteroData, track_idx: int) -> set:
         """
-        Count how many robots have edges to a specific track.
+        Get the set of robot indices that have edges to a specific track.
 
         Args:
             ego_graph: Ego graph with edge_index_dict
             track_idx: Index of the track node
 
         Returns:
-            Number of unique robots with edges to this track
+            Set of unique robot indices with edges to this track
         """
         edge_index_dict = ego_graph.edge_index_dict
         robots_with_edges = set()
@@ -357,7 +363,7 @@ class SupervisedDataGenerator:
                     agents_to_this_track = edges[0][edges[1] == track_idx]
                     robots_with_edges.update(agents_to_this_track.tolist())
 
-        return len(robots_with_edges)
+        return robots_with_edges
 
     def _extract_triplets_for_storage(self, node_type: str, num_nodes: int, edge_index_dict: Dict):
         """
