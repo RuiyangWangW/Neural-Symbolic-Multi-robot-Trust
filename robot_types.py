@@ -255,8 +255,8 @@ class AdversarialRobot(Robot):
                  adversarial_fn_suppression_rate: float = 0.0,
                  sensor_fp_rate: float = 0.05,
                  sensor_fn_rate: float = 0.05,
-                 delta_plus: float = 2.0,
-                 delta_minus: float = 1.0):
+                 delta_plus: float = 3.0,
+                 delta_minus: float = 3.0):
         """
         Initialize an adversarial robot.
 
@@ -276,13 +276,14 @@ class AdversarialRobot(Robot):
                 how much reporting a persistent FP object is worth (FP gain) relative to its
                 contradiction cost. Higher values make the policy report FPs more readily/more
                 often, even with fewer supporting neighbors. Only used by 'optimized' and
-                'deceptive' modes (see _estimate_objective_change). Default 2.0 keeps contested
-                FP objects (ones a legitimate neighbor could contradict) from saturating to
-                "always reported" - values >=5.0 make FP reporting unconditional regardless of
-                contradicting neighbors, while 1.4-2.0 leaves a real mixed strategy.
+                'deceptive' modes (see _estimate_objective_change). Values >=5.0 make FP
+                reporting unconditional regardless of contradicting neighbors ("aggressive"),
+                while 1.0-2.0 leaves a real mixed strategy ("conservative"/"moderate") - see
+                optimized_policy_benchmark.py's delta sweep scenarios. Default 3.0 matches
+                the training distribution used by generate_supervised_data.py.
             delta_minus: Dilution factor in the same objective - scales how much suppressing a
                 GT object is worth (GT-suppression gain). Only used by 'optimized' and
-                'deceptive' modes.
+                'deceptive' modes. Default 3.0 matches the training distribution.
         """
         super().__init__(robot_id, position, velocity, fov_range=fov_range, fov_angle=fov_angle)
 

@@ -129,6 +129,8 @@ class TrustMethodComparison:
         self.allow_fp_codetection = allow_fp_codetection  # Can be set to True for FP codetection experiments
         self.legitimate_mode = legitimate_mode
         self.adversarial_mode = adversarial_mode
+        self.delta_plus = 3.0  # Corroboration factor (FP-gain coefficient), 'optimized'/'deceptive' modes only
+        self.delta_minus = 3.0  # Dilution factor (GT-suppression coefficient), 'optimized'/'deceptive' modes only
 
         # Try to load supervised model after proximal_range is set
         try:
@@ -174,7 +176,9 @@ class TrustMethodComparison:
                 sensor_fn_rate=self.sensor_fn_rate,
                 allow_fp_codetection=self.allow_fp_codetection,
                 legitimate_mode=self.legitimate_mode,
-                adversarial_mode=self.adversarial_mode
+                adversarial_mode=self.adversarial_mode,
+                delta_plus=self.delta_plus,
+                delta_minus=self.delta_minus
             )
             envs.append(env)
         return envs

@@ -5,16 +5,25 @@ Optimized Policy Benchmark System for Multi-Robot Trust Methods
 This benchmark tests trust methods against OPTIMIZED adversarial mode
 (see AdversarialRobot._generate_optimized_adversarial_detections in robot_types.py):
 - Per-timestep binary report/ignore decision for every FP-in-FoV and sensed object,
-  solved as a MILP that maximizes J_adv = alpha * (FP trust gain) - beta * (GT trust loss)
+  solved as a MILP that maximizes J_adv = delta_plus * (FP trust gain) - delta_minus *
+  (GT trust loss)
 - FP trust gain/GT trust loss are driven by corroborating vs. contradicting proximal
   neighbors (via last_reported_tracks from the previous timestep)
 - A single linear constraint caps the number of adversarial operations per timestep
   (FP reports + GT suppressions <= max_adversarial_operations)
 
-Test scenarios:
-- In-sample (training distribution)
-- Higher adversarial ratio (0.4-0.5)
-- Higher FP injection (0.4-0.5) - more persistent false hypotheses
+Test scenarios sweep delta_plus/delta_minus (both set equal, per scenario) instead of
+FP injection rate - empirically, delta_plus is what actually controls whether the
+adversarial policy exhibits a real mixed report/suppress strategy (delta=1-2) or
+saturates to reporting/suppressing every eligible object regardless of contradicting
+neighbors (delta>=5, see the delta sweep investigation). Training uses delta_plus=
+delta_minus=3.0 (see generate_supervised_data.py), so "aggressive" here matches the
+training distribution and "conservative"/"moderate" are out-of-distribution in the
+"less saturated" direction:
+- conservative: in-sample parameter ranges, delta_plus=delta_minus=1.0
+- moderate: in-sample parameter ranges, delta_plus=delta_minus=2.0
+- aggressive: in-sample parameter ranges, delta_plus=delta_minus=3.0 (matches training)
+- higher_adv_ratio_aggressive: higher adversarial ratio (0.4-0.5), delta_plus=delta_minus=3.0
 
 Robot modes:
 - Legitimate: realistic (natural sensor noise)
@@ -49,42 +58,63 @@ class BenchmarkConfig:
     target_density_multiplier: float
     adversarial_ratio_range: Tuple[float, float]
     adversarial_fp_injection_rate_range: Tuple[float, float]
+    delta_plus: float  # MILP FP-gain coefficient (see module docstring)
+    delta_minus: float  # MILP GT-suppression coefficient (see module docstring)
     sensor_fp_rate: float = 0.05  # Sensor FP rate (transient)
     sensor_fn_rate: float = 0.05  # Sensor FN rate (transient)
     description: str = ""
 
 
-# Define all benchmark types
+# Define all benchmark types - a delta_plus/delta_minus sweep at in-sample parameter
+# ranges, plus one higher-adversarial-ratio scenario at the training-matched delta (3.0)
 BENCHMARK_CONFIGS = {
-    "in_sample": BenchmarkConfig(
-        name="in_sample",
+    "conservative": BenchmarkConfig(
+        name="conservative",
         robot_density_range=(0.0005, 0.0020),
         target_density_multiplier=2.0,
         adversarial_ratio_range=(0.1, 0.3),
         adversarial_fp_injection_rate_range=(0.1, 0.3),
+        delta_plus=1.0,
+        delta_minus=1.0,
         sensor_fp_rate=0.05,
         sensor_fn_rate=0.05,
-        description="In-sample (training distribution) - Optimized policy"
+        description="In-sample parameter ranges, delta_plus=delta_minus=1.0 - Optimized policy"
     ),
-    "higher_adv_ratio": BenchmarkConfig(
-        name="higher_adv_ratio",
+    "moderate": BenchmarkConfig(
+        name="moderate",
+        robot_density_range=(0.0005, 0.0020),
+        target_density_multiplier=2.0,
+        adversarial_ratio_range=(0.1, 0.3),
+        adversarial_fp_injection_rate_range=(0.1, 0.3),
+        delta_plus=2.0,
+        delta_minus=2.0,
+        sensor_fp_rate=0.05,
+        sensor_fn_rate=0.05,
+        description="In-sample parameter ranges, delta_plus=delta_minus=2.0 - Optimized policy"
+    ),
+    "aggressive": BenchmarkConfig(
+        name="aggressive",
+        robot_density_range=(0.0005, 0.0020),
+        target_density_multiplier=2.0,
+        adversarial_ratio_range=(0.1, 0.3),
+        adversarial_fp_injection_rate_range=(0.1, 0.3),
+        delta_plus=3.0,
+        delta_minus=3.0,
+        sensor_fp_rate=0.05,
+        sensor_fn_rate=0.05,
+        description="In-sample parameter ranges, delta_plus=delta_minus=3.0 (matches training) - Optimized policy"
+    ),
+    "higher_adv_ratio_aggressive": BenchmarkConfig(
+        name="higher_adv_ratio_aggressive",
         robot_density_range=(0.0005, 0.0020),
         target_density_multiplier=2.0,
         adversarial_ratio_range=(0.4, 0.5),  # HIGHER
         adversarial_fp_injection_rate_range=(0.1, 0.3),
+        delta_plus=3.0,
+        delta_minus=3.0,
         sensor_fp_rate=0.05,
         sensor_fn_rate=0.05,
-        description="Higher adversarial ratio (0.4-0.5) - Optimized policy"
-    ),
-    "higher_fp_injection": BenchmarkConfig(
-        name="higher_fp_injection",
-        robot_density_range=(0.0005, 0.0020),
-        target_density_multiplier=2.0,
-        adversarial_ratio_range=(0.1, 0.3),
-        adversarial_fp_injection_rate_range=(0.4, 0.5),  # HIGHER (more persistent FP hypotheses)
-        sensor_fp_rate=0.05,
-        sensor_fn_rate=0.05,
-        description="Higher adversarial FP injection rate (0.4-0.5) - Optimized policy"
+        description="Higher adversarial ratio (0.4-0.5), delta_plus=delta_minus=3.0 - Optimized policy"
     ),
 }
 
@@ -166,6 +196,8 @@ def sample_scenario_parameters(
         "adversarial_ratio": adversarial_ratio,
         "adversarial_fp_injection_rate": adversarial_fp_injection_rate,
         "adversarial_fn_suppression_rate": 0.0,  # Not used in optimized mode (policy-based instead)
+        "delta_plus": config.delta_plus,
+        "delta_minus": config.delta_minus,
         "sensor_fp_rate": config.sensor_fp_rate,
         "sensor_fn_rate": config.sensor_fn_rate,
         "random_seed": simulation_seed,
@@ -210,9 +242,8 @@ def run_scenario(
     comparison.adversarial_fn_suppression_rate = scenario["adversarial_fn_suppression_rate"]
     comparison.sensor_fp_rate = scenario["sensor_fp_rate"]
     comparison.sensor_fn_rate = scenario["sensor_fn_rate"]
-
-    # Note: eta_f and eta_r are no longer used (legacy parameters)
-    # Optimized mode now uses objective-driven policy
+    comparison.delta_plus = scenario["delta_plus"]
+    comparison.delta_minus = scenario["delta_minus"]
 
     results = comparison.run_comparison()
     evaluation = evaluate_methods(results, threshold=threshold, adversarial_lie=adversarial_lie, object_threshold=threshold)
@@ -250,6 +281,7 @@ def run_benchmark(
     print(f"  Adversarial ratio: {config.adversarial_ratio_range}")
     print(f"  Adversarial FP injection rate: {config.adversarial_fp_injection_rate_range} (persistent)")
     print(f"  Sensor FP/FN rates: {config.sensor_fp_rate}/{config.sensor_fn_rate} (transient)")
+    print(f"  delta_plus/delta_minus: {config.delta_plus}/{config.delta_minus}")
     print(f"Running {num_scenarios} scenarios...")
     print(f"{'=' * 80}\n")
 
@@ -325,6 +357,8 @@ def save_results(
                 "adversarial_fp_injection_rate": config.adversarial_fp_injection_rate_range,
                 "sensor_fp_rate": config.sensor_fp_rate,
                 "sensor_fn_rate": config.sensor_fn_rate,
+                "delta_plus": config.delta_plus,
+                "delta_minus": config.delta_minus,
             },
             "simulation_constants": {
                 "world_size": WORLD_SIZE,
