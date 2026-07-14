@@ -63,17 +63,6 @@ BENCHMARK_CONFIGS = {
         sensor_fn_rate=0.05,  # Transient sensor FNs
         description="In-sample (training distribution)"
     ),
-    "higher_adv_ratio": BenchmarkConfig(
-        name="higher_adv_ratio",
-        robot_density_range=(0.0005, 0.0020),
-        target_density_multiplier=2.0,
-        adversarial_ratio_range=(0.4, 0.5),  # HIGHER
-        adversarial_fp_injection_rate_range=(0.1, 0.3),
-        adversarial_fn_suppression_rate_range=(0.0, 0.3),
-        sensor_fp_rate=0.05,
-        sensor_fn_rate=0.05,
-        description="Higher adversarial ratio (0.4-0.5)"
-    ),
     "higher_fp_injection": BenchmarkConfig(
         name="higher_fp_injection",
         robot_density_range=(0.0005, 0.0020),
@@ -95,19 +84,6 @@ BENCHMARK_CONFIGS = {
         sensor_fp_rate=0.05,
         sensor_fn_rate=0.05,
         description="Higher adversarial FN suppression rate (0.4-0.5)"
-    ),
-    "in_sample_no_fp_codetection": BenchmarkConfig(
-        name="in_sample_no_fp_codetection",
-        robot_density_range=(0.0005, 0.0020),
-        target_density_multiplier=2.0,
-        adversarial_ratio_range=(0.1, 0.3),
-        adversarial_fp_injection_rate_range=(0.1, 0.3),
-        adversarial_fn_suppression_rate_range=(0.0, 0.3),
-        sensor_fp_rate=0.05,
-        sensor_fn_rate=0.05,
-        allow_fp_codetection=False,  # Adversarial robots cannot co-detect each other's FPs
-        description="In-sample (training distribution) parameter ranges, but adversarial "
-                     "robots cannot corroborate each other's persistent FP objects"
     ),
 }
 
