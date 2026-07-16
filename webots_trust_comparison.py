@@ -15,6 +15,7 @@ Features:
 - Reports robot precision/recall and object precision/recall
 """
 
+import argparse
 import numpy as np
 import random
 import json
@@ -135,12 +136,20 @@ class WebotsTrustComparison:
 
         return scenarios
 
-    def run_all_scenarios(self):
-        """Run all scenarios and compare trust methods"""
+    def run_all_scenarios(self, output_dir: str = "benchmark_results", output_name: str = "webots"):
+        """Run all scenarios and compare trust methods.
+
+        Args:
+            output_dir: Directory to save results (default: benchmark_results/, matching
+                the other benchmark scripts' default so analyze_benchmark_results.py's
+                default search path picks this up automatically)
+            output_name: Base filename, produces <output_dir>/<output_name>_detailed.json
+        """
         # First, load base environment to get robot names (more efficient than full trust environment)
         from webots_simulation_environment import WebotsSimulationEnvironment
         temp_env = WebotsSimulationEnvironment(webots_data_path=self.webots_data_path)
         robot_names = list(temp_env.robot_data.keys())
+        self.num_robots_total = len(robot_names)
 
         # Generate scenarios
         scenarios = self.generate_scenarios(robot_names)
@@ -162,7 +171,7 @@ class WebotsTrustComparison:
             self.results.append(result)
 
         # Save results
-        self.save_results()
+        self.save_results(output_dir=output_dir, name=output_name)
 
         # Print summary statistics
         self.print_summary_statistics()
@@ -356,110 +365,31 @@ class WebotsTrustComparison:
         """
         Calculate comprehensive performance metrics for a method.
 
-        Metrics:
-        - Trust separation metrics (legacy)
-        - Robot precision/recall
-        - Object precision/recall (with adversarial lies)
+        Returns the same {"robots": {...}, "objects": {...}} shape as
+        comprehensive_trust_benchmark.py's evaluate_methods, so results saved by this
+        script are directly readable by analyze_benchmark_results.py.
 
         Args:
             env: Environment
-            trust_history: List of trust scores over time
+            trust_history: List of trust scores over time (unused now that
+                compute_robot_metrics computes mean_legitimate_trust/mean_adversarial_trust
+                directly from final robot state; kept as a parameter for call-site
+                compatibility)
             adversarial_robots: List of adversarial robot names
 
         Returns:
-            Dictionary of metrics
+            Dictionary with 'robots' and 'objects' metric sub-dicts
         """
-        adversarial_set = set(adversarial_robots)
-        legitimate_robots = [name for name in env.robots.keys() if name not in adversarial_set]
-
-        # Final trust scores
-        final_trusts = trust_history[-1] if trust_history else {}
-
-        leg_trust_final = np.mean([final_trusts[r] for r in legitimate_robots])
-        adv_trust_final = np.mean([final_trusts[r] for r in adversarial_robots])
-        trust_separation = leg_trust_final - adv_trust_final
-
-        # Trust over time
-        leg_trust_over_time = []
-        adv_trust_over_time = []
-
-        for trust_scores in trust_history:
-            leg_mean = np.mean([trust_scores[r] for r in legitimate_robots])
-            adv_mean = np.mean([trust_scores[r] for r in adversarial_robots])
-
-            leg_trust_over_time.append(leg_mean)
-            adv_trust_over_time.append(adv_mean)
-
-        # Compute robot and object metrics
         robot_metrics = self.compute_robot_metrics(env, adversarial_robots, threshold=0.5)
         object_metrics = self.compute_object_metrics(env, threshold=0.5)
 
-        metrics = {
-            # Trust separation metrics (legacy)
-            'final_legitimate_trust': float(leg_trust_final),
-            'final_adversarial_trust': float(adv_trust_final),
-            'trust_separation': float(trust_separation),
-            'legitimate_trust_history': leg_trust_over_time,
-            'adversarial_trust_history': adv_trust_over_time,
-
-            # Robot classification metrics (nested)
-            'robot_classification': {
-                'precision': robot_metrics['precision'],
-                'recall': robot_metrics['recall'],
-                'f1': robot_metrics['f1'],
-                'accuracy': robot_metrics['accuracy']
-            },
-
-            # Object classification metrics (nested)
-            'object_classification': {
-                'precision': object_metrics['precision'],
-                'recall': object_metrics['recall'],
-                'f1': object_metrics['f1'],
-                'accuracy': object_metrics['accuracy'],
-                'mean_true_object_trust': object_metrics['mean_true_object_trust'],
-                'mean_false_object_trust': object_metrics['mean_false_object_trust']
-            }
+        return {
+            'robots': robot_metrics,
+            'objects': object_metrics,
         }
-
-        return metrics
-
-    def format_evaluation_results(self) -> List[Dict]:
-        """Format results to match comprehensive_trust_benchmark structure"""
-        formatted_results = []
-
-        for result in self.results:
-            scenario = result['scenario']
-            methods_data = result['methods']
-
-            # Format metrics for each method
-            formatted_methods = {}
-            for method_name, metrics in methods_data.items():
-                formatted_methods[method_name] = {
-                    'robots': {
-                        'precision': metrics['robot_classification']['precision'],
-                        'recall': metrics['robot_classification']['recall'],
-                        'f1': metrics['robot_classification']['f1'],
-                        'accuracy': metrics['robot_classification']['accuracy']
-                    },
-                    'objects': {
-                        'precision': metrics['object_classification']['precision'],
-                        'recall': metrics['object_classification']['recall'],
-                        'f1': metrics['object_classification']['f1'],
-                        'accuracy': metrics['object_classification']['accuracy']
-                    }
-                }
-
-            formatted_results.append({
-                'name': f"webots_{scenario['id']:03d}",
-                'metrics': formatted_methods
-            })
-
-        return formatted_results
 
     def print_summary_statistics(self):
         """Print summary statistics matching in_sample_benchmark format"""
-        summary = self.format_evaluation_results()
-
         # Collect metrics for each method
         method_robot_precisions = {method: [] for method in METHOD_ORDER}
         method_robot_recalls = {method: [] for method in METHOD_ORDER}
@@ -468,15 +398,16 @@ class WebotsTrustComparison:
         method_object_recalls = {method: [] for method in METHOD_ORDER}
         method_object_accuracies = {method: [] for method in METHOD_ORDER}
 
-        for entry in summary:
+        for result in self.results:
+            methods_data = result['methods']
             for method in METHOD_ORDER:
-                if method in entry["metrics"]:
-                    robot_prec = entry["metrics"][method]["robots"].get("precision", 0.0)
-                    robot_rec = entry["metrics"][method]["robots"].get("recall", 0.0)
-                    robot_acc = entry["metrics"][method]["robots"].get("accuracy", 0.0)
-                    object_prec = entry["metrics"][method]["objects"].get("precision", 0.0)
-                    object_rec = entry["metrics"][method]["objects"].get("recall", 0.0)
-                    object_acc = entry["metrics"][method]["objects"].get("accuracy", 0.0)
+                if method in methods_data:
+                    robot_prec = methods_data[method]["robots"].get("precision", 0.0)
+                    robot_rec = methods_data[method]["robots"].get("recall", 0.0)
+                    robot_acc = methods_data[method]["robots"].get("accuracy", 0.0)
+                    object_prec = methods_data[method]["objects"].get("precision", 0.0)
+                    object_rec = methods_data[method]["objects"].get("recall", 0.0)
+                    object_acc = methods_data[method]["objects"].get("accuracy", 0.0)
                     method_robot_precisions[method].append(robot_prec)
                     method_robot_recalls[method].append(robot_rec)
                     method_robot_accuracies[method].append(robot_acc)
@@ -554,9 +485,20 @@ class WebotsTrustComparison:
                 print(f"{METHOD_DISPLAY_NAMES[method]:<25} {mean_acc:.4f}          {std_acc:.4f}          {len(accs)}")
 
 
-    def save_results(self, output_path: str = "webots_trust_comparison_results.json"):
-        """Save results to JSON file"""
-        output_file = Path(output_path)
+    def save_results(self, output_dir: str = "benchmark_results", name: str = "webots"):
+        """Save results in the same {"metadata": ..., "scenarios": [...]} _detailed.json
+        format used by unified_benchmark.py / optimized_policy_benchmark.py /
+        deceptive_policy_benchmark.py, so analyze_benchmark_results.py can read this
+        script's output directly (it discovers files via *_detailed.json glob and reads
+        scenario["parameters"]/scenario["evaluation"][method]["robots"/"objects"]).
+
+        Args:
+            output_dir: Directory to save results (default: benchmark_results/, matching
+                the other benchmark scripts' default)
+            name: Base filename, produces <output_dir>/<name>_detailed.json
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
 
         # Convert numpy types to Python types for JSON serialization
         def convert_to_serializable(obj):
@@ -572,26 +514,97 @@ class WebotsTrustComparison:
                 return [convert_to_serializable(item) for item in obj]
             return obj
 
-        serializable_results = convert_to_serializable(self.results)
+        scenarios = []
+        for i, result in enumerate(self.results):
+            scenario = result['scenario']
+            # extract_metrics_dataframe requires: name, robot_density, adversarial_ratio,
+            # random_seed (no fallback for these). Webots has no robot_density (fixed real
+            # robot count from the recording, not sampled) - report num robots instead so
+            # the field is at least present and informative.
+            parameters = {
+                "name": f"webots_{scenario['id']:03d}",
+                "benchmark_type": "webots",
+                # Webots has no sampled robot_density (fixed real robot count from the
+                # recording) - report the actual robot count instead so the field is at
+                # least present and informative for extract_metrics_dataframe.
+                "robot_density": self.num_robots_total,
+                "adversarial_ratio": self.num_adversarial / max(1, self.num_robots_total),
+                "adversarial_fp_injection_rate": scenario['fp_injection_rate'],
+                "adversarial_fn_suppression_rate": 0.0,  # Policy-driven (MILP), not a rate
+                "delta_plus": 3.0,
+                "delta_minus": 3.0,
+                "adversarial_robots": scenario['adversarial_robots'],
+                "random_seed": scenario['seed'],
+            }
+            scenarios.append({
+                "scenario_index": i,
+                "parameters": parameters,
+                "evaluation": result['methods'],
+            })
 
-        with open(output_file, 'w') as f:
-            json.dump(serializable_results, f, indent=2)
+        detailed_results = {
+            "metadata": {
+                "benchmark_type": "webots",
+                "adversarial_mode": "optimized",
+                "description": "Webots replay data - optimized aggressive policy (delta_plus=delta_minus=3.0)",
+                "num_scenarios": len(self.results),
+                "base_seed": self.random_seed,
+                "robot_modes": {
+                    "legitimate": "webots_replay",
+                    "adversarial": "optimized"
+                },
+                "adversarial_lie": False,
+                "parameter_ranges": {
+                    "num_adversarial": self.num_adversarial,
+                    "num_timesteps": self.num_timesteps,
+                    "delta_plus": 3.0,
+                    "delta_minus": 3.0,
+                },
+            },
+            "scenarios": scenarios,
+        }
 
-        print(f"\n✓ Results saved to: {output_file}")
+        detailed_path = output_path / f"{name}_detailed.json"
+        with open(detailed_path, 'w') as f:
+            json.dump(convert_to_serializable(detailed_results), f, indent=2)
+
+        print(f"\n✓ Results saved to: {detailed_path}")
 
 
 def main():
-    """Run comparison with default settings"""
+    parser = argparse.ArgumentParser(
+        description="Webots trust method comparison - optimized aggressive adversarial policy"
+    )
+    parser.add_argument("--webots-data-path", type=str, default="webots_sim_filtered_corrected",
+                        help="Path to filtered Webots data")
+    parser.add_argument("--supervised-model", type=str, default="supervised_trust_model.pth",
+                        help="Path to trained supervised GNN model")
+    parser.add_argument("--num-scenarios", type=int, default=10,
+                        help="Number of scenarios to test (default: 10)")
+    parser.add_argument("--num-adversarial", type=int, default=2,
+                        help="Number of adversarial robots per scenario (default: 2)")
+    parser.add_argument("--num-timesteps", type=int, default=100,
+                        help="Number of timesteps to simulate per scenario (default: 100)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Base random seed (default: 42)")
+    parser.add_argument("--output-dir", type=str, default="benchmark_results",
+                        help="Directory to save results (default: benchmark_results/, "
+                             "matching the other benchmark scripts so "
+                             "analyze_benchmark_results.py's default search picks it up)")
+    parser.add_argument("--output-name", type=str, default="webots",
+                        help="Base filename, produces <output-dir>/<output-name>_detailed.json")
+    args = parser.parse_args()
+
     comparison = WebotsTrustComparison(
-        webots_data_path="webots_sim_filtered_corrected",
-        supervised_model_path="supervised_trust_model.pth",
-        num_scenarios=10,
-        num_adversarial=2,
-        num_timesteps=100,
-        random_seed=42
+        webots_data_path=args.webots_data_path,
+        supervised_model_path=args.supervised_model,
+        num_scenarios=args.num_scenarios,
+        num_adversarial=args.num_adversarial,
+        num_timesteps=args.num_timesteps,
+        random_seed=args.seed
     )
 
-    comparison.run_all_scenarios()
+    comparison.run_all_scenarios(output_dir=args.output_dir, output_name=args.output_name)
 
 
 if __name__ == "__main__":
