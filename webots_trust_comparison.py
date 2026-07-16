@@ -2,12 +2,16 @@
 """
 Webots Trust Method Comparison: 10 Scenarios with Random Adversarial Assignments
 
-Compares Paper, Supervised, Bayesian, and Ego-Graph trust methods
-across 10 scenarios with randomly selected adversarial robots.
+Compares Paper, Supervised, Bayesian, and Baseline trust methods across scenarios with
+randomly selected adversarial robots, running on real Webots replay data via
+WebotsTrustEnvironment (synchronized with the main simulation pipeline's LegitimateRobot/
+AdversarialRobot architecture and reported_tracks/all_tracks track model).
 
 Features:
 - FP co-detection enabled by default
-- Adversarial robots lie about track trust values
+- Adversarial robots run the real optimized ("aggressive", delta_plus=delta_minus=3.0)
+  MILP policy - not a random FP/FN rate - for both persistent FP injection and GT
+  suppression decisions
 - Reports robot precision/recall and object precision/recall
 """
 
@@ -98,8 +102,11 @@ class WebotsTrustComparison:
 
         Each scenario has:
         - 2 randomly selected adversarial robots
-        - Random FP rate (0.1 to 0.3)
-        - Random FN rate (0.0 to 0.3)
+        - Random persistent FP injection rate (0.1 to 0.3)
+        - Adversarial robots run the real optimized policy (MILP-based report/suppress
+          decisions), not a random FP/FN rate - GT suppression is policy-driven via
+          delta_plus/delta_minus, matching optimized_policy_benchmark.py's "aggressive"
+          scenario (delta_plus=delta_minus=3.0)
 
         Args:
             robot_names: List of available robot names
@@ -114,15 +121,13 @@ class WebotsTrustComparison:
             # Randomly select adversarial robots
             adversarial_robots = random.sample(robot_names, self.num_adversarial)
 
-            # Random FP and FN rates
-            fp_rate = random.uniform(0.1, 0.3)
-            fn_rate = random.uniform(0.0, 0.3)
+            # Random persistent FP injection rate
+            fp_injection_rate = random.uniform(0.1, 0.3)
 
             scenario = {
                 'id': i,
                 'adversarial_robots': adversarial_robots,
-                'fp_rate': fp_rate,
-                'fn_rate': fn_rate,
+                'fp_injection_rate': fp_injection_rate,
                 'seed': self.random_seed + i  # Unique seed per scenario
             }
 
@@ -189,13 +194,14 @@ class WebotsTrustComparison:
 
         for method_name, algorithm in methods.items():
 
-            # Reset environment (with FP co-detection enabled)
+            # Reset environment (with FP co-detection enabled, optimized aggressive policy)
             env = WebotsTrustEnvironment(
                 webots_data_path=self.webots_data_path,
                 adversarial_robot_ids=scenario['adversarial_robots'],
-                false_positive_rate=scenario['fp_rate'],
-                false_negative_rate=scenario['fn_rate'],
+                adversarial_fp_injection_rate=scenario['fp_injection_rate'],
                 allow_fp_codetection=True,  # Enable FP co-detection by default
+                delta_plus=3.0,  # "aggressive" - matches training distribution
+                delta_minus=3.0,
                 random_seed=scenario['seed']
             )
 
@@ -261,39 +267,33 @@ class WebotsTrustComparison:
 
         return metrics
 
-    def compute_object_metrics_with_adversarial_lies(self, env: WebotsTrustEnvironment,
-                                                     adversarial_robots: List[str],
-                                                     threshold: float = 0.5) -> Dict[str, float]:
+    def compute_object_metrics(self, env: WebotsTrustEnvironment,
+                               threshold: float = 0.5) -> Dict[str, float]:
         """
-        Compute object-level precision/recall with ADVERSARIAL TRACK LIES.
-
-        Adversarial robots lie about track trust values:
-        - GT objects: lie low (random uniform 0.0 to 0.2)
-        - FP objects: lie high (random uniform 0.8 to 1.0)
+        Compute object-level precision/recall using each robot's real (unmanipulated)
+        track trust values - no adversarial lie substitution.
 
         Args:
             env: Environment with robot tracks
-            adversarial_robots: List of adversarial robot names
             threshold: Classification threshold
 
         Returns:
             Dictionary with object precision, recall, F1, accuracy
         """
-        adversarial_set = set(adversarial_robots)
-
         # Filter to believed-legitimate robots (trust >= threshold)
         legitimate_robots = {name for name, robot in env.robots.items()
                            if robot.trust_value >= threshold}
 
-        # Collect ALL objects (from all robots)
-        # Webots uses 'DEF:' for ground truth and 'FP:' for false positives
+        # Collect ALL objects ever reported by any robot (all_tracks, not just this
+        # step's reported_tracks - see register_reported_tracks_in_all_tracks). Webots
+        # ground truth gids use 'DEF:' (e.g. 'DEF:WoodenBox_1'); persistent adversarial FP
+        # objects use robot_types.py's 'fp_obj_{id}' convention, not 'FP:'.
         all_objects = set()
         for robot_name, robot in env.robots.items():
-            for track in robot.local_tracks.values():
-                if hasattr(track, 'object_id'):
-                    obj_id = track.object_id
-                    if obj_id.startswith('DEF:') or obj_id.startswith('FP:'):
-                        all_objects.add(obj_id)
+            for track in robot.get_all_tracks():
+                obj_id = track.object_id
+                if obj_id.startswith('DEF:') or obj_id.startswith('fp_obj_'):
+                    all_objects.add(obj_id)
 
         # Aggregate tracks by object_id from legitimate robots only
         object_weighted_trusts = {}  # object_id -> list of (robot_trust, track_trust)
@@ -303,25 +303,12 @@ class WebotsTrustComparison:
                 continue  # Skip robots with trust < threshold
 
             robot_trust = robot.trust_value
-            is_adversarial = robot_name in adversarial_set
 
-            for track in robot.local_tracks.values():
-                if not hasattr(track, 'object_id'):
-                    print("Warning: Track missing object_id attribute, skipping.")
-                    continue
-
+            for track in robot.get_all_tracks():
                 obj_id = track.object_id
                 track_trust = track.trust_value
 
-                # ADVERSARIAL TRACK LIES: Override track trust if robot is adversarial
-                # Webots uses 'DEF:' for ground truth and 'FP:' for false positives
-                if is_adversarial:
-                    if obj_id.startswith('DEF:'):  # Ground truth object
-                        track_trust = random.uniform(0.0, 0.2)
-                    elif obj_id.startswith('FP:'):  # False positive object
-                        track_trust = random.uniform(0.8, 1.0)
-
-                if obj_id.startswith('DEF:') or obj_id.startswith('FP:'):
+                if obj_id.startswith('DEF:') or obj_id.startswith('fp_obj_'):
                     if obj_id not in object_weighted_trusts:
                         object_weighted_trusts[obj_id] = []
                     object_weighted_trusts[obj_id].append((robot_trust, track_trust))
@@ -344,11 +331,12 @@ class WebotsTrustComparison:
                 # Object only seen by untrusted robots -> score = 0.0
                 avg_trust = 0.0
 
-            # Webots uses 'DEF:' for ground truth and 'FP:' for false positives
+            # Webots gids use 'DEF:' for ground truth; persistent adversarial FP objects
+            # use robot_types.py's 'fp_obj_{id}' convention
             if obj_id.startswith('DEF:'):  # Ground truth object
                 labels.append(1)
                 gt_trust.append(avg_trust)
-            elif obj_id.startswith('FP:'):  # False positive object
+            elif obj_id.startswith('fp_obj_'):  # False positive object
                 labels.append(0)
                 fp_trust.append(avg_trust)
             else:
@@ -404,7 +392,7 @@ class WebotsTrustComparison:
 
         # Compute robot and object metrics
         robot_metrics = self.compute_robot_metrics(env, adversarial_robots, threshold=0.5)
-        object_metrics = self.compute_object_metrics_with_adversarial_lies(env, adversarial_robots, threshold=0.5)
+        object_metrics = self.compute_object_metrics(env, threshold=0.5)
 
         metrics = {
             # Trust separation metrics (legacy)

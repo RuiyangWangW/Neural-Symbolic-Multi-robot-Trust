@@ -500,7 +500,14 @@ class AdversarialRobot(Robot):
         4. Return reported_tracks for communication to neighbors
 
         Decision based on maximizing adversarial objective:
-        J_adv = alpha * (FP trust) - beta * (GT trust)
+        J_adv = delta_plus * (FP trust gain) - delta_minus * (GT trust loss)
+
+        This method drives its own sensor sampling via DetectorSensor (step 1), which
+        requires a live ground_truth_objects list to sample from - not available for replay
+        data sources (e.g. Webots) that provide pre-recorded per-timestep detections
+        instead. Those callers should populate current_timestep_tracks themselves (via
+        add_sensor_detection) and call _run_optimized_policy_on_current_tracks(time)
+        directly, skipping this method's step 1.
         """
         # Clear timestep-specific tracks
         self.clear_timestep_specific_tracks()
@@ -536,10 +543,29 @@ class AdversarialRobot(Robot):
                 timestamp=time
             )
 
-        # STEP 2: Run adversarial policy to decide what to report
-        # Input: current_timestep_tracks (sensor detections) + FP objects in FoV
-        # Output: reported_tracks (manipulated detections)
+        # STEPS 2-4: Run adversarial policy on the now-populated current_timestep_tracks
+        return self._run_optimized_policy_on_current_tracks(time)
 
+    def _run_optimized_policy_on_current_tracks(self, time: float) -> List[Track]:
+        """
+        Run the objective-driven MILP policy (FP injection / GT suppression decisions)
+        against whatever is already in current_timestep_tracks, and populate
+        reported_tracks accordingly.
+
+        Factored out of _generate_optimized_adversarial_detections so replay-data callers
+        (e.g. WebotsTrustEnvironment) that populate current_timestep_tracks themselves from
+        pre-recorded detections - rather than from DetectorSensor sampling a live
+        ground_truth_objects list - can still run the real MILP policy unmodified. Requires
+        self.neighbor_information / self.last_reported_tracks and (if any FP objects should
+        be considered) self._assigned_fp_objects_cache to already be set, exactly as for the
+        synthetic-sensor path.
+
+        Input: current_timestep_tracks (sensor/replay detections) + FP objects in FoV
+        Output: reported_tracks (manipulated detections), also returned as a list
+
+        Decision based on maximizing adversarial objective:
+        J_adv = delta_plus * (FP trust gain) - delta_minus * (GT trust loss)
+        """
         # ===== Collect FP objects in FoV =====
         fp_objects_in_fov = []
         if hasattr(self, '_assigned_fp_objects_cache'):
