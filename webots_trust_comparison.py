@@ -97,17 +97,25 @@ class WebotsTrustComparison:
         # Results storage
         self.results = []
 
+    # Adversarial policy aggressiveness levels (delta_plus=delta_minus), matching
+    # optimized_policy_benchmark.py's conservative/moderate/aggressive sweep.
+    POLICY_DELTAS = {
+        'conservative': 1.0,
+        'moderate': 2.0,
+        'aggressive': 3.0,
+    }
+
     def generate_scenarios(self, robot_names: List[str]) -> List[Dict]:
         """
-        Generate 10 different test scenarios with random adversarial assignments.
+        Generate num_scenarios test scenarios with random adversarial assignments.
 
         Each scenario has:
-        - 2 randomly selected adversarial robots
+        - num_adversarial randomly selected adversarial robots
         - Random persistent FP injection rate (0.1 to 0.3)
-        - Adversarial robots run the real optimized policy (MILP-based report/suppress
-          decisions), not a random FP/FN rate - GT suppression is policy-driven via
-          delta_plus/delta_minus, matching optimized_policy_benchmark.py's "aggressive"
-          scenario (delta_plus=delta_minus=3.0)
+        - A randomly selected adversarial policy aggressiveness (conservative/moderate/
+          aggressive -> delta_plus=delta_minus in {1.0, 2.0, 3.0}). Adversarial robots run
+          the real optimized MILP policy (report/suppress decisions driven by
+          delta_plus/delta_minus), not a random FP/FN rate.
 
         Args:
             robot_names: List of available robot names
@@ -118,6 +126,8 @@ class WebotsTrustComparison:
         scenarios = []
         random.seed(self.random_seed)
 
+        policy_names = list(self.POLICY_DELTAS.keys())
+
         for i in range(self.num_scenarios):
             # Randomly select adversarial robots
             adversarial_robots = random.sample(robot_names, self.num_adversarial)
@@ -125,10 +135,17 @@ class WebotsTrustComparison:
             # Random persistent FP injection rate
             fp_injection_rate = random.uniform(0.1, 0.3)
 
+            # Randomly select adversarial policy aggressiveness for this scenario
+            policy = random.choice(policy_names)
+            delta = self.POLICY_DELTAS[policy]
+
             scenario = {
                 'id': i,
                 'adversarial_robots': adversarial_robots,
                 'fp_injection_rate': fp_injection_rate,
+                'policy': policy,
+                'delta_plus': delta,
+                'delta_minus': delta,
                 'seed': self.random_seed + i  # Unique seed per scenario
             }
 
@@ -203,14 +220,15 @@ class WebotsTrustComparison:
 
         for method_name, algorithm in methods.items():
 
-            # Reset environment (with FP co-detection enabled, optimized aggressive policy)
+            # Reset environment (with FP co-detection enabled, per-scenario optimized policy
+            # aggressiveness - conservative/moderate/aggressive, see generate_scenarios)
             env = WebotsTrustEnvironment(
                 webots_data_path=self.webots_data_path,
                 adversarial_robot_ids=scenario['adversarial_robots'],
                 adversarial_fp_injection_rate=scenario['fp_injection_rate'],
                 allow_fp_codetection=True,  # Enable FP co-detection by default
-                delta_plus=3.0,  # "aggressive" - matches training distribution
-                delta_minus=3.0,
+                delta_plus=scenario['delta_plus'],
+                delta_minus=scenario['delta_minus'],
                 random_seed=scenario['seed']
             )
 
@@ -293,10 +311,15 @@ class WebotsTrustComparison:
         legitimate_robots = {name for name, robot in env.robots.items()
                            if robot.trust_value >= threshold}
 
-        # Collect ALL objects ever reported by any robot (all_tracks, not just this
-        # step's reported_tracks - see register_reported_tracks_in_all_tracks). Webots
-        # ground truth gids use 'DEF:' (e.g. 'DEF:WoodenBox_1'); persistent adversarial FP
-        # objects use robot_types.py's 'fp_obj_{id}' convention, not 'FP:'.
+        # FIXED DENOMINATOR: every object ANY robot ever actually detected (union of
+        # all_tracks across all robots, independent of trust), NOT every object that
+        # exists in the environment definition. An object no robot ever sensed the whole
+        # episode is a sensing-coverage gap outside every method's control (occlusion,
+        # range, FoV) - it should not count against any method's recall, since no method
+        # could possibly have recalled an object nobody ever observed. This denominator is
+        # still identical across all four methods within a scenario: it only depends on
+        # what robots detected (same sensors, same replay data, same is_in_fov/DetectorSensor
+        # sampling per method run - not on which trust algorithm is scoring afterward).
         all_objects = set()
         for robot_name, robot in env.robots.items():
             for track in robot.get_all_tracks():
@@ -531,8 +554,9 @@ class WebotsTrustComparison:
                 "adversarial_ratio": self.num_adversarial / max(1, self.num_robots_total),
                 "adversarial_fp_injection_rate": scenario['fp_injection_rate'],
                 "adversarial_fn_suppression_rate": 0.0,  # Policy-driven (MILP), not a rate
-                "delta_plus": 3.0,
-                "delta_minus": 3.0,
+                "policy": scenario['policy'],  # conservative / moderate / aggressive
+                "delta_plus": scenario['delta_plus'],
+                "delta_minus": scenario['delta_minus'],
                 "adversarial_robots": scenario['adversarial_robots'],
                 "random_seed": scenario['seed'],
             }
@@ -546,7 +570,9 @@ class WebotsTrustComparison:
             "metadata": {
                 "benchmark_type": "webots",
                 "adversarial_mode": "optimized",
-                "description": "Webots replay data - optimized aggressive policy (delta_plus=delta_minus=3.0)",
+                "description": "Webots replay data - optimized policy, per-scenario random "
+                               "aggressiveness (conservative/moderate/aggressive, "
+                               "delta_plus=delta_minus in {1.0, 2.0, 3.0})",
                 "num_scenarios": len(self.results),
                 "base_seed": self.random_seed,
                 "robot_modes": {
@@ -557,8 +583,8 @@ class WebotsTrustComparison:
                 "parameter_ranges": {
                     "num_adversarial": self.num_adversarial,
                     "num_timesteps": self.num_timesteps,
-                    "delta_plus": 3.0,
-                    "delta_minus": 3.0,
+                    "policies": list(self.POLICY_DELTAS.keys()),
+                    "delta_values": list(self.POLICY_DELTAS.values()),
                 },
             },
             "scenarios": scenarios,
@@ -579,8 +605,8 @@ def main():
                         help="Path to filtered Webots data")
     parser.add_argument("--supervised-model", type=str, default="supervised_trust_model.pth",
                         help="Path to trained supervised GNN model")
-    parser.add_argument("--num-scenarios", type=int, default=10,
-                        help="Number of scenarios to test (default: 10)")
+    parser.add_argument("--num-scenarios", type=int, default=100,
+                        help="Number of scenarios to test (default: 100)")
     parser.add_argument("--num-adversarial", type=int, default=2,
                         help="Number of adversarial robots per scenario (default: 2)")
     parser.add_argument("--num-timesteps", type=int, default=100,
