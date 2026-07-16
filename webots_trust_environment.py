@@ -7,10 +7,15 @@ the main simulation pipeline's current architecture (robot_types.py's Legitimate
 AdversarialRobot, robot_track_classes.py's reported_tracks/all_tracks track model).
 
 Legitimate and adversarial robots are real LegitimateRobot/AdversarialRobot instances.
-Each timestep, every robot's REAL recorded Webots detections (union_detections) are fed
-directly into add_sensor_detection() - Webots' own camera geometry/occlusion is already
-baked into the recording, so DetectorSensor's synthetic FoV/noise sampling is skipped
-entirely (there is no live ground_truth_objects list to sample from during replay).
+The Webots replay data supplies each timestep's TRUE (optimal) object positions - the
+cross-robot-averaged union of what every robot's real camera actually recorded
+(get_ground_truth_object_positions) - exactly like the live ground_truth_objects list
+simulation_environment.py's realistic mode consumes. No real robot's sensor is perfect, so
+every robot (legitimate and adversarial alike) runs its own DetectorSensor over that true
+position set each timestep (_feed_real_detections): is_in_fov gating (SPOT dual-camera +
+occupancy-grid line-of-sight), sensor_fn_rate missed-detection sampling, Gaussian
+position/velocity noise (noise_std), and transient sensor_fp_* clutter - the same
+realistic-sensor layer applied on top of ground truth in the synthetic pipeline.
 
 Adversarial robots run the actual objective-driven MILP policy
 (AdversarialRobot._run_optimized_policy_on_current_tracks, mode='optimized', "aggressive"
@@ -56,6 +61,9 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
                  fov_range: float = 20.0,
                  fov_angle: float = np.pi / 4,
                  proximal_range: float = 100.0,
+                 noise_std: float = 1.0,
+                 sensor_fp_rate: float = 0.05,
+                 sensor_fn_rate: float = 0.05,
                  random_seed: Optional[int] = None):
         """
         Initialize Webots trust environment.
@@ -80,6 +88,16 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
                 combination - see Robot.is_in_spot_dual_camera_fov)
             proximal_range: Communication/proximal range for ego-graph construction and
                 neighbor information sharing
+            noise_std: Standard deviation (meters) of Gaussian position noise DetectorSensor
+                adds on top of each timestep's true (replay) object position - matches
+                detector_sensor.py's convention (velocity noise is noise_std * 0.1), applied
+                identically to legitimate and adversarial robots' own sensors.
+            sensor_fp_rate: Transient sensor false positive rate (DetectorSensor clutter
+                objects, distinct from persistent adversarial FP objects) - same default as
+                LegitimateRobot/AdversarialRobot elsewhere in the codebase.
+            sensor_fn_rate: Sensor false negative rate - probability a real object within
+                is_in_fov is nonetheless missed by the sensor, same default as
+                LegitimateRobot/AdversarialRobot elsewhere in the codebase.
             random_seed: Random seed for reproducibility
         """
         # Initialize base environment
@@ -99,6 +117,9 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
         self.fov_range = fov_range
         self.fov_angle = fov_angle
         self.proximal_range = proximal_range
+        self.noise_std = noise_std
+        self.sensor_fp_rate = sensor_fp_rate
+        self.sensor_fn_rate = sensor_fn_rate
 
         # Robot trust management (real LegitimateRobot/AdversarialRobot instances)
         self.robots: Dict[str, Robot] = {}
@@ -138,6 +159,8 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
                     fov_range=self.fov_range,
                     fov_angle=self.fov_angle,
                     mode='optimized',
+                    sensor_fp_rate=self.sensor_fp_rate,
+                    sensor_fn_rate=self.sensor_fn_rate,
                     delta_plus=self.delta_plus,
                     delta_minus=self.delta_minus,
                 )
@@ -148,8 +171,13 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
                     velocity=np.array([0.0, 0.0, 0.0]),
                     fov_range=self.fov_range,
                     fov_angle=self.fov_angle,
-                    mode='optimal',  # Webots detections are ground truth as-recorded, no
-                                      # synthetic sensor noise layered on top of them
+                    mode='realistic',  # Webots replay supplies the "optimal" true detections
+                                        # (see _feed_real_detections) - mode='realistic' gives
+                                        # this robot its own DetectorSensor to layer FN/noise/
+                                        # transient-FP sensor imperfection on top, same as
+                                        # AdversarialRobot always has one.
+                    sensor_fp_rate=self.sensor_fp_rate,
+                    sensor_fn_rate=self.sensor_fn_rate,
                 )
 
             # SPOT dual-camera FoV + occupancy grid for line-of-sight, not exposed as
@@ -246,21 +274,24 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
 
     def _feed_real_detections(self, robot_name: str, timestep: int):
         """
-        Populate a robot's current_timestep_tracks directly from its REAL recorded Webots
-        detections for this timestep - no synthetic DetectorSensor sampling. This is the
-        analog of AdversarialRobot._generate_optimized_adversarial_detections's step 1,
-        but sourced from replay data instead of a live ground_truth_objects list.
+        Populate a robot's current_timestep_tracks by running its own realistic
+        DetectorSensor over this timestep's TRUE object positions - the Webots replay
+        supplies the "optimal" (perfect) detections (the union of what every robot's real
+        camera recorded, cross-robot-averaged per object via
+        get_ground_truth_object_positions), exactly like the live ground_truth_objects
+        list simulation_environment.py's _generate_realistic_detections consumes. No real
+        robot's sensor is actually optimal, so DetectorSensor.generate_detections is
+        layered on top for every robot (legitimate and adversarial alike, matching how
+        AdversarialRobot always owns a DetectorSensor and LegitimateRobot gets one too here
+        via mode='realistic') to apply:
+        - is_in_fov gating (SPOT dual-camera + occupancy-grid line-of-sight)
+        - sensor_fn_rate: probabilistic missed detections of real objects
+        - Gaussian position/velocity noise (noise_std)
+        - transient sensor_fp_* clutter objects near the robot
 
-        Detections are additionally filtered through robot.is_in_fov(), the same geometric
-        + occupancy-grid check the trust algorithms use downstream (negative PSMs,
-        in_fov_only graph edges). Without this filter, a real Webots detection can fall
-        outside the simplified geometric FoV model (or vice versa - a geometrically-in-FoV
-        object goes unreported because the real camera pipeline missed/occluded it), and
-        the trust algorithms would then treat that mismatch as evidence of dishonesty
-        rather than a modeling artifact. Requiring is_in_fov agreement keeps "what was fed
-        in" and "what the trust algorithms think should have been visible" consistent, the
-        same way DetectorSensor keeps them consistent on synthetic data (it also gates
-        every detection through is_in_fov_func before applying sensor_fn_rate).
+        Ground-truth object_ids are recovered from each detection's 'gt_object' field
+        (the real gid, e.g. 'DEF:Woodbox_0') rather than DetectorSensor's default
+        f"gt_obj_{id}" wrapping, so downstream DEF:-prefix classification still works.
 
         Args:
             robot_name: Name of the robot
@@ -269,21 +300,46 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
         robot = self.robots[robot_name]
         robot.clear_timestep_specific_tracks()
 
-        robot_timestep_data = self.robot_data[robot_name][timestep]
-        union_detections = robot_timestep_data.get('visible', {}).get('union', [])
+        # True (optimal) object positions for this timestep, cross-robot-averaged from the
+        # real recording - the "live ground_truth_objects list" DetectorSensor expects.
+        gt_positions = self.get_ground_truth_object_positions(timestep)
+        ground_truth_objects = [
+            GroundTruthObject(
+                id=gid,
+                position=np.asarray(pos, dtype=float),
+                velocity=np.zeros(3),  # Webots replay has no recorded velocity
+                object_type='unknown',
+                movement_pattern='stationary',
+                spawn_time=0.0,
+            )
+            for gid, pos in gt_positions.items()
+        ]
 
-        for det in union_detections:
-            obj_gid = det['gid']
-            pos = det['pos']
-            position = np.array([pos['x'], pos['y'], pos['z']])
+        detected_gt_objects, detected_sensor_fp_objects = robot.detector_sensor.generate_detections(
+            robot_position=robot.position,
+            robot_orientation=robot.orientation,
+            robot_fov_range=robot.fov_range,
+            robot_fov_angle=robot.fov_angle,
+            is_in_fov_func=robot.is_in_fov,
+            ground_truth_objects=ground_truth_objects,
+            time=float(timestep),
+            noise_std=self.noise_std,
+            world_size=(self.grid_xmax - self.grid_xmin, self.grid_ymax - self.grid_ymin),
+        )
 
-            if not robot.is_in_fov(position):
-                continue
-
+        for detection in detected_gt_objects:
             robot.add_sensor_detection(
-                object_id=obj_gid,
-                position=position,
-                velocity=np.array([0.0, 0.0, 0.0]),  # Webots data has no velocity
+                object_id=detection['gt_object'].id,  # real gid, e.g. 'DEF:Woodbox_0'
+                position=detection['position'],
+                velocity=detection['velocity'],
+                timestamp=float(timestep)
+            )
+
+        for detection in detected_sensor_fp_objects:
+            robot.add_sensor_detection(
+                object_id=detection['object_id'],  # 'sensor_fp_{robot_id}_{fp_id}'
+                position=detection['position'],
+                velocity=detection['velocity'],
                 timestamp=float(timestep)
             )
 
