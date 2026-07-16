@@ -251,6 +251,17 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
         analog of AdversarialRobot._generate_optimized_adversarial_detections's step 1,
         but sourced from replay data instead of a live ground_truth_objects list.
 
+        Detections are additionally filtered through robot.is_in_fov(), the same geometric
+        + occupancy-grid check the trust algorithms use downstream (negative PSMs,
+        in_fov_only graph edges). Without this filter, a real Webots detection can fall
+        outside the simplified geometric FoV model (or vice versa - a geometrically-in-FoV
+        object goes unreported because the real camera pipeline missed/occluded it), and
+        the trust algorithms would then treat that mismatch as evidence of dishonesty
+        rather than a modeling artifact. Requiring is_in_fov agreement keeps "what was fed
+        in" and "what the trust algorithms think should have been visible" consistent, the
+        same way DetectorSensor keeps them consistent on synthetic data (it also gates
+        every detection through is_in_fov_func before applying sensor_fn_rate).
+
         Args:
             robot_name: Name of the robot
             timestep: Current timestep index
@@ -264,9 +275,14 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
         for det in union_detections:
             obj_gid = det['gid']
             pos = det['pos']
+            position = np.array([pos['x'], pos['y'], pos['z']])
+
+            if not robot.is_in_fov(position):
+                continue
+
             robot.add_sensor_detection(
                 object_id=obj_gid,
-                position=np.array([pos['x'], pos['y'], pos['z']]),
+                position=position,
                 velocity=np.array([0.0, 0.0, 0.0]),  # Webots data has no velocity
                 timestamp=float(timestep)
             )
