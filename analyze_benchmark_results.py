@@ -49,6 +49,11 @@ def extract_metrics_dataframe(results: Dict, method: str = "supervised") -> pd.D
 
     for scenario in results["scenarios"]:
         params = scenario["parameters"]
+        # A benchmark file may not contain this method (e.g. an ablation file has variant
+        # names, not baseline/paper/... and vice versa). Skip such scenarios rather than
+        # KeyError - callers that iterate methods across mixed files rely on this.
+        if method not in scenario.get("evaluation", {}):
+            continue
         metrics = scenario["evaluation"][method]
 
         # Handle different metric structures (some have robot_metrics/object_metrics, some have robots/objects)
@@ -105,6 +110,10 @@ def print_summary_statistics(df: pd.DataFrame, method: str):
     print(f"SUMMARY STATISTICS - {method.upper()}")
     print(f"{'=' * 80}\n")
 
+    if df.empty:
+        print("  (no scenarios for this method in this benchmark)")
+        return
+
     # Robot classification - concise version
     print("ROBOT CLASSIFICATION:")
     print(f"  Accuracy:  {df['robot_accuracy'].mean():.4f} ± {df['robot_accuracy'].std():.4f}")
@@ -127,6 +136,8 @@ def plot_metrics_vs_parameters(df: pd.DataFrame, output_dir: Path, method: str, 
         method: Method name
         prefix: Prefix for output filenames (e.g., benchmark name)
     """
+    if df.empty:
+        return  # method absent from this benchmark - nothing to plot
     output_dir.mkdir(parents=True, exist_ok=True)
 
     parameters = ["adversarial_ratio", "adversarial_fp_injection_rate", "adversarial_fn_suppression_rate"]
@@ -320,10 +331,15 @@ def compare_benchmarks_across_methods(all_results: Dict[str, Dict], output_dir: 
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract dataframes for each benchmark
+    # Extract dataframes for each benchmark (skip benchmarks that don't contain this method,
+    # e.g. an ablation file when comparing a standard method, or vice versa).
     benchmark_dfs = {}
     for benchmark_name, results in all_results.items():
-        benchmark_dfs[benchmark_name] = extract_metrics_dataframe(results, method)
+        df = extract_metrics_dataframe(results, method)
+        if not df.empty:
+            benchmark_dfs[benchmark_name] = df
+    if not benchmark_dfs:
+        return  # no benchmark contains this method
 
     # Prepare data for comparison
     benchmark_names = []
@@ -449,8 +465,6 @@ def create_summary_table(all_results: Dict[str, Dict], output_dir: Path):
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    methods = ["baseline", "bayesian", "paper", "supervised"]
-
     # Group benchmarks by type
     normal_benchmarks = {}
     optimized_benchmarks = {}
@@ -469,8 +483,12 @@ def create_summary_table(all_results: Dict[str, Dict], output_dir: Path):
         summary_rows = []
 
         for benchmark_name, results in benchmarks_dict.items():
-            for method in methods:
+            # Use each benchmark's own methods (ablation files use variant names, not the
+            # standard baseline/bayesian/paper/supervised set).
+            for method in discover_methods(results):
                 df = extract_metrics_dataframe(results, method)
+                if df.empty:
+                    continue
 
                 summary_rows.append({
                     "Benchmark": benchmark_name,
@@ -571,9 +589,12 @@ Examples:
     parser.add_argument(
         "--method",
         type=str,
-        default="supervised",
-        choices=["baseline", "bayesian", "paper", "supervised", "all"],
-        help="Which method to analyze (default: supervised)"
+        default="all",
+        help="Which method to analyze: 'all' (default - every standard method AND every "
+             "ablation variant present across the benchmark_results/ directory), "
+             "baseline/bayesian/paper/supervised, or an ablation variant name "
+             "(full/no_gat/homogeneous/triplet_init/no_beta). Methods absent from a file "
+             "are skipped."
     )
     parser.add_argument(
         "--export-csv",
@@ -629,18 +650,25 @@ Examples:
             print(f"ANALYZING BENCHMARK: {benchmark_name.upper()}")
             print(f"{'=' * 80}")
 
-            # Print metadata
-            print(f"\nBenchmark type: {results['metadata']['benchmark_type']}")
-            print(f"Description: {results['metadata']['description']}")
-            print(f"Number of scenarios: {results['metadata']['num_scenarios']}")
-            print(f"Robot modes: {results['metadata']['robot_modes']}")
-            print(f"Adversarial lie: {results['metadata']['adversarial_lie']}")
+            # Print metadata (use .get so files without every optional key - e.g. the
+            # ablation benchmark - still print cleanly)
+            meta = results.get('metadata', {})
+            print(f"\nBenchmark type: {meta.get('benchmark_type', 'unknown')}")
+            print(f"Description: {meta.get('description', '')}")
+            print(f"Number of scenarios: {meta.get('num_scenarios', 'unknown')}")
+            print(f"Robot modes: {meta.get('robot_modes', 'n/a')}")
+            print(f"Adversarial lie: {meta.get('adversarial_lie', 'n/a')}")
 
             # Create subdirectory for this benchmark
             benchmark_output_dir = args.output_dir / benchmark_name
 
-            # Analyze each method
+            # Analyze each method (skip methods this particular benchmark doesn't contain -
+            # in a mixed directory, ablation variant names won't exist in a standard file
+            # and vice versa)
+            benchmark_methods = discover_methods(results)
             for method in methods_to_analyze:
+                if method not in benchmark_methods:
+                    continue
                 print(f"\n  Method: {method.upper()}")
                 df = extract_metrics_dataframe(results, method)
                 print_summary_statistics(df, method)
