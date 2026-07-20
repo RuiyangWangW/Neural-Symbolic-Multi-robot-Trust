@@ -183,7 +183,9 @@ def compare_methods(results: Dict, output_dir: Path):
         results: Detailed results dictionary
         output_dir: Directory to save plots
     """
-    methods = ["baseline", "bayesian", "paper", "supervised"]
+    # Discover methods from the file (ablation benchmark -> variant names; otherwise the
+    # standard baseline/bayesian/paper/supervised set).
+    methods = discover_methods(results)
 
     # Extract metrics for each method
     method_dfs = {}
@@ -248,6 +250,26 @@ def export_to_csv(results: Dict, output_dir: Path, prefix: str = ""):
         csv_path = output_dir / filename
         df.to_csv(csv_path, index=False)
         print(f"✓ Saved: {csv_path}")
+
+
+def discover_methods(results: Dict) -> List[str]:
+    """
+    Determine which methods a benchmark file contains for `--method all`.
+
+    Prefers an explicit metadata["methods"] list (used by the ablation benchmark, whose
+    "methods" are ablation variant names like no_gat/homogeneous rather than the fixed
+    baseline/bayesian/paper/supervised). Falls back to the keys actually present in the
+    first scenario's evaluation, then to the four standard methods.
+    """
+    meta_methods = results.get("metadata", {}).get("methods")
+    if meta_methods:
+        return list(meta_methods)
+    scenarios = results.get("scenarios", [])
+    if scenarios and "evaluation" in scenarios[0]:
+        keys = list(scenarios[0]["evaluation"].keys())
+        if keys:
+            return keys
+    return ["baseline", "bayesian", "paper", "supervised"]
 
 
 def find_benchmark_files(benchmark_dir: Path) -> Dict[str, List[Path]]:
@@ -590,7 +612,14 @@ Examples:
 
         # Determine methods to analyze
         if args.method == "all":
-            methods_to_analyze = ["baseline", "bayesian", "paper", "supervised"]
+            # Union of methods across all loaded benchmarks (handles ablation variant names).
+            methods_to_analyze = []
+            for res in all_results.values():
+                for m in discover_methods(res):
+                    if m not in methods_to_analyze:
+                        methods_to_analyze.append(m)
+            if not methods_to_analyze:
+                methods_to_analyze = ["baseline", "bayesian", "paper", "supervised"]
         else:
             methods_to_analyze = [args.method]
 
@@ -649,20 +678,22 @@ Examples:
         print(f"Loading results from: {args.results_file}")
         results = load_detailed_results(args.results_file)
 
-        # Print metadata
+        # Print metadata (use .get so files without every optional key - e.g. the ablation
+        # benchmark - still print cleanly)
+        meta = results.get('metadata', {})
         print(f"\n{'=' * 80}")
         print("BENCHMARK METADATA")
         print(f"{'=' * 80}")
-        print(f"Benchmark type: {results['metadata']['benchmark_type']}")
-        print(f"Description: {results['metadata']['description']}")
-        print(f"Number of scenarios: {results['metadata']['num_scenarios']}")
-        print(f"Base seed: {results['metadata']['base_seed']}")
-        print(f"Robot modes: {results['metadata']['robot_modes']}")
-        print(f"Adversarial lie: {results['metadata']['adversarial_lie']}")
+        print(f"Benchmark type: {meta.get('benchmark_type', 'unknown')}")
+        print(f"Description: {meta.get('description', '')}")
+        print(f"Number of scenarios: {meta.get('num_scenarios', 'unknown')}")
+        print(f"Base seed: {meta.get('base_seed', 'unknown')}")
+        print(f"Robot modes: {meta.get('robot_modes', 'n/a')}")
+        print(f"Adversarial lie: {meta.get('adversarial_lie', 'n/a')}")
 
-        # Analyze specific method or all methods
+        # Analyze specific method or all methods (for ablation files, "all" = variant names)
         if args.method == "all":
-            methods_to_analyze = ["baseline", "bayesian", "paper", "supervised"]
+            methods_to_analyze = discover_methods(results)
         else:
             methods_to_analyze = [args.method]
 

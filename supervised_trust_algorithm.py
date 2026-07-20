@@ -272,13 +272,9 @@ class SupervisedTrustAlgorithm:
                 ego_robot = graph_data._proximal_robots[0]
 
                 if self.temporal_mode == 'beta':
-                    # Convert probability to alpha/beta update (contribution #2)
-                    # High probability (p ≥ 0.5) → increase alpha (positive evidence)
-                    # Low probability (p < 0.5) → increase beta (negative evidence)
-                    if p >= 0.5:
-                        delta_alpha, delta_beta = p, 0.0
-                    else:
-                        delta_alpha, delta_beta = 0.0, (1 - p)
+                    # Convert probability to alpha/beta update (contribution #2): standard
+                    # soft-evidence Beta update - every step adds p to alpha and (1-p) to beta.
+                    delta_alpha, delta_beta = p, (1 - p)
                     ego_robot.update_trust(delta_alpha, delta_beta)
                 else:
                     # Temporal ablation: record the raw per-step score instead of
@@ -323,11 +319,9 @@ class SupervisedTrustAlgorithm:
                         continue
 
                     if self.temporal_mode == 'beta':
-                        # Convert probability to alpha/beta update (contribution #2)
-                        if p >= 0.5:
-                            delta_alpha, delta_beta = p, 0.0
-                        else:
-                            delta_alpha, delta_beta = 0.0, (1 - p)
+                        # Convert probability to alpha/beta update (contribution #2): standard
+                        # soft-evidence Beta update - add p to alpha and (1-p) to beta.
+                        delta_alpha, delta_beta = p, (1 - p)
                         # Forward trust update to all_tracks (persistent storage)
                         ego_robot.forward_trust_update_to_all_tracks(
                             object_id=object_id,

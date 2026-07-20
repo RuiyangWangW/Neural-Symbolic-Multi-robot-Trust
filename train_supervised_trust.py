@@ -1366,8 +1366,8 @@ def main():
                        help='Number of DataLoader workers (default: 0, use 2-4 for MPS/CUDA)')
     parser.add_argument('--force-cpu', action='store_true',
                        help='Force CPU training (useful if MPS has issues)')
-    parser.add_argument('--patience', type=int, default=100,
-                       help='Early stopping patience - epochs without improvement (default: 100)')
+    parser.add_argument('--patience', type=int, default=10,
+                       help='Early stopping patience - epochs without improvement (default: 10)')
     parser.add_argument('--output', type=str, default='supervised_trust_model.pth',
                        help='Output model path')
     parser.add_argument('--log', type=str, default=None,

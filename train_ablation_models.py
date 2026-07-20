@@ -56,7 +56,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--patience', type=int, default=100)
+    parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--agent-loss-weight', type=float, default=5.0)
     parser.add_argument('--track-loss-weight', type=float, default=1.0)
     parser.add_argument('--train-ratio', type=float, default=0.8)

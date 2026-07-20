@@ -54,6 +54,15 @@ from optimized_policy_benchmark import (
 ARCH_VARIANTS = ['full', 'no_gat', 'homogeneous', 'triplet_init']
 ALL_VARIANTS = ARCH_VARIANTS + ['no_beta']
 
+# Human-readable titles for each variant (used in the metadata/table).
+VARIANT_DISPLAY_NAMES = {
+    'full': 'Full (reference)',
+    'no_gat': 'No-GAT (0 message-passing layers)',
+    'homogeneous': 'Homogeneous GAT (single relation)',
+    'triplet_init': 'No-Triplet-Init (learned type embeddings)',
+    'no_beta': 'No-Beta (mean of per-step scores)',
+}
+
 
 def variant_spec(variant: str, models_dir: Path):
     """Return (model_checkpoint_key, temporal_mode) for a variant name."""
@@ -110,6 +119,41 @@ class AblationComparison(TrustMethodComparison):
                 }
         return results
 
+    def run_comparison(self) -> dict:
+        """
+        Ablation-only comparison: run ONLY the supervised method (the ablation variant under
+        test) plus the baseline. The other baselines (paper, bayesian) are skipped entirely
+        - we only compare ablation models against each other, so computing paper/bayesian
+        every scenario would be wasted work. Baseline is still run because its ever-observed
+        GT/FP object set is the shared object-metric denominator (same as run_comparison in
+        the parent), and evaluate_methods needs it to score the supervised object metrics
+        on the correct detectable-object set. paper_results/bayesian_results are left empty,
+        which evaluate_methods gracefully skips.
+        """
+        supervised_env, baseline_env = self.create_identical_environments(2)
+
+        self.supervised_results = self.run_supervised_model_simulation(supervised_env)
+        self.baseline_results = self.run_baseline_simulation(baseline_env)
+        self.paper_results = []
+        self.bayesian_results = []
+
+        # Propagate baseline's ever-observed GT/FP object sets into supervised results, so the
+        # object-level denominator is the shared detectable-object set (matches the parent's
+        # run_comparison behavior).
+        if self.baseline_results:
+            final_gt_ids = self.baseline_results[-1]['all_gt_object_ids']
+            final_fp_ids = self.baseline_results[-1]['all_fp_object_ids']
+            for step_result in self.supervised_results:
+                step_result['all_gt_object_ids'] = final_gt_ids
+                step_result['all_fp_object_ids'] = final_fp_ids
+
+        return {
+            'supervised_results': self.supervised_results,
+            'baseline_results': self.baseline_results,
+            'paper_results': self.paper_results,
+            'bayesian_results': self.bayesian_results,
+        }
+
 
 def run_variant_scenario(scenario: Dict, model_path: str, temporal_mode: str,
                          threshold: float) -> Dict:
@@ -151,16 +195,30 @@ def main():
                         default=ALL_VARIANTS, choices=ALL_VARIANTS,
                         help='Which of the 5 ablation models to benchmark (default: all)')
     parser.add_argument('--num-scenarios', type=int, default=50,
-                        help='Number of aggressive scenarios per variant (default: 50)')
+                        help='Number of aggressive scenarios (default: 50)')
     parser.add_argument('--base-seed', type=int, default=42)
     parser.add_argument('--threshold', type=float, default=0.5)
-    parser.add_argument('--output', type=str, default='ablation_benchmark_results.json')
+    parser.add_argument('--output-dir', type=str, default='benchmark_results',
+                        help='Directory to save results (default: benchmark_results/, matching '
+                             'the other benchmarks so analyze_benchmark_results.py picks it up)')
+    parser.add_argument('--output-name', type=str, default='ablation',
+                        help='Base filename, produces <output-dir>/<output-name>_detailed.json')
     args = parser.parse_args()
 
     models_dir = Path(args.models_dir)
     config = BENCHMARK_CONFIGS['aggressive']  # delta_plus = delta_minus = 3.0
 
-    # Same scenario set (same seeds) across all variants -> paired comparison.
+    # Resolve which variants actually have a usable checkpoint.
+    usable_variants = []
+    for variant in args.variants:
+        ckpt_key, _ = variant_spec(variant, models_dir)
+        if (models_dir / f"supervised_model_{ckpt_key}.pth").exists():
+            usable_variants.append(variant)
+        else:
+            print(f"⚠️ SKIP {variant}: checkpoint not found: "
+                  f"{models_dir / f'supervised_model_{ckpt_key}.pth'}")
+
+    # Same scenario set (same seeds) evaluated by EVERY variant -> paired comparison.
     scenarios = [sample_scenario_parameters(i, args.base_seed, config)
                  for i in range(args.num_scenarios)]
 
@@ -168,73 +226,98 @@ def main():
     print("ABLATION BENCHMARK - aggressive optimized policy (delta_plus=delta_minus=3.0)")
     print("=" * 80)
     print(f"Models dir:   {models_dir}")
-    print(f"Variants:     {args.variants}")
+    print(f"Variants:     {usable_variants}")
     print(f"Scenarios:    {args.num_scenarios} (base_seed={args.base_seed})")
     print("=" * 80)
 
-    all_results = {}  # variant -> list of supervised evaluations
-    for variant in args.variants:
-        ckpt_key, temporal_mode = variant_spec(variant, models_dir)
-        model_path = models_dir / f"supervised_model_{ckpt_key}.pth"
-        if not model_path.exists():
-            print(f"⚠️ SKIP {variant}: checkpoint not found: {model_path}")
-            continue
-
-        print(f"\n{'='*80}\n▶ Variant: {variant}  (checkpoint={ckpt_key}, temporal={temporal_mode})\n{'='*80}")
-        variant_evals = []
-        for i, scenario in enumerate(scenarios):
+    # Build the _detailed.json structure: one entry per scenario, every variant appearing
+    # as its own "method" inside that scenario's `evaluation` dict (matching how
+    # analyze_benchmark_results.py reads scenario["evaluation"][method]).
+    scenario_entries = []
+    for i, scenario in enumerate(scenarios):
+        evaluation = {}
+        for variant in usable_variants:
+            ckpt_key, temporal_mode = variant_spec(variant, models_dir)
+            model_path = models_dir / f"supervised_model_{ckpt_key}.pth"
             try:
                 supervised_eval = run_variant_scenario(
                     scenario, str(model_path), temporal_mode, args.threshold)
-                variant_evals.append(supervised_eval)
+                # supervised_eval is {"robots": {...}, "objects": {...}} for this variant.
+                evaluation[variant] = supervised_eval
             except Exception as e:
-                print(f"  scenario {i}: ERROR {e}")
-            if (i + 1) % 10 == 0:
-                print(f"  ...{i+1}/{args.num_scenarios} scenarios done")
-        all_results[variant] = variant_evals
+                print(f"  scenario {i} variant {variant}: ERROR {e}")
 
-    # Aggregate + print a comparison table
-    def agg(evals, level, metric):
-        vals = [e[level][metric] for e in evals if level in e and metric in e[level]]
-        return (float(np.mean(vals)), float(np.std(vals)), len(vals)) if vals else (0.0, 0.0, 0)
+        scenario_entries.append({
+            "scenario_index": i,
+            "parameters": {
+                "name": f"ablation_{i:03d}",
+                "benchmark_type": "ablation",
+                "robot_density": scenario["robot_density"],
+                "adversarial_ratio": scenario["adversarial_ratio"],
+                "adversarial_fp_injection_rate": scenario["adversarial_fp_injection_rate"],
+                "adversarial_fn_suppression_rate": scenario["adversarial_fn_suppression_rate"],
+                "sensor_fp_rate": scenario["sensor_fp_rate"],
+                "sensor_fn_rate": scenario["sensor_fn_rate"],
+                "delta_plus": scenario["delta_plus"],
+                "delta_minus": scenario["delta_minus"],
+                "legitimate_mode": scenario.get("legitimate_mode", LEGITIMATE_MODE),
+                "adversarial_mode": scenario.get("adversarial_mode", ADVERSARIAL_MODE),
+                "random_seed": scenario["random_seed"],
+            },
+            "evaluation": evaluation,
+        })
+        if (i + 1) % 10 == 0:
+            print(f"  ...{i+1}/{args.num_scenarios} scenarios done")
+
+    detailed_results = {
+        "metadata": {
+            "benchmark_type": "ablation",
+            "description": "Supervised model architecture ablation - aggressive optimized "
+                           "policy (delta_plus=delta_minus=3.0). Each 'method' is an ablation "
+                           "variant of the supervised model.",
+            "adversarial_mode": ADVERSARIAL_MODE,
+            "num_scenarios": args.num_scenarios,
+            "base_seed": args.base_seed,
+            "threshold": args.threshold,
+            "models_dir": str(models_dir),
+            "methods": usable_variants,  # ablation variant names, keyed in each evaluation
+            "method_display_names": {v: VARIANT_DISPLAY_NAMES[v] for v in usable_variants},
+            "parameter_ranges": {
+                "delta_plus": config.delta_plus,
+                "delta_minus": config.delta_minus,
+            },
+        },
+        "scenarios": scenario_entries,
+    }
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    detailed_path = output_dir / f"{args.output_name}_detailed.json"
+    with open(detailed_path, 'w') as f:
+        json.dump(detailed_results, f, indent=2, default=float)
+
+    # Print a quick comparison table (aggregate across scenarios).
+    def agg(variant, level, metric):
+        vals = [e["evaluation"][variant][level][metric]
+                for e in scenario_entries
+                if variant in e["evaluation"] and level in e["evaluation"][variant]
+                and metric in e["evaluation"][variant][level]]
+        return (float(np.mean(vals)), float(np.std(vals))) if vals else (0.0, 0.0)
 
     print("\n" + "=" * 120)
-    print("ABLATION RESULTS (supervised method, aggressive optimized)")
+    print("ABLATION RESULTS (aggressive optimized) - each row is one ablation variant")
     print("=" * 120)
-    header = f"{'variant':<24}{'robot_prec':<16}{'robot_rec':<16}{'robot_acc':<16}{'obj_prec':<16}{'obj_rec':<16}{'obj_acc':<16}"
-    print(header)
+    print(f"{'variant':<20}{'robot_prec':<16}{'robot_rec':<16}{'robot_acc':<16}"
+          f"{'obj_prec':<16}{'obj_rec':<16}{'obj_acc':<16}")
     print("-" * 120)
-    table = {}
-    for variant in args.variants:
-        evals = all_results.get(variant, [])
-        if not evals:
-            continue
-        rp = agg(evals, 'robots', 'precision'); rr = agg(evals, 'robots', 'recall'); ra = agg(evals, 'robots', 'accuracy')
-        op = agg(evals, 'objects', 'precision'); orr = agg(evals, 'objects', 'recall'); oa = agg(evals, 'objects', 'accuracy')
-        table[variant] = {
-            'n': rp[2],
-            'robot_precision': rp[:2], 'robot_recall': rr[:2], 'robot_accuracy': ra[:2],
-            'object_precision': op[:2], 'object_recall': orr[:2], 'object_accuracy': oa[:2],
-        }
-        print(f"{variant:<24}{rp[0]:.3f}±{rp[1]:.3f}   {rr[0]:.3f}±{rr[1]:.3f}   {ra[0]:.3f}±{ra[1]:.3f}   "
+    for variant in usable_variants:
+        rp = agg(variant, 'robots', 'precision'); rr = agg(variant, 'robots', 'recall'); ra = agg(variant, 'robots', 'accuracy')
+        op = agg(variant, 'objects', 'precision'); orr = agg(variant, 'objects', 'recall'); oa = agg(variant, 'objects', 'accuracy')
+        print(f"{variant:<20}{rp[0]:.3f}±{rp[1]:.3f}   {rr[0]:.3f}±{rr[1]:.3f}   {ra[0]:.3f}±{ra[1]:.3f}   "
               f"{op[0]:.3f}±{op[1]:.3f}   {orr[0]:.3f}±{orr[1]:.3f}   {oa[0]:.3f}±{oa[1]:.3f}")
 
-    out = {
-        'metadata': {
-            'benchmark': 'aggressive_optimized',
-            'delta_plus': config.delta_plus,
-            'delta_minus': config.delta_minus,
-            'num_scenarios': args.num_scenarios,
-            'base_seed': args.base_seed,
-            'threshold': args.threshold,
-            'models_dir': str(models_dir),
-        },
-        'summary': table,
-        'per_scenario': all_results,
-    }
-    with open(args.output, 'w') as f:
-        json.dump(out, f, indent=2, default=float)
-    print(f"\n✓ Saved: {args.output}")
+    print(f"\n✓ Saved: {detailed_path}")
+    print(f"  Analyze with: python analyze_benchmark_results.py {detailed_path} --single-file --method all")
 
 
 if __name__ == '__main__':
