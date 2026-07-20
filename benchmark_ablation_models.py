@@ -54,8 +54,9 @@ from optimized_policy_benchmark import (
 ARCH_VARIANTS = ['full', 'no_gat', 'homogeneous', 'triplet_init']
 ALL_VARIANTS = ARCH_VARIANTS + ['no_beta']
 
-# Human-readable titles for each variant (used in the metadata/table).
+# Human-readable titles for each method (baseline + the 5 ablation variants).
 VARIANT_DISPLAY_NAMES = {
+    'baseline': 'Baseline (No Trust)',
     'full': 'Full (reference)',
     'no_gat': 'No-GAT (0 message-passing layers)',
     'homogeneous': 'Homogeneous GAT (single relation)',
@@ -73,93 +74,21 @@ def variant_spec(variant: str, models_dir: Path):
     raise ValueError(f"Unknown variant '{variant}'")
 
 
-class AblationComparison(TrustMethodComparison):
+def run_scenario(scenario: Dict, variants: List[str], models_dir: Path,
+                 threshold: float) -> Dict[str, Dict]:
+    """Run a single scenario and return evaluation metrics keyed by method.
+
+    Mirrors unified_benchmark.py / optimized_policy_benchmark.py's run_scenario, except the
+    "methods" are the baseline (no trust) plus the ablation variants. Each method runs on its
+    OWN fresh SimulationEnvironment built with the SAME scenario seed (via
+    create_identical_environments), so every method sees an identical world and starts trust
+    accumulation fresh - exactly the per-method reset the standard benchmarks already do.
+
+    Returns {"baseline": {robots, objects}, <variant>: {robots, objects}, ...}.
     """
-    TrustMethodComparison variant that lets the supervised method use a chosen temporal_mode
-    and, for the temporal ablation, finalizes the per-step scores at the end of the episode
-    and rewrites the last step's trust values (which is what evaluate_methods reads).
-    """
-
-    def __init__(self, *args, supervised_temporal_mode: str = 'beta', **kwargs):
-        self._supervised_temporal_mode = supervised_temporal_mode
-        super().__init__(*args, **kwargs)
-        # Rebuild the supervised algorithm with the requested temporal_mode (the base class
-        # already built one with temporal_mode='beta'; replace it). The ablation architecture
-        # is auto-detected from the checkpoint's stored tag.
-        gnn_path_str = str(self.supervised_model_path) if self.supervised_model_path else None
-        try:
-            self.supervised_algorithm = SupervisedTrustAlgorithm(
-                model_path=gnn_path_str,
-                proximal_range=self.proximal_range,
-                temporal_mode=self._supervised_temporal_mode,
-            )
-        except Exception as e:
-            print(f"⚠️ Failed to init supervised ablation algorithm: {e}")
-
-    def run_supervised_model_simulation(self, env) -> List[Dict]:
-        results = super().run_supervised_model_simulation(env)
-        # Temporal ablation: fold the recorded per-step scores into a single final trust,
-        # then overwrite the LAST step's trust fields (evaluate_methods uses the final step).
-        if self._supervised_temporal_mode != 'beta' and results:
-            self.supervised_algorithm.finalize_temporal(env.robots)
-            last = results[-1]
-            last['robot_trust_values'] = {r.id: r.trust_value for r in env.robots}
-            last['robot_alpha_beta'] = {
-                r.id: {'alpha': r.trust_alpha, 'beta': r.trust_beta} for r in env.robots
-            }
-            for robot in env.robots:
-                last['track_trust_values'][robot.id] = {
-                    track.track_id: {
-                        'trust_value': track.trust_value,
-                        'alpha': track.trust_alpha,
-                        'beta': track.trust_beta,
-                        'object_id': track.object_id,
-                    }
-                    for track in robot.get_all_tracks()
-                }
-        return results
-
-    def run_comparison(self) -> dict:
-        """
-        Ablation-only comparison: run ONLY the supervised method (the ablation variant under
-        test) plus the baseline. The other baselines (paper, bayesian) are skipped entirely
-        - we only compare ablation models against each other, so computing paper/bayesian
-        every scenario would be wasted work. Baseline is still run because its ever-observed
-        GT/FP object set is the shared object-metric denominator (same as run_comparison in
-        the parent), and evaluate_methods needs it to score the supervised object metrics
-        on the correct detectable-object set. paper_results/bayesian_results are left empty,
-        which evaluate_methods gracefully skips.
-        """
-        supervised_env, baseline_env = self.create_identical_environments(2)
-
-        self.supervised_results = self.run_supervised_model_simulation(supervised_env)
-        self.baseline_results = self.run_baseline_simulation(baseline_env)
-        self.paper_results = []
-        self.bayesian_results = []
-
-        # Propagate baseline's ever-observed GT/FP object sets into supervised results, so the
-        # object-level denominator is the shared detectable-object set (matches the parent's
-        # run_comparison behavior).
-        if self.baseline_results:
-            final_gt_ids = self.baseline_results[-1]['all_gt_object_ids']
-            final_fp_ids = self.baseline_results[-1]['all_fp_object_ids']
-            for step_result in self.supervised_results:
-                step_result['all_gt_object_ids'] = final_gt_ids
-                step_result['all_fp_object_ids'] = final_fp_ids
-
-        return {
-            'supervised_results': self.supervised_results,
-            'baseline_results': self.baseline_results,
-            'paper_results': self.paper_results,
-            'bayesian_results': self.bayesian_results,
-        }
-
-
-def run_variant_scenario(scenario: Dict, model_path: str, temporal_mode: str,
-                         threshold: float) -> Dict:
-    """Run one scenario for one variant; return the supervised method's evaluation."""
-    comparison = AblationComparison(
-        supervised_model_path=model_path,
+    # One TrustMethodComparison holds the shared scenario config and the environment factory.
+    comparison = TrustMethodComparison(
+        supervised_model_path=str(models_dir / "supervised_model_full.pth"),
         robot_density=scenario["robot_density"],
         target_density_multiplier=scenario["target_density_multiplier"],
         num_timesteps=NUM_TIMESTEPS,
@@ -171,7 +100,6 @@ def run_variant_scenario(scenario: Dict, model_path: str, temporal_mode: str,
         allow_fp_codetection=True,
         legitimate_mode=scenario.get("legitimate_mode", LEGITIMATE_MODE),
         adversarial_mode=scenario.get("adversarial_mode", ADVERSARIAL_MODE),
-        supervised_temporal_mode=temporal_mode,
     )
     comparison.adversarial_ratio = scenario["adversarial_ratio"]
     comparison.adversarial_fp_injection_rate = scenario["adversarial_fp_injection_rate"]
@@ -181,10 +109,56 @@ def run_variant_scenario(scenario: Dict, model_path: str, temporal_mode: str,
     comparison.delta_plus = scenario["delta_plus"]
     comparison.delta_minus = scenario["delta_minus"]
 
-    results = comparison.run_comparison()
-    evaluation = evaluate_methods(results, threshold=threshold,
-                                  adversarial_lie=False, object_threshold=threshold)
-    return evaluation.get('supervised', {})
+    # Fresh identical-seed environment per method (baseline + each variant).
+    envs = comparison.create_identical_environments(1 + len(variants))
+    baseline_env, variant_envs = envs[0], envs[1:]
+
+    # --- Baseline (no trust): also the shared GT/FP object-metric denominator ---
+    baseline_results = comparison.run_baseline_simulation(baseline_env)
+    shared_gt_ids = baseline_results[-1]['all_gt_object_ids'] if baseline_results else []
+    shared_fp_ids = baseline_results[-1]['all_fp_object_ids'] if baseline_results else []
+
+    evaluation = {}
+    baseline_eval = evaluate_methods(
+        {'baseline_results': baseline_results, 'supervised_results': [],
+         'paper_results': [], 'bayesian_results': []},
+        threshold=threshold, adversarial_lie=False, object_threshold=threshold)
+    evaluation['baseline'] = baseline_eval.get('baseline', {})
+
+    # --- Each ablation variant on its own fresh, same-seed environment ---
+    for variant, env in zip(variants, variant_envs):
+        ckpt_key, temporal_mode = variant_spec(variant, models_dir)
+        model_path = models_dir / f"supervised_model_{ckpt_key}.pth"
+
+        # The variant's supervised algorithm (correct ablation auto-detected from checkpoint
+        # tag, correct temporal_mode). finalize_temporal for the No-Beta variant.
+        comparison.supervised_algorithm = SupervisedTrustAlgorithm(
+            model_path=str(model_path), proximal_range=PROXIMAL_RANGE, temporal_mode=temporal_mode)
+        sup_results = comparison.run_supervised_model_simulation(env)
+        if temporal_mode != 'beta' and sup_results:
+            comparison.supervised_algorithm.finalize_temporal(env.robots)
+            last = sup_results[-1]
+            last['robot_trust_values'] = {r.id: r.trust_value for r in env.robots}
+            last['robot_alpha_beta'] = {r.id: {'alpha': r.trust_alpha, 'beta': r.trust_beta}
+                                        for r in env.robots}
+            for robot in env.robots:
+                last['track_trust_values'][robot.id] = {
+                    t.track_id: {'trust_value': t.trust_value, 'alpha': t.trust_alpha,
+                                 'beta': t.trust_beta, 'object_id': t.object_id}
+                    for t in robot.get_all_tracks()}
+
+        # Shared baseline denominator for object metrics.
+        for step_result in sup_results:
+            step_result['all_gt_object_ids'] = shared_gt_ids
+            step_result['all_fp_object_ids'] = shared_fp_ids
+
+        var_eval = evaluate_methods(
+            {'supervised_results': sup_results, 'baseline_results': baseline_results,
+             'paper_results': [], 'bayesian_results': []},
+            threshold=threshold, adversarial_lie=False, object_threshold=threshold)
+        evaluation[variant] = var_eval.get('supervised', {})
+
+    return evaluation
 
 
 def main():
@@ -223,51 +197,42 @@ def main():
                  for i in range(args.num_scenarios)]
 
     print("=" * 80)
+    # Methods = baseline (no trust) + the ablation variants, all keyed in each scenario's
+    # evaluation dict (matching how the other benchmarks key baseline/bayesian/paper/supervised).
+    methods = ['baseline'] + usable_variants
+
     print("ABLATION BENCHMARK - aggressive optimized policy (delta_plus=delta_minus=3.0)")
     print("=" * 80)
     print(f"Models dir:   {models_dir}")
-    print(f"Variants:     {usable_variants}")
+    print(f"Methods:      {methods}")
     print(f"Scenarios:    {args.num_scenarios} (base_seed={args.base_seed})")
     print("=" * 80)
 
-    # Build the _detailed.json structure: one entry per scenario, every variant appearing
-    # as its own "method" inside that scenario's `evaluation` dict (matching how
+    # Build the _detailed.json structure: one entry per scenario, every method appearing
+    # as its own key inside that scenario's `evaluation` dict (matching how
     # analyze_benchmark_results.py reads scenario["evaluation"][method]).
     scenario_entries = []
     for i, scenario in enumerate(scenarios):
-        evaluation = {}
-        for variant in usable_variants:
-            ckpt_key, temporal_mode = variant_spec(variant, models_dir)
-            model_path = models_dir / f"supervised_model_{ckpt_key}.pth"
-            try:
-                supervised_eval = run_variant_scenario(
-                    scenario, str(model_path), temporal_mode, args.threshold)
-                # supervised_eval is {"robots": {...}, "objects": {...}} for this variant.
-                evaluation[variant] = supervised_eval
-            except Exception as e:
-                print(f"  scenario {i} variant {variant}: ERROR {e}")
+        try:
+            # run_scenario builds a fresh identical-seed environment per method (baseline +
+            # each variant), so trust starts fresh for every one - matches the standard
+            # benchmarks' per-method reset via create_identical_environments.
+            evaluation = run_scenario(scenario, usable_variants, models_dir, args.threshold)
+        except Exception as e:
+            print(f"  scenario {i}: ERROR {e}")
+            evaluation = {}
+
+        if (i + 1) % 10 == 0:
+            print(f"Completed {i + 1}/{args.num_scenarios} scenarios")
 
         scenario_entries.append({
             "scenario_index": i,
-            "parameters": {
-                "name": f"ablation_{i:03d}",
-                "benchmark_type": "ablation",
-                "robot_density": scenario["robot_density"],
-                "adversarial_ratio": scenario["adversarial_ratio"],
-                "adversarial_fp_injection_rate": scenario["adversarial_fp_injection_rate"],
-                "adversarial_fn_suppression_rate": scenario["adversarial_fn_suppression_rate"],
-                "sensor_fp_rate": scenario["sensor_fp_rate"],
-                "sensor_fn_rate": scenario["sensor_fn_rate"],
-                "delta_plus": scenario["delta_plus"],
-                "delta_minus": scenario["delta_minus"],
-                "legitimate_mode": scenario.get("legitimate_mode", LEGITIMATE_MODE),
-                "adversarial_mode": scenario.get("adversarial_mode", ADVERSARIAL_MODE),
-                "random_seed": scenario["random_seed"],
-            },
+            # Store the full scenario dict as parameters, exactly like unified_benchmark.py /
+            # optimized_policy_benchmark.py ("parameters": r["scenario"]) - it already has
+            # name/benchmark_type/robot_density/adversarial_ratio/random_seed/etc.
+            "parameters": scenario,
             "evaluation": evaluation,
         })
-        if (i + 1) % 10 == 0:
-            print(f"  ...{i+1}/{args.num_scenarios} scenarios done")
 
     detailed_results = {
         "metadata": {
@@ -280,8 +245,8 @@ def main():
             "base_seed": args.base_seed,
             "threshold": args.threshold,
             "models_dir": str(models_dir),
-            "methods": usable_variants,  # ablation variant names, keyed in each evaluation
-            "method_display_names": {v: VARIANT_DISPLAY_NAMES[v] for v in usable_variants},
+            "methods": methods,  # baseline + ablation variant names, keyed in each evaluation
+            "method_display_names": {m: VARIANT_DISPLAY_NAMES[m] for m in methods},
             "parameter_ranges": {
                 "delta_plus": config.delta_plus,
                 "delta_minus": config.delta_minus,
@@ -305,15 +270,15 @@ def main():
         return (float(np.mean(vals)), float(np.std(vals))) if vals else (0.0, 0.0)
 
     print("\n" + "=" * 120)
-    print("ABLATION RESULTS (aggressive optimized) - each row is one ablation variant")
+    print("ABLATION RESULTS (aggressive optimized) - baseline + one row per ablation model")
     print("=" * 120)
-    print(f"{'variant':<20}{'robot_prec':<16}{'robot_rec':<16}{'robot_acc':<16}"
+    print(f"{'method':<20}{'robot_prec':<16}{'robot_rec':<16}{'robot_acc':<16}"
           f"{'obj_prec':<16}{'obj_rec':<16}{'obj_acc':<16}")
     print("-" * 120)
-    for variant in usable_variants:
-        rp = agg(variant, 'robots', 'precision'); rr = agg(variant, 'robots', 'recall'); ra = agg(variant, 'robots', 'accuracy')
-        op = agg(variant, 'objects', 'precision'); orr = agg(variant, 'objects', 'recall'); oa = agg(variant, 'objects', 'accuracy')
-        print(f"{variant:<20}{rp[0]:.3f}±{rp[1]:.3f}   {rr[0]:.3f}±{rr[1]:.3f}   {ra[0]:.3f}±{ra[1]:.3f}   "
+    for method in methods:
+        rp = agg(method, 'robots', 'precision'); rr = agg(method, 'robots', 'recall'); ra = agg(method, 'robots', 'accuracy')
+        op = agg(method, 'objects', 'precision'); orr = agg(method, 'objects', 'recall'); oa = agg(method, 'objects', 'accuracy')
+        print(f"{method:<20}{rp[0]:.3f}±{rp[1]:.3f}   {rr[0]:.3f}±{rr[1]:.3f}   {ra[0]:.3f}±{ra[1]:.3f}   "
               f"{op[0]:.3f}±{op[1]:.3f}   {orr[0]:.3f}±{orr[1]:.3f}   {oa[0]:.3f}±{oa[1]:.3f}")
 
     print(f"\n✓ Saved: {detailed_path}")
