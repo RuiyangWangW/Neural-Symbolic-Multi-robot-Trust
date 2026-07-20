@@ -36,19 +36,39 @@ class SupervisedTrustAlgorithm:
     4. Other robots update themselves when building their own ego-graphs
     """
 
-    def __init__(self, model_path: Optional[str] = None, proximal_range: float = 50.0):
+    def __init__(self, model_path: Optional[str] = None, proximal_range: float = 50.0,
+                 ablation: Optional[str] = None, temporal_mode: str = 'beta'):
         """
         Initialize supervised trust algorithm
 
         Args:
             model_path: Path to trained GNN model (.pth file). If None, uses fresh weights.
             proximal_range: Maximum distance for considering robots as proximal neighbors
+            ablation: Architecture ablation the checkpoint was trained with (forwarded to
+                SupervisedTrustPredictor; None auto-detects from the checkpoint tag).
+            temporal_mode: How per-timestep GNN scores are aggregated into a final trust:
+                - 'beta'        : (default) accumulate delta_alpha/delta_beta into a Beta
+                                  distribution every timestep (the paper's contribution #2).
+                - 'last_step'   : ignore accumulation; final trust = last timestep's raw GNN
+                                  probability.
+                - 'mean_scores' : final trust = mean of per-timestep raw GNN probabilities.
+                For 'last_step'/'mean_scores', per-step scores are recorded and the benchmark
+                must call finalize_temporal(robots) once at the end of the episode to write
+                the aggregated trust back onto each robot/track.
         """
+        if temporal_mode not in ('beta', 'last_step', 'mean_scores'):
+            raise ValueError(f"Unknown temporal_mode '{temporal_mode}'")
         self.proximal_range = proximal_range
+        self.temporal_mode = temporal_mode
         self.predictor = SupervisedTrustPredictor(
             model_path=model_path,
-            proximal_range=proximal_range
+            proximal_range=proximal_range,
+            ablation=ablation,
         )
+        # Per-step raw GNN probability history for the non-beta temporal ablations.
+        # robot_id -> list[float];  (robot_id, object_id) -> list[float]
+        self._agent_score_history: Dict = {}
+        self._track_score_history: Dict = {}
 
     def update_trust(self, robots: List[Robot], environment: Optional[SimulationEnvironment] = None) -> Dict[int, Dict]:
         """
@@ -159,6 +179,55 @@ class SupervisedTrustAlgorithm:
 
         return trust_updates
 
+    def finalize_temporal(self, robots: List[Robot]) -> None:
+        """
+        For the temporal ablation ('last_step' / 'mean_scores'), aggregate the per-timestep
+        raw GNN probabilities recorded during the episode into a single final trust value
+        and write it onto each robot (and its meaningful tracks) by setting the Beta params
+        so that trust_value == aggregated_score (alpha=s, beta=1-s).
+
+        No-op for temporal_mode='beta' (trust was already accumulated online), so it is safe
+        to call unconditionally at the end of an episode.
+
+        Args:
+            robots: The robots evaluated this episode (same list passed to update_trust).
+        """
+        if self.temporal_mode == 'beta':
+            return
+
+        def _aggregate(scores: List[float]) -> Optional[float]:
+            if not scores:
+                return None
+            if self.temporal_mode == 'last_step':
+                return scores[-1]
+            return sum(scores) / len(scores)  # 'mean_scores'
+
+        eps = 1e-3
+
+        def _set_trust(obj, score: float):
+            s = min(max(score, eps), 1.0 - eps)  # keep alpha,beta strictly positive
+            obj.trust_alpha = s
+            obj.trust_beta = 1.0 - s
+
+        robots_by_id = {r.id: r for r in robots}
+
+        # Agent (robot) trust
+        for robot_id, scores in self._agent_score_history.items():
+            agg = _aggregate(scores)
+            if agg is None or robot_id not in robots_by_id:
+                continue
+            _set_trust(robots_by_id[robot_id], agg)
+
+        # Track trust (only tracks that were meaningful at some step)
+        for (robot_id, object_id), scores in self._track_score_history.items():
+            agg = _aggregate(scores)
+            if agg is None or robot_id not in robots_by_id:
+                continue
+            robot = robots_by_id[robot_id]
+            track = robot.all_tracks.get(object_id)
+            if track is not None:
+                _set_trust(track, agg)
+
     def _update_trust_from_predictions(
         self,
         predictions: Dict,
@@ -197,21 +266,24 @@ class SupervisedTrustAlgorithm:
                 raw_p = agent_probs[ego_idx][0]  # Extract raw probability from array
 
                 # Use raw probability from model (no calibration)
-                p = raw_p
-
-                # Convert probability to alpha/beta update
-                # High probability (p ≥ 0.5) → increase alpha (positive evidence)
-                # Low probability (p < 0.5) → increase beta (negative evidence)
-                if p >= 0.5:
-                    delta_alpha = p
-                    delta_beta = 0.0
-                else:
-                    delta_alpha = 0.0
-                    delta_beta = (1 - p)
+                p = float(raw_p)
 
                 # Find ego robot object (first robot in proximal_robots list)
                 ego_robot = graph_data._proximal_robots[0]
-                ego_robot.update_trust(delta_alpha, delta_beta)
+
+                if self.temporal_mode == 'beta':
+                    # Convert probability to alpha/beta update (contribution #2)
+                    # High probability (p ≥ 0.5) → increase alpha (positive evidence)
+                    # Low probability (p < 0.5) → increase beta (negative evidence)
+                    if p >= 0.5:
+                        delta_alpha, delta_beta = p, 0.0
+                    else:
+                        delta_alpha, delta_beta = 0.0, (1 - p)
+                    ego_robot.update_trust(delta_alpha, delta_beta)
+                else:
+                    # Temporal ablation: record the raw per-step score instead of
+                    # accumulating a Beta distribution (finalized in finalize_temporal()).
+                    self._agent_score_history.setdefault(ego_robot.id, []).append(p)
 
         # Update ONLY meaningful tracks (those that pass cross-validation)
         if 'track' in predictions and hasattr(graph_data, '_fused_tracks') and hasattr(graph_data, '_individual_tracks') and meaningful_track_indices:
@@ -231,17 +303,7 @@ class SupervisedTrustAlgorithm:
             for track_idx in meaningful_track_indices:
                 if track_idx < len(track_probs) and track_idx < len(all_tracks):
                     raw_p = track_probs[track_idx][0]  # Extract raw probability from array
-                    p = raw_p  # Use raw probability (no calibration)
-
-                    # Convert probability to alpha/beta update
-                    if p >= 0.5:
-                        # High trust prediction - increase alpha
-                        delta_alpha = p
-                        delta_beta = 0.0
-                    else:
-                        # Low trust prediction - increase beta
-                        delta_alpha = 0.0
-                        delta_beta = (1 - p)
+                    p = float(raw_p)  # Use raw probability (no calibration)
 
                     # Find the track object using the graph's own track list
                     object_id = all_tracks[track_idx].object_id
@@ -256,15 +318,28 @@ class SupervisedTrustAlgorithm:
                     # though a proximal robot currently corroborates it - see
                     # _identify_meaningful_tracks criterion 1b). Both cases have a real
                     # all_tracks entry to update; anything else was never a track ego owns.
-                    if (object_id in ego_robot.get_reported_object_ids()
+                    if not (object_id in ego_robot.get_reported_object_ids()
                             or object_id in ego_robot.all_tracks):
+                        continue
+
+                    if self.temporal_mode == 'beta':
+                        # Convert probability to alpha/beta update (contribution #2)
+                        if p >= 0.5:
+                            delta_alpha, delta_beta = p, 0.0
+                        else:
+                            delta_alpha, delta_beta = 0.0, (1 - p)
                         # Forward trust update to all_tracks (persistent storage)
                         ego_robot.forward_trust_update_to_all_tracks(
                             object_id=object_id,
                             delta_alpha=delta_alpha,
                             delta_beta=delta_beta
                         )
-                        updated_track_ids.add(object_id)
+                    else:
+                        # Temporal ablation: record the raw per-step score, keyed by the
+                        # ego robot + object, finalized in finalize_temporal().
+                        self._track_score_history.setdefault((ego_robot.id, object_id), []).append(p)
+
+                    updated_track_ids.add(object_id)
 
         return updated_track_ids
 

@@ -1175,7 +1175,10 @@ class SupervisedTrustTrainer:
                     'train_loss': train_loss,
                     'val_loss': val_loss,
                     'train_metrics': train_metrics,
-                    'val_metrics': val_metrics
+                    'val_metrics': val_metrics,
+                    # Architecture tag so SupervisedTrustPredictor rebuilds the matching
+                    # ablation variant when loading this checkpoint.
+                    'ablation': getattr(self.model, 'ablation', None),
                 }, save_path)
 
                 log_print(f"✅ Saved best model (val_loss: {best_val_loss:.4f}) to {save_path}")
@@ -1379,6 +1382,11 @@ def main():
                        help='Train/validation split ratio (default: 0.8 = 80%% train, 20%% val)')
     parser.add_argument('--split-seed', type=int, default=42,
                        help='Random seed for train/val split (default: 42, ensures reproducibility)')
+    parser.add_argument('--ablation', type=str, default=None,
+                       choices=[None, 'no_gat', 'homogeneous', 'triplet_init'],
+                       help='Architecture ablation to train (default: None = full model). See '
+                            'SupervisedTrustGNN.VALID_ABLATIONS. The tag is written into the '
+                            'checkpoint so the predictor reconstructs the matching architecture.')
 
     args = parser.parse_args()
 
@@ -1475,8 +1483,9 @@ def main():
                            num_workers=num_workers, pin_memory=pin_memory)
 
     # Create supervised model with structure-only learning (no input features)
-    model = SupervisedTrustGNN(hidden_dim=128)
+    model = SupervisedTrustGNN(hidden_dim=128, ablation=args.ablation)
 
+    log_print(f"🧬 Ablation: {args.ablation if args.ablation else 'none (full model)'}")
     log_print(f"🧠 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     log_print(f"📦 Batching mode: {batching_mode}")
     log_print(f"👷 DataLoader workers: {num_workers}")

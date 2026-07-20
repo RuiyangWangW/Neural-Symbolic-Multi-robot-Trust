@@ -73,7 +73,7 @@ class WebotsTrustComparison:
                  webots_data_path: str = "webots_sim_filtered_corrected",
                  supervised_model_path: str = "supervised_trust_model.pth",
                  num_scenarios: int = 100,
-                 num_adversarial: int = 1,
+                 num_adversarial: int = 2,
                  num_timesteps: int = 100,
                  random_seed: int = 42):
         """

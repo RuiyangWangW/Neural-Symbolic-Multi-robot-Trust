@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import HeteroConv, GATConv, Linear
 from torch_geometric.data import HeteroData
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 from dataclasses import dataclass
 import numpy as np
@@ -132,10 +132,33 @@ class SupervisedTrustGNN(nn.Module):
     - Binary classification heads for agent and track trust prediction
     """
 
-    def __init__(self, hidden_dim: int = 128):
+    # The 5-model ablation study (ablation=None is the full reference model).
+    #   None          - full architecture
+    #   no_gat        - skip the HeteroGAT stack entirely; triplet-init h^(0) -> heads
+    #   homogeneous   - map every relation to a single shared GATConv (no relation typing)
+    #   triplet_init  - replace the triplet encoder with a learned per-type embedding
+    #   (No-Beta is NOT a model here: it is the FULL model with inference-side
+    #    temporal_mode='mean_scores' - see SupervisedTrustAlgorithm.)
+    VALID_ABLATIONS = {
+        None,
+        'no_gat',
+        'homogeneous',
+        'triplet_init',
+    }
+
+    def __init__(self, hidden_dim: int = 128, ablation: Optional[str] = None):
         super(SupervisedTrustGNN, self).__init__()
 
+        if ablation not in self.VALID_ABLATIONS:
+            raise ValueError(f"Unknown ablation '{ablation}'. Valid: {sorted(str(a) for a in self.VALID_ABLATIONS)}")
+
         self.hidden_dim = hidden_dim
+        self.ablation = ablation
+
+        # Architecture switches derived from the ablation config
+        self.num_conv_layers = 0 if ablation == 'no_gat' else 3
+        self.homogeneous = (ablation == 'homogeneous')
+        self.use_triplet_encoder = (ablation != 'triplet_init')
 
         # Define edge types for heterogeneous graph
         self.edge_types = [
@@ -150,41 +173,54 @@ class SupervisedTrustGNN(nn.Module):
         # Map edge types to indices for one-hot encoding
         self.edge_type_to_idx = {edge_type: i for i, edge_type in enumerate(self.edge_types)}
 
-        # Triplet encoders: Convert local edge structure to node embeddings
-        # Separate encoders for agents and tracks (they have different edge patterns)
-        self.agent_triplet_encoder = TripletEncoder(
-            hidden_dim=hidden_dim,
-            num_heads=4,
-            num_layers=1,
-            dropout=0.1
-        )
+        # For the homogeneous ablation, all typed relations are merged into these two
+        # single-relation edge types (agent<->track and agent<->agent still keep distinct
+        # src/dst node types, but every relation shares ONE GATConv weight matrix - killing
+        # relation-typed message passing while preserving the bipartite/agent-agent topology).
+        self.homogeneous_edge_types = [
+            ('agent', 'edge', 'track'),
+            ('track', 'edge', 'agent'),
+            ('agent', 'edge', 'agent'),
+        ]
 
-        self.track_triplet_encoder = TripletEncoder(
-            hidden_dim=hidden_dim,
-            num_heads=4,
-            num_layers=1,
-            dropout=0.1
-        )
+        # Node-init encoders.
+        if self.use_triplet_encoder:
+            # Triplet encoders: Convert local edge structure to node embeddings
+            # Separate encoders for agents and tracks (they have different edge patterns)
+            self.agent_triplet_encoder = TripletEncoder(
+                hidden_dim=hidden_dim, num_heads=4, num_layers=1, dropout=0.1,
+            )
+            self.track_triplet_encoder = TripletEncoder(
+                hidden_dim=hidden_dim, num_heads=4, num_layers=1, dropout=0.1,
+            )
+        else:
+            # triplet_init ablation: delete triplet extraction / MLPtri / attention pooling /
+            # Linear_out (Eqs 26-31). Replace h^(0) with a learned per-type embedding:
+            # nn.Embedding(2, hidden_dim), row 0 = agent/robot, row 1 = track. All robots
+            # share one initial vector, all tracks share another; no local edge structure.
+            self.type_embedding = nn.Embedding(2, hidden_dim)
 
-        # Three layers of heterogeneous convolution (each with independent parameters)
-        # FIXED: Create separate conv_dict for each layer to avoid parameter sharing
-        self.conv1 = HeteroConv(self._create_conv_dict(), aggr='mean')
-        self.conv2 = HeteroConv(self._create_conv_dict(), aggr='mean')
-        self.conv3 = HeteroConv(self._create_conv_dict(), aggr='mean')
-
-        # Batch normalization layers
-        self.norm1 = nn.ModuleDict({
-            'agent': nn.BatchNorm1d(hidden_dim),
-            'track': nn.BatchNorm1d(hidden_dim)
-        })
-        self.norm2 = nn.ModuleDict({
-            'agent': nn.BatchNorm1d(hidden_dim),
-            'track': nn.BatchNorm1d(hidden_dim)
-        })
-        self.norm3 = nn.ModuleDict({
-            'agent': nn.BatchNorm1d(hidden_dim),
-            'track': nn.BatchNorm1d(hidden_dim)
-        })
+        # Heterogeneous convolution layers (each with independent parameters).
+        # num_conv_layers is 0 for the no_gat ablation (triplet embeddings feed the heads
+        # directly, no message passing at all), else 3.
+        if self.num_conv_layers >= 1:
+            self.conv1 = HeteroConv(self._create_conv_dict(), aggr='mean')
+            self.norm1 = nn.ModuleDict({
+                'agent': nn.BatchNorm1d(hidden_dim),
+                'track': nn.BatchNorm1d(hidden_dim)
+            })
+        if self.num_conv_layers >= 2:
+            self.conv2 = HeteroConv(self._create_conv_dict(), aggr='mean')
+            self.norm2 = nn.ModuleDict({
+                'agent': nn.BatchNorm1d(hidden_dim),
+                'track': nn.BatchNorm1d(hidden_dim)
+            })
+        if self.num_conv_layers >= 3:
+            self.conv3 = HeteroConv(self._create_conv_dict(), aggr='mean')
+            self.norm3 = nn.ModuleDict({
+                'agent': nn.BatchNorm1d(hidden_dim),
+                'track': nn.BatchNorm1d(hidden_dim)
+            })
 
         # Binary classification heads for trust prediction
         self.agent_classifier = nn.Sequential(
@@ -218,20 +254,53 @@ class SupervisedTrustGNN(nn.Module):
         This helper method is called for each conv layer to ensure they have
         separate learnable parameters (no parameter sharing).
 
+        For the homogeneous ablation, only the 3 single-relation edge types are created
+        (one shared GATConv per src/dst node-type pairing), so every original relation is
+        routed through the SAME weight matrix - removing relation-typed message passing.
+
         Returns:
             Dictionary mapping edge types to GATConv modules
         """
         conv_dict = {}
-        for src_type, relation, dst_type in self.edge_types:
+        edge_types = self.homogeneous_edge_types if self.homogeneous else self.edge_types
+        for src_type, relation, dst_type in edge_types:
             conv_dict[(src_type, relation, dst_type)] = GATConv(
                 in_channels=self.hidden_dim,
                 out_channels=self.hidden_dim,
                 heads=4,
                 concat=False,
                 add_self_loops=False,
-                dropout=0.1  # Standardized to 0.1
+                dropout=0.1,  # Standardized to 0.1
             )
         return conv_dict
+
+    def _to_homogeneous_edges(self, edge_index_dict, device='cpu'):
+        """
+        Collapse the 6 typed relations in edge_index_dict into the 3 single-relation edge
+        types (agent->track, track->agent, agent->agent) for the homogeneous ablation, so
+        every original relation flows through one shared GATConv per node-type pairing.
+
+        Returns homo_edge_index_dict.
+        """
+        merged_index = {et: [] for et in self.homogeneous_edge_types}
+
+        for (src_type, relation, dst_type), edge_index in edge_index_dict.items():
+            homo_key = (src_type, 'edge', dst_type)
+            if homo_key not in merged_index:
+                # Shouldn't happen (all real edges are agent/track pairings), but guard.
+                continue
+            if edge_index is None or edge_index.numel() == 0:
+                continue
+            merged_index[homo_key].append(edge_index)
+
+        homo_edge_index_dict = {}
+        for homo_key in self.homogeneous_edge_types:
+            if merged_index[homo_key]:
+                homo_edge_index_dict[homo_key] = torch.cat(merged_index[homo_key], dim=1)
+            else:
+                homo_edge_index_dict[homo_key] = torch.empty((2, 0), dtype=torch.long, device=device)
+
+        return homo_edge_index_dict
 
     def forward(self, num_agents, num_tracks, edge_index_dict, device='cpu',
                 agent_triplets=None, agent_triplet_mask=None,
@@ -256,80 +325,87 @@ class SupervisedTrustGNN(nn.Module):
         has_tracks = num_tracks > 0
 
         # ============================================================
-        # STEP 1: Triplet Encoding - Extract and encode local structure
+        # STEP 1: Node initialization (h^(0))
         # ============================================================
-
-        # Use pre-computed triplets if available, otherwise extract them
-        if agent_triplets is not None and agent_triplet_mask is not None:
-            # Use pre-computed triplets (faster - skip extraction)
-            agent_triplets = agent_triplets.to(device)
-            agent_triplet_mask = agent_triplet_mask.to(device)
+        # Full / homogeneous / no_gat: encode local edge structure as triplets (Eqs 26-31).
+        # triplet_init ablation: use a plain learned per-type embedding (no structure).
+        if self.use_triplet_encoder:
+            if agent_triplets is not None and agent_triplet_mask is not None:
+                agent_triplets = agent_triplets.to(device)
+                agent_triplet_mask = agent_triplet_mask.to(device)
+            else:
+                agent_triplets, agent_triplet_mask = self._extract_triplets('agent', num_agents, edge_index_dict, device)
+            agent_embeddings = self.agent_triplet_encoder(agent_triplets, agent_triplet_mask)
         else:
-            # Extract triplets dynamically (slower - for inference)
-            agent_triplets, agent_triplet_mask = self._extract_triplets('agent', num_agents, edge_index_dict, device)
-
-        # Encode with transformer
-        agent_embeddings = self.agent_triplet_encoder(agent_triplets, agent_triplet_mask)
+            # triplet_init: every agent node starts from the same learned embedding (row 0)
+            agent_idx = torch.zeros(num_agents, dtype=torch.long, device=device)
+            agent_embeddings = self.type_embedding(agent_idx)
 
         x_dict = {'agent': agent_embeddings}
 
-        # Extract and encode triplets for track nodes
         if has_tracks:
-            if track_triplets is not None and track_triplet_mask is not None:
-                # Use pre-computed triplets (faster - skip extraction)
-                track_triplets = track_triplets.to(device)
-                track_triplet_mask = track_triplet_mask.to(device)
+            if self.use_triplet_encoder:
+                if track_triplets is not None and track_triplet_mask is not None:
+                    track_triplets = track_triplets.to(device)
+                    track_triplet_mask = track_triplet_mask.to(device)
+                else:
+                    track_triplets, track_triplet_mask = self._extract_triplets('track', num_tracks, edge_index_dict, device)
+                track_embeddings = self.track_triplet_encoder(track_triplets, track_triplet_mask)
             else:
-                # Extract triplets dynamically (slower - for inference)
-                track_triplets, track_triplet_mask = self._extract_triplets('track', num_tracks, edge_index_dict, device)
-
-            track_embeddings = self.track_triplet_encoder(track_triplets, track_triplet_mask)
+                # triplet_init: every track node starts from the same learned embedding (row 1)
+                track_idx = torch.ones(num_tracks, dtype=torch.long, device=device)
+                track_embeddings = self.type_embedding(track_idx)
             x_dict['track'] = track_embeddings
         else:
-            # Create empty track tensor with correct dimensions
             x_dict['track'] = torch.empty(0, self.hidden_dim, device=device)
 
-        # Graph convolution layers with skip connections and batch normalization
-        # First layer
-        x_dict_1 = self.conv1(x_dict, edge_index_dict)
-        x_dict_1 = {key: F.relu(x) for key, x in x_dict_1.items()}
+        # ============================================================
+        # STEP 2: Message passing (0 or 3 GAT layers)
+        # ============================================================
+        # For the homogeneous ablation, collapse the typed relations into single-relation
+        # edge types (one shared GATConv per node-type pairing - no relation typing).
+        if self.homogeneous:
+            conv_edge_index_dict = self._to_homogeneous_edges(edge_index_dict, device)
+        else:
+            conv_edge_index_dict = edge_index_dict
 
-        # Apply batch normalization (only if batch size > 1)
-        for key in x_dict_1:
-            if x_dict_1[key].shape[0] > 1:
-                x_dict_1[key] = self.norm1[key](x_dict_1[key])
+        def _run_conv(conv, x_in):
+            return conv(x_in, conv_edge_index_dict)
 
-        # Second layer with skip connection
-        x_dict_2 = self.conv2(x_dict_1, edge_index_dict)
-        x_dict_2 = {key: F.relu(x) for key, x in x_dict_2.items()}
+        if self.num_conv_layers == 0:
+            # no_gat ablation: node embeddings feed the heads directly (no message passing).
+            x_dict_final = x_dict
+        else:
+            # First layer
+            x_dict_1 = _run_conv(self.conv1, x_dict)
+            x_dict_1 = {key: F.relu(x) for key, x in x_dict_1.items()}
+            for key in x_dict_1:
+                if x_dict_1[key].shape[0] > 1:
+                    x_dict_1[key] = self.norm1[key](x_dict_1[key])
 
-        # Apply batch normalization
-        for key in x_dict_2:
-            if x_dict_2[key].shape[0] > 1:
-                x_dict_2[key] = self.norm2[key](x_dict_2[key])
+            # Second layer with skip connection from first
+            x_dict_2 = _run_conv(self.conv2, x_dict_1)
+            x_dict_2 = {key: F.relu(x) for key, x in x_dict_2.items()}
+            for key in x_dict_2:
+                if x_dict_2[key].shape[0] > 1:
+                    x_dict_2[key] = self.norm2[key](x_dict_2[key])
+            x_dict_2 = {
+                key: x_dict_2[key] + x_dict_1[key] if x_dict_2[key].shape[0] > 0 and x_dict_1[key].shape[0] > 0
+                else x_dict_2[key]
+                for key in x_dict_2
+            }
 
-        # Add skip connection from first layer
-        x_dict_2 = {
-            key: x_dict_2[key] + x_dict_1[key] if x_dict_2[key].shape[0] > 0 and x_dict_1[key].shape[0] > 0
-            else x_dict_2[key]
-            for key in x_dict_2
-        }
-
-        # Third layer with skip connection
-        x_dict_3 = self.conv3(x_dict_2, edge_index_dict)
-        x_dict_3 = {key: F.relu(x) for key, x in x_dict_3.items()}
-
-        # Apply batch normalization
-        for key in x_dict_3:
-            if x_dict_3[key].shape[0] > 1:
-                x_dict_3[key] = self.norm3[key](x_dict_3[key])
-
-        # Add skip connection from second layer
-        x_dict_final = {
-            key: x_dict_3[key] + x_dict_2[key] if x_dict_3[key].shape[0] > 0 and x_dict_2[key].shape[0] > 0
-            else x_dict_3[key]
-            for key in x_dict_3
-        }
+            # Third layer with skip connection from second
+            x_dict_3 = _run_conv(self.conv3, x_dict_2)
+            x_dict_3 = {key: F.relu(x) for key, x in x_dict_3.items()}
+            for key in x_dict_3:
+                if x_dict_3[key].shape[0] > 1:
+                    x_dict_3[key] = self.norm3[key](x_dict_3[key])
+            x_dict_final = {
+                key: x_dict_3[key] + x_dict_2[key] if x_dict_3[key].shape[0] > 0 and x_dict_2[key].shape[0] > 0
+                else x_dict_3[key]
+                for key in x_dict_3
+            }
 
         # Apply classification heads
         predictions = {}
@@ -441,7 +517,8 @@ class SupervisedTrustPredictor:
     Wrapper class for supervised trust prediction
     """
 
-    def __init__(self, model_path: str, device: str = 'cpu', proximal_range: float = 50.0):
+    def __init__(self, model_path: str, device: str = 'cpu', proximal_range: float = 50.0,
+                 ablation: Optional[str] = None):
         """
         Initialize predictor with trained model
 
@@ -449,20 +526,36 @@ class SupervisedTrustPredictor:
             model_path: Path to trained model checkpoint
             device: Device to run inference on
             proximal_range: Proximal range for ego graph building (must match training data)
+            ablation: Architecture ablation to reconstruct (see SupervisedTrustGNN). If None,
+                it is auto-detected from an 'ablation' tag stored in the checkpoint; pass it
+                explicitly to override. Must match the architecture the checkpoint was
+                trained with, or load_state_dict will skip mismatched tensors.
         """
         self.device = torch.device(device)
         self.model = None
         self.available = False  # Track whether model loaded successfully
+        self.ablation = ablation
         self.ego_graph_builder = EgoGraphBuilder(proximal_range=proximal_range)
         self._load_model(model_path)
 
     def _load_model(self, model_path: str):
         """Load trained model from checkpoint or initialize fresh weights if unavailable"""
-        # Always create the model so we can fall back to fresh weights when needed
-        # Structure-only learning: no input features, only learnable type embeddings
-        self.model = SupervisedTrustGNN(hidden_dim=128)
-
         resolved_path = Path(model_path) if model_path else None
+
+        # Determine the architecture (ablation) to build. Prefer an explicit override, else
+        # read the tag the training script wrote into the checkpoint, else full model.
+        ablation = self.ablation
+        if ablation is None and resolved_path and resolved_path.exists():
+            try:
+                _ckpt_peek = torch.load(resolved_path, map_location='cpu', weights_only=False)
+                if isinstance(_ckpt_peek, dict) and 'ablation' in _ckpt_peek:
+                    ablation = _ckpt_peek['ablation']
+            except Exception:
+                ablation = None
+
+        # Build the model with the resolved architecture so state_dict keys/shapes match.
+        self.model = SupervisedTrustGNN(hidden_dim=128, ablation=ablation)
+        self.ablation = ablation
 
         if resolved_path and resolved_path.exists():
             try:
