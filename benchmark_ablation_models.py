@@ -24,6 +24,7 @@ Usage:
 
 import argparse
 import json
+import random
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -168,16 +169,27 @@ def main():
     parser.add_argument('--variants', nargs='+',
                         default=ALL_VARIANTS, choices=ALL_VARIANTS,
                         help='Which of the 5 ablation models to benchmark (default: all)')
-    parser.add_argument('--num-scenarios', type=int, default=50,
-                        help='Number of aggressive scenarios (default: 50)')
-    parser.add_argument('--base-seed', type=int, default=42)
-    parser.add_argument('--threshold', type=float, default=0.5)
+    # Defaults UNIFIED with optimized_policy_benchmark.py so the ablation 'full' variant is
+    # directly comparable to that benchmark's aggressive 'supervised' method (identical
+    # scenarios/seed/threshold -> identical numbers).
+    parser.add_argument('--num-scenarios', type=int, default=100,
+                        help='Number of aggressive scenarios to run (default: 100)')
+    parser.add_argument('--threshold', type=float, default=0.3,
+                        help='Trust threshold for binary classification (default: 0.3, '
+                             'consistent across all benchmarks)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Base random seed for reproducibility (default: random). Pass the '
+                             'same --seed as optimized_policy_benchmark.py to reproduce its '
+                             'aggressive scenarios exactly.')
     parser.add_argument('--output-dir', type=str, default='benchmark_results',
                         help='Directory to save results (default: benchmark_results/, matching '
                              'the other benchmarks so analyze_benchmark_results.py picks it up)')
     parser.add_argument('--output-name', type=str, default='ablation',
                         help='Base filename, produces <output-dir>/<output-name>_detailed.json')
     args = parser.parse_args()
+
+    # Generate base seed (same convention as optimized_policy_benchmark.py)
+    base_seed = args.seed if args.seed is not None else random.randint(1, 999999)
 
     models_dir = Path(args.models_dir)
     config = BENCHMARK_CONFIGS['aggressive']  # delta_plus = delta_minus = 3.0
@@ -193,19 +205,20 @@ def main():
                   f"{models_dir / f'supervised_model_{ckpt_key}.pth'}")
 
     # Same scenario set (same seeds) evaluated by EVERY variant -> paired comparison.
-    scenarios = [sample_scenario_parameters(i, args.base_seed, config)
+    scenarios = [sample_scenario_parameters(i, base_seed, config)
                  for i in range(args.num_scenarios)]
 
-    print("=" * 80)
     # Methods = baseline (no trust) + the ablation variants, all keyed in each scenario's
     # evaluation dict (matching how the other benchmarks key baseline/bayesian/paper/supervised).
     methods = ['baseline'] + usable_variants
 
+    print("=" * 80)
     print("ABLATION BENCHMARK - aggressive optimized policy (delta_plus=delta_minus=3.0)")
     print("=" * 80)
+    print(f"Base seed: {base_seed} (use --seed {base_seed} to reproduce)")
     print(f"Models dir:   {models_dir}")
     print(f"Methods:      {methods}")
-    print(f"Scenarios:    {args.num_scenarios} (base_seed={args.base_seed})")
+    print(f"Scenarios:    {args.num_scenarios}")
     print("=" * 80)
 
     # Build the _detailed.json structure: one entry per scenario, every method appearing
@@ -242,7 +255,7 @@ def main():
                            "variant of the supervised model.",
             "adversarial_mode": ADVERSARIAL_MODE,
             "num_scenarios": args.num_scenarios,
-            "base_seed": args.base_seed,
+            "base_seed": base_seed,
             "threshold": args.threshold,
             "models_dir": str(models_dir),
             "methods": methods,  # baseline + ablation variant names, keyed in each evaluation
