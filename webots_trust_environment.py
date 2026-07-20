@@ -142,7 +142,7 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
         print(f"  Adversarial robots: {len(self.adversarial_robot_ids)}")
         print(f"  Legitimate robots: {len(self.robot_data) - len(self.adversarial_robot_ids)}")
         print(f"  Ground truth objects: {len(self.ground_truth_objects)}")
-        print(f"  Adversarial mode: optimized (aggressive), delta_plus={self.delta_plus}, delta_minus={self.delta_minus}")
+        print(f"  Adversarial mode: optimized, delta_plus={self.delta_plus}, delta_minus={self.delta_minus}")
         print(f"  FP co-detection: {self.allow_fp_codetection}")
         print(f"  Total FP objects: {len(self.shared_fp_objects)}")
 

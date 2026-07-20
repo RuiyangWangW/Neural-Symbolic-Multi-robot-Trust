@@ -9,7 +9,7 @@ AdversarialRobot architecture and reported_tracks/all_tracks track model).
 
 Features:
 - FP co-detection enabled by default
-- Adversarial robots run the real optimized ("aggressive", delta_plus=delta_minus=3.0)
+- Adversarial robots run the real optimized
   MILP policy - not a random FP/FN rate - for both persistent FP injection and GT
   suppression decisions
 - Reports robot precision/recall and object precision/recall
@@ -73,7 +73,7 @@ class WebotsTrustComparison:
                  webots_data_path: str = "webots_sim_filtered_corrected",
                  supervised_model_path: str = "supervised_trust_model.pth",
                  num_scenarios: int = 100,
-                 num_adversarial: int = 2,
+                 num_adversarial: int = 1,
                  num_timesteps: int = 100,
                  random_seed: int = 42):
         """
@@ -599,7 +599,7 @@ class WebotsTrustComparison:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Webots trust method comparison - optimized aggressive adversarial policy"
+        description="Webots trust method comparison - optimized adversarial policy"
     )
     parser.add_argument("--webots-data-path", type=str, default="webots_sim_filtered_corrected",
                         help="Path to filtered Webots data")
@@ -607,8 +607,8 @@ def main():
                         help="Path to trained supervised GNN model")
     parser.add_argument("--num-scenarios", type=int, default=100,
                         help="Number of scenarios to test (default: 100)")
-    parser.add_argument("--num-adversarial", type=int, default=2,
-                        help="Number of adversarial robots per scenario (default: 2)")
+    parser.add_argument("--num-adversarial", type=int, default=1,
+                        help="Number of adversarial robots per scenario (default: 1)")
     parser.add_argument("--num-timesteps", type=int, default=100,
                         help="Number of timesteps to simulate per scenario (default: 100)")
     parser.add_argument("--seed", type=int, default=42,
