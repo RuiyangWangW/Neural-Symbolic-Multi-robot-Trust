@@ -173,15 +173,11 @@ class SupervisedTrustGNN(nn.Module):
         # Map edge types to indices for one-hot encoding
         self.edge_type_to_idx = {edge_type: i for i, edge_type in enumerate(self.edge_types)}
 
-        # For the homogeneous ablation, all typed relations are merged into these two
-        # single-relation edge types (agent<->track and agent<->agent still keep distinct
-        # src/dst node types, but every relation shares ONE GATConv weight matrix - killing
-        # relation-typed message passing while preserving the bipartite/agent-agent topology).
-        self.homogeneous_edge_types = [
-            ('agent', 'edge', 'track'),
-            ('track', 'edge', 'agent'),
-            ('agent', 'edge', 'agent'),
-        ]
+        # For the homogeneous ablation there is exactly ONE node type and ONE edge type:
+        # agent and track nodes are merged into a single unified node set (track indices
+        # offset by num_agents) and all 6 relations become one untyped edge set, run through
+        # a single plain GATConv (see _to_homogeneous_edges / the forward pass). No node-type
+        # or relation-type distinction survives during message passing.
 
         # Node-init encoders.
         if self.use_triplet_encoder:
@@ -200,27 +196,37 @@ class SupervisedTrustGNN(nn.Module):
             # share one initial vector, all tracks share another; no local edge structure.
             self.type_embedding = nn.Embedding(2, hidden_dim)
 
-        # Heterogeneous convolution layers (each with independent parameters).
+        # Convolution layers (each with independent parameters).
         # num_conv_layers is 0 for the no_gat ablation (triplet embeddings feed the heads
         # directly, no message passing at all), else 3.
+        #
+        # homogeneous ablation: a SINGLE plain GATConv per layer over ONE node type and ONE
+        # edge type - agent and track nodes are merged into one unified node set and all 6
+        # relations become a single untyped edge set, so the model has no notion of node
+        # type OR relation type during message passing. Other variants keep the per-relation
+        # HeteroConv (relation-typed message passing).
+        def _make_conv():
+            if self.homogeneous:
+                return GATConv(in_channels=hidden_dim, out_channels=hidden_dim, heads=4,
+                               concat=False, add_self_loops=False, dropout=0.1)
+            return HeteroConv(self._create_conv_dict(), aggr='mean')
+
+        def _make_norm():
+            if self.homogeneous:
+                # One shared norm over the unified node set (no per-node-type norms).
+                return nn.BatchNorm1d(hidden_dim)
+            return nn.ModuleDict({'agent': nn.BatchNorm1d(hidden_dim),
+                                  'track': nn.BatchNorm1d(hidden_dim)})
+
         if self.num_conv_layers >= 1:
-            self.conv1 = HeteroConv(self._create_conv_dict(), aggr='mean')
-            self.norm1 = nn.ModuleDict({
-                'agent': nn.BatchNorm1d(hidden_dim),
-                'track': nn.BatchNorm1d(hidden_dim)
-            })
+            self.conv1 = _make_conv()
+            self.norm1 = _make_norm()
         if self.num_conv_layers >= 2:
-            self.conv2 = HeteroConv(self._create_conv_dict(), aggr='mean')
-            self.norm2 = nn.ModuleDict({
-                'agent': nn.BatchNorm1d(hidden_dim),
-                'track': nn.BatchNorm1d(hidden_dim)
-            })
+            self.conv2 = _make_conv()
+            self.norm2 = _make_norm()
         if self.num_conv_layers >= 3:
-            self.conv3 = HeteroConv(self._create_conv_dict(), aggr='mean')
-            self.norm3 = nn.ModuleDict({
-                'agent': nn.BatchNorm1d(hidden_dim),
-                'track': nn.BatchNorm1d(hidden_dim)
-            })
+            self.conv3 = _make_conv()
+            self.norm3 = _make_norm()
 
         # Binary classification heads for trust prediction
         self.agent_classifier = nn.Sequential(
@@ -274,33 +280,32 @@ class SupervisedTrustGNN(nn.Module):
             )
         return conv_dict
 
-    def _to_homogeneous_edges(self, edge_index_dict, device='cpu'):
+    def _to_homogeneous_edges(self, edge_index_dict, num_agents, num_tracks, device='cpu'):
         """
-        Collapse the 6 typed relations in edge_index_dict into the 3 single-relation edge
-        types (agent->track, track->agent, agent->agent) for the homogeneous ablation, so
-        every original relation flows through one shared GATConv per node-type pairing.
+        Collapse ALL 6 typed relations into ONE untyped edge_index over a single unified
+        node set for the homogeneous ablation. Agent nodes occupy indices [0, num_agents);
+        track nodes are offset to [num_agents, num_agents + num_tracks). Each relation's
+        (src, dst) indices are remapped into this shared space based on its src/dst node
+        types, then all edges are concatenated - so message passing sees neither node type
+        nor relation type.
 
-        Returns homo_edge_index_dict.
+        Returns a single edge_index tensor of shape [2, total_edges].
         """
-        merged_index = {et: [] for et in self.homogeneous_edge_types}
-
-        for (src_type, relation, dst_type), edge_index in edge_index_dict.items():
-            homo_key = (src_type, 'edge', dst_type)
-            if homo_key not in merged_index:
-                # Shouldn't happen (all real edges are agent/track pairings), but guard.
-                continue
+        cols = []
+        for (src_type, _relation, dst_type), edge_index in edge_index_dict.items():
             if edge_index is None or edge_index.numel() == 0:
                 continue
-            merged_index[homo_key].append(edge_index)
+            src = edge_index[0].clone()
+            dst = edge_index[1].clone()
+            if src_type == 'track':
+                src = src + num_agents
+            if dst_type == 'track':
+                dst = dst + num_agents
+            cols.append(torch.stack([src, dst], dim=0))
 
-        homo_edge_index_dict = {}
-        for homo_key in self.homogeneous_edge_types:
-            if merged_index[homo_key]:
-                homo_edge_index_dict[homo_key] = torch.cat(merged_index[homo_key], dim=1)
-            else:
-                homo_edge_index_dict[homo_key] = torch.empty((2, 0), dtype=torch.long, device=device)
-
-        return homo_edge_index_dict
+        if cols:
+            return torch.cat(cols, dim=1).to(device)
+        return torch.empty((2, 0), dtype=torch.long, device=device)
 
     def forward(self, num_agents, num_tracks, edge_index_dict, device='cpu',
                 agent_triplets=None, agent_triplet_mask=None,
@@ -362,20 +367,38 @@ class SupervisedTrustGNN(nn.Module):
         # ============================================================
         # STEP 2: Message passing (0 or 3 GAT layers)
         # ============================================================
-        # For the homogeneous ablation, collapse the typed relations into single-relation
-        # edge types (one shared GATConv per node-type pairing - no relation typing).
-        if self.homogeneous:
-            conv_edge_index_dict = self._to_homogeneous_edges(edge_index_dict, device)
-        else:
-            conv_edge_index_dict = edge_index_dict
-
-        def _run_conv(conv, x_in):
-            return conv(x_in, conv_edge_index_dict)
-
         if self.num_conv_layers == 0:
             # no_gat ablation: node embeddings feed the heads directly (no message passing).
             x_dict_final = x_dict
+
+        elif self.homogeneous:
+            # homogeneous ablation: ONE node type, ONE edge type. Merge agent+track into a
+            # single node tensor and run a single plain GATConv per layer over one untyped
+            # edge set, then split back for the heads. No node-type/relation-type distinction.
+            h = torch.cat([x_dict['agent'], x_dict['track']], dim=0)  # [num_agents+num_tracks, hid]
+            edge_index = self._to_homogeneous_edges(edge_index_dict, num_agents, num_tracks, device)
+
+            def _homo_layer(conv, norm, x_in):
+                out = F.relu(conv(x_in, edge_index))
+                if out.shape[0] > 1:
+                    out = norm(out)
+                return out
+
+            h1 = _homo_layer(self.conv1, self.norm1, h)
+            h2 = _homo_layer(self.conv2, self.norm2, h1) + h1   # skip
+            h3 = _homo_layer(self.conv3, self.norm3, h2) + h2   # skip
+
+            x_dict_final = {
+                'agent': h3[:num_agents],
+                'track': h3[num_agents:],
+            }
+
         else:
+            conv_edge_index_dict = edge_index_dict
+
+            def _run_conv(conv, x_in):
+                return conv(x_in, conv_edge_index_dict)
+
             # First layer
             x_dict_1 = _run_conv(self.conv1, x_dict)
             x_dict_1 = {key: F.relu(x) for key, x in x_dict_1.items()}
