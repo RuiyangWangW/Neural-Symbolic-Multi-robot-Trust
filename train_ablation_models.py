@@ -8,7 +8,9 @@ hyperparameters, so the only thing that differs between rows is the ablated comp
 
   full          - reference architecture (ablation=None)
   no_gat        - skip the HeteroGAT stack entirely (triplet-init h^(0) -> heads)
-  homogeneous   - map every relation to a single shared GATConv (no relation typing)
+  homogeneous   - fully type-blind: one node type + one untyped edge type (merges agent/track
+                  and all 6 relations); triplet features also neutralized so no type/relation
+                  info at init either - only edge presence/count survives
   triplet_init  - replace the triplet encoder with a learned nn.Embedding(2, 128) per type
 
 These are 4 of the 5 ablation-study models. The 5th (No-Beta) needs NO training - it is the

@@ -135,7 +135,10 @@ class SupervisedTrustGNN(nn.Module):
     # The 5-model ablation study (ablation=None is the full reference model).
     #   None          - full architecture
     #   no_gat        - skip the HeteroGAT stack entirely; triplet-init h^(0) -> heads
-    #   homogeneous   - map every relation to a single shared GATConv (no relation typing)
+    #   homogeneous   - fully type-blind: one node type + one edge type. Merges agent/track
+    #                   into one node set and all 6 relations into one untyped edge set, AND
+    #                   neutralizes the triplet features so init sees no type/relation info
+    #                   either - only edge presence/count survives (see _neutralize_triplets).
     #   triplet_init  - replace the triplet encoder with a learned per-type embedding
     #   (No-Beta is NOT a model here: it is the FULL model with inference-side
     #    temporal_mode='mean_scores' - see SupervisedTrustAlgorithm.)
@@ -255,21 +258,18 @@ class SupervisedTrustGNN(nn.Module):
 
     def _create_conv_dict(self):
         """
-        Create a new GAT convolution dictionary with independent parameters
+        Create a new HeteroConv GAT dictionary with independent parameters - one GATConv per
+        relation, so each conv layer learns a separate transformation per edge type.
 
-        This helper method is called for each conv layer to ensure they have
-        separate learnable parameters (no parameter sharing).
-
-        For the homogeneous ablation, only the 3 single-relation edge types are created
-        (one shared GATConv per src/dst node-type pairing), so every original relation is
-        routed through the SAME weight matrix - removing relation-typed message passing.
+        Used only by the relation-typed (non-homogeneous) variants. The homogeneous ablation
+        does NOT call this: it builds a single plain GATConv over one untyped edge set (see
+        _make_conv in __init__ and the homogeneous branch of forward).
 
         Returns:
             Dictionary mapping edge types to GATConv modules
         """
         conv_dict = {}
-        edge_types = self.homogeneous_edge_types if self.homogeneous else self.edge_types
-        for src_type, relation, dst_type in edge_types:
+        for src_type, relation, dst_type in self.edge_types:
             conv_dict[(src_type, relation, dst_type)] = GATConv(
                 in_channels=self.hidden_dim,
                 out_channels=self.hidden_dim,
@@ -340,6 +340,11 @@ class SupervisedTrustGNN(nn.Module):
                 agent_triplet_mask = agent_triplet_mask.to(device)
             else:
                 agent_triplets, agent_triplet_mask = self._extract_triplets('agent', num_agents, edge_index_dict, device)
+            # homogeneous ablation: strip ALL type/relation info from the triplets so the
+            # encoder is type-blind too (consistent with its single-node-type/single-edge-type
+            # message passing) - every edge becomes the same "an edge exists" token, so the
+            # encoder can only use edge PRESENCE/COUNT per node, not which relation or node types.
+            agent_triplets = self._neutralize_triplets(agent_triplets, agent_triplet_mask)
             agent_embeddings = self.agent_triplet_encoder(agent_triplets, agent_triplet_mask)
         else:
             # triplet_init: every agent node starts from the same learned embedding (row 0)
@@ -355,6 +360,7 @@ class SupervisedTrustGNN(nn.Module):
                     track_triplet_mask = track_triplet_mask.to(device)
                 else:
                     track_triplets, track_triplet_mask = self._extract_triplets('track', num_tracks, edge_index_dict, device)
+                track_triplets = self._neutralize_triplets(track_triplets, track_triplet_mask)
                 track_embeddings = self.track_triplet_encoder(track_triplets, track_triplet_mask)
             else:
                 # triplet_init: every track node starts from the same learned embedding (row 1)
@@ -444,6 +450,31 @@ class SupervisedTrustGNN(nn.Module):
             predictions['track'] = track_trust_probs
 
         return predictions
+
+    def _neutralize_triplets(self, triplets, mask):
+        """
+        For the homogeneous ablation only: strip ALL type/relation information from the
+        triplet features so the triplet encoder is type-blind, consistent with the
+        single-node-type / single-edge-type message passing.
+
+        The triplet layout is [src_type_bit, relation_onehot(6), dst_type_bit] (8 dims). We
+        replace every REAL (non-padded) edge with the same constant "an edge exists" token:
+        src/dst type bits and the relation one-hot are all zeroed, and a single constant 1.0
+        is placed in the first slot as a presence marker. Padded positions are left at 0
+        (the mask already excludes them from attention pooling). The encoder can therefore
+        only use edge presence/count per node - not which relation or which node types.
+
+        No-op for every non-homogeneous variant (triplets pass through unchanged).
+        """
+        if not self.homogeneous:
+            return triplets
+        neutral = torch.zeros_like(triplets)
+        if triplets.numel() == 0:
+            return neutral
+        # real (non-padded) edges get a constant presence token in the first slot
+        valid = (~mask).unsqueeze(-1).to(neutral.dtype)  # [num_nodes, max_edges, 1]
+        neutral[..., 0:1] = valid
+        return neutral
 
     def _extract_triplets(self, node_type: str, num_nodes: int, edge_index_dict: Dict, device='cpu') -> Tuple[torch.Tensor, torch.Tensor]:
         """

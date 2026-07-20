@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Benchmark all supervised-trust ablation variants on the AGGRESSIVE OPTIMIZED policy.
+Benchmark all supervised-trust ablation variants on the TRAINING-MATCHED adversarial
+distribution.
 
-Evaluates each ablation variant with the exact same aggressive-optimized adversarial policy
-(delta_plus = delta_minus = 3.0, matching the training distribution) and the same scenario
-seeds, so every row is directly comparable. Reuses optimized_policy_benchmark.py's "aggressive"
-config and TrustMethodComparison's environment/evaluation machinery - only the supervised
-method's model/temporal-aggregation is swapped per row.
+Each of the scenarios draws its adversary the same way the training data was generated:
+50% 'normal' adversaries, 50% 'optimized' - and for optimized scenarios the policy
+aggressiveness is equally likely conservative/moderate/aggressive (delta_plus=delta_minus in
+{1.0, 2.0, 3.0}). All methods (baseline + every ablation variant) see the SAME scenarios/seeds,
+so every row is directly comparable. Reuses optimized_policy_benchmark.py's parameter ranges
+and TrustMethodComparison's environment/evaluation machinery - only the supervised method's
+model/temporal-aggregation is swapped per row.
 
 The 5 ablation-study models (each row = the SUPERVISED method's robot/object metrics):
 
@@ -60,7 +63,7 @@ VARIANT_DISPLAY_NAMES = {
     'baseline': 'Baseline (No Trust)',
     'full': 'Full (reference)',
     'no_gat': 'No-GAT (0 message-passing layers)',
-    'homogeneous': 'Homogeneous GAT (single relation)',
+    'homogeneous': 'Homogeneous GAT (type-blind: 1 node type, 1 edge type)',
     'triplet_init': 'No-Triplet-Init (learned type embeddings)',
     'no_beta': 'No-Beta (mean of per-step scores)',
 }
@@ -73,6 +76,43 @@ def variant_spec(variant: str, models_dir: Path):
     if variant == 'no_beta':
         return 'full', 'mean_scores'
     raise ValueError(f"Unknown variant '{variant}'")
+
+
+# Optimized-policy aggressiveness levels for the test distribution: conservative/moderate/
+# aggressive -> delta_plus=delta_minus, equally likely within an optimized scenario.
+POLICY_DELTAS = [1.0, 2.0, 3.0]  # conservative, moderate, aggressive
+
+
+def apply_training_adversarial_distribution(scenario: Dict, base_seed: int) -> Dict:
+    """
+    Stamp the training-matched adversarial distribution onto a scenario dict, in place:
+      - 50% 'normal' adversaries, 50% 'optimized' (matches generate_supervised_data.py's
+        optimized_mode_probability=0.5).
+      - For 'optimized' scenarios, delta_plus=delta_minus is equally likely conservative(1.0),
+        moderate(2.0), or aggressive(3.0).
+      - For 'normal' scenarios, sample a real adversarial_fn_suppression_rate in [0.0, 0.3]
+        (the range training used); delta_plus/delta_minus are unused by 'normal' mode.
+
+    Uses a scenario-specific RNG seeded from the scenario's own seed so the assignment is
+    reproducible and independent of scenario order.
+    """
+    rng = random.Random(base_seed * 100003 + scenario["random_seed"])
+
+    if rng.random() < 0.5:
+        scenario["adversarial_mode"] = "normal"
+        # normal mode is random FP/FN manipulation - give it a real FN suppression rate
+        scenario["adversarial_fn_suppression_rate"] = round(rng.uniform(0.0, 0.3), 2)
+        # delta unused for 'normal'; keep informative values but they have no effect
+        scenario["delta_plus"] = 0.0
+        scenario["delta_minus"] = 0.0
+    else:
+        scenario["adversarial_mode"] = "optimized"
+        delta = rng.choice(POLICY_DELTAS)
+        scenario["delta_plus"] = delta
+        scenario["delta_minus"] = delta
+        scenario["adversarial_fn_suppression_rate"] = 0.0  # optimized: policy-driven, not a rate
+
+    return scenario
 
 
 def run_scenario(scenario: Dict, variants: List[str], models_dir: Path,
@@ -163,7 +203,8 @@ def run_scenario(scenario: Dict, variants: List[str], models_dir: Path,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark supervised ablation variants (aggressive optimized)")
+    parser = argparse.ArgumentParser(description="Benchmark supervised ablation variants "
+                                     "(training-matched adversary mix: 50% normal / 50% optimized)")
     parser.add_argument('--models-dir', type=str, default='models_ablation',
                         help='Directory holding supervised_model_<variant>.pth checkpoints')
     parser.add_argument('--variants', nargs='+',
@@ -205,7 +246,12 @@ def main():
                   f"{models_dir / f'supervised_model_{ckpt_key}.pth'}")
 
     # Same scenario set (same seeds) evaluated by EVERY variant -> paired comparison.
-    scenarios = [sample_scenario_parameters(i, base_seed, config)
+    # The base scenario is sampled from the aggressive config for its parameter RANGES
+    # (robot density, adversarial ratio, FP injection), then the adversarial DISTRIBUTION is
+    # overwritten to match training: 50% normal / 50% optimized, optimized split equally
+    # across conservative/moderate/aggressive (delta 1/2/3).
+    scenarios = [apply_training_adversarial_distribution(
+                     sample_scenario_parameters(i, base_seed, config), base_seed)
                  for i in range(args.num_scenarios)]
 
     # Methods = baseline (no trust) + the ablation variants, all keyed in each scenario's
@@ -213,7 +259,8 @@ def main():
     methods = ['baseline'] + usable_variants
 
     print("=" * 80)
-    print("ABLATION BENCHMARK - aggressive optimized policy (delta_plus=delta_minus=3.0)")
+    print("ABLATION BENCHMARK - training-matched adversarial distribution "
+          "(50% normal / 50% optimized; optimized delta in {1,2,3} equally)")
     print("=" * 80)
     print(f"Base seed: {base_seed} (use --seed {base_seed} to reproduce)")
     print(f"Models dir:   {models_dir}")
@@ -250,20 +297,23 @@ def main():
     detailed_results = {
         "metadata": {
             "benchmark_type": "ablation",
-            "description": "Supervised model architecture ablation - aggressive optimized "
-                           "policy (delta_plus=delta_minus=3.0). Each 'method' is an ablation "
-                           "variant of the supervised model.",
-            "adversarial_mode": ADVERSARIAL_MODE,
+            "description": "Supervised model architecture ablation - training-matched "
+                           "adversarial distribution: 50% normal / 50% optimized, optimized "
+                           "split equally across conservative/moderate/aggressive "
+                           "(delta_plus=delta_minus in {1.0, 2.0, 3.0}). Each 'method' is an "
+                           "ablation variant of the supervised model (plus the no-trust baseline).",
+            "adversarial_mode": "mixed_normal_optimized",
+            "adversarial_distribution": {
+                "normal_probability": 0.5,
+                "optimized_probability": 0.5,
+                "optimized_deltas": POLICY_DELTAS,  # equally likely within optimized scenarios
+            },
             "num_scenarios": args.num_scenarios,
             "base_seed": base_seed,
             "threshold": args.threshold,
             "models_dir": str(models_dir),
             "methods": methods,  # baseline + ablation variant names, keyed in each evaluation
             "method_display_names": {m: VARIANT_DISPLAY_NAMES[m] for m in methods},
-            "parameter_ranges": {
-                "delta_plus": config.delta_plus,
-                "delta_minus": config.delta_minus,
-            },
         },
         "scenarios": scenario_entries,
     }
@@ -283,7 +333,7 @@ def main():
         return (float(np.mean(vals)), float(np.std(vals))) if vals else (0.0, 0.0)
 
     print("\n" + "=" * 120)
-    print("ABLATION RESULTS (aggressive optimized) - baseline + one row per ablation model")
+    print("ABLATION RESULTS (training-matched adversary mix) - baseline + one row per ablation model")
     print("=" * 120)
     print(f"{'method':<20}{'robot_prec':<16}{'robot_rec':<16}{'robot_acc':<16}"
           f"{'obj_prec':<16}{'obj_rec':<16}{'obj_acc':<16}")
