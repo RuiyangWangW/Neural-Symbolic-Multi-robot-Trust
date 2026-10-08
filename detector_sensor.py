@@ -151,10 +151,9 @@ class DetectorSensor:
             if time - fp['spawn_time'] < fp_lifetime
         ]
 
-        # Potentially create new natural FP objects
-        # Expected number of FP objects = sensor_fp_rate * number of real objects in FoV
-        # For simplicity, create with small probability each timestep
-        if random.random() < self.sensor_fp_rate * 0.1:  # 0.1 is timestep factor
+        # Potentially create new natural FP objects: at most one per timestep, with
+        # probability sensor_fp_rate (independent of the number of real objects in FoV)
+        if random.random() < self.sensor_fp_rate:
             # Create new natural FP near the robot's FoV (sensor artifact)
             distance = random.uniform(robot_fov_range * 0.3, robot_fov_range * 0.9)
             angle = robot_orientation + random.uniform(-robot_fov_angle/2, robot_fov_angle/2)
