@@ -33,7 +33,7 @@ METHOD_ORDER = ["baseline", "bayesian", "paper", "supervised"]
 METHOD_DISPLAY_NAMES = {
     "baseline": "Baseline (No Trust)",
     "bayesian": "Naïve Bayesian",
-    "paper": "PSM Aggregation",
+    "paper": "MATE",
     "supervised": "NeST-Bayes",
 }
 
