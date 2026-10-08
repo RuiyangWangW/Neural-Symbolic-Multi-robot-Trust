@@ -135,19 +135,19 @@ def sample_scenario_parameters(
 
     # Sample adversarial ratio (increment: 0.05)
     min_adv, max_adv = config.adversarial_ratio_range
-    adv_steps = int((max_adv - min_adv) / 0.05)
+    adv_steps = int(round((max_adv - min_adv) / 0.05))
     adv_step = random.randint(0, adv_steps)
     adversarial_ratio = round(min_adv + (adv_step * 0.05), 2)
 
     # Sample adversarial FP injection rate (increment: 0.05)
     min_fp, max_fp = config.adversarial_fp_injection_rate_range
-    fp_steps = int((max_fp - min_fp) / 0.05)
+    fp_steps = int(round((max_fp - min_fp) / 0.05))
     fp_step = random.randint(0, fp_steps)
     adversarial_fp_injection_rate = round(min_fp + (fp_step * 0.05), 2)
 
     # Sample adversarial FN suppression rate (increment: 0.05)
     min_fn, max_fn = config.adversarial_fn_suppression_rate_range
-    fn_steps = int((max_fn - min_fn) / 0.05)
+    fn_steps = int(round((max_fn - min_fn) / 0.05))
     fn_step = random.randint(0, fn_steps)
     adversarial_fn_suppression_rate = round(min_fn + (fn_step * 0.05), 2)
 

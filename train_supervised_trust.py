@@ -257,6 +257,7 @@ class SupervisedTrustTrainer:
                  weight_decay: float = 1e-4,
                  agent_loss_weight: float = 1.0,
                  track_loss_weight: float = 1.0,
+                 agent_class_weights: Tuple[float, float] = None,
                 ):
         """
         Initialize trainer
@@ -268,6 +269,8 @@ class SupervisedTrustTrainer:
             weight_decay: Weight decay for regularization
             agent_loss_weight: Weight for agent loss (default: 1.0)
             track_loss_weight: Weight for track loss (default: 1.0)
+            agent_class_weights: (adversarial, legitimate) per-sample weights for the ego agent
+                loss, balancing the two classes on an unbalanced dataset (None = unweighted)
         """
         self.model = model
         self.device = torch.device(device)
@@ -276,6 +279,7 @@ class SupervisedTrustTrainer:
         # Loss weights for balancing agent and track objectives
         self.agent_loss_weight = agent_loss_weight
         self.track_loss_weight = track_loss_weight
+        self.agent_class_weights = agent_class_weights
 
         # Optimizer and loss function
         self.optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -309,6 +313,13 @@ class SupervisedTrustTrainer:
             except:
                 pass  # Fallback method not available in this PyTorch version
             print("🍎 MPS optimizations enabled")
+
+    def _agent_class_weight(self, ego_label: torch.Tensor) -> float:
+        """Class-balancing weight for one ego robot's agent loss (label 1 = legitimate)."""
+        if self.agent_class_weights is None:
+            return 1.0
+        w_adversarial, w_legitimate = self.agent_class_weights
+        return w_legitimate if float(ego_label.reshape(-1)[0]) >= 0.5 else w_adversarial
 
     def _transfer_to_device(self, sample: Dict, non_blocking: bool = True) -> Tuple:
         """
@@ -410,7 +421,8 @@ class SupervisedTrustTrainer:
         if ego_has_cross_validation and 'agent' in predictions and agent_labels.shape[0] > 0:
             # predictions['agent'] is a tensor [num_agents, 1]
             agent_preds = predictions['agent']
-            agent_loss = self.criterion(agent_preds[0:1], agent_labels[0:1])
+            agent_loss = (self._agent_class_weight(agent_labels[0:1])
+                          * self.criterion(agent_preds[0:1], agent_labels[0:1]))
             # Apply weight to agent loss
             weighted_agent_loss = self.agent_loss_weight * agent_loss
             loss += weighted_agent_loss
@@ -763,7 +775,7 @@ class SupervisedTrustTrainer:
                 ego_idx = ego_robot_indices[graph_idx]
                 ego_pred = predictions['agent'][ego_idx:ego_idx+1]
                 ego_label = agent_labels[ego_idx:ego_idx+1]
-                agent_loss = self.criterion(ego_pred, ego_label)
+                agent_loss = self._agent_class_weight(ego_label) * self.criterion(ego_pred, ego_label)
                 # Apply weight to agent loss
                 weighted_agent_loss = self.agent_loss_weight * agent_loss
                 graph_loss += weighted_agent_loss
@@ -817,7 +829,8 @@ class SupervisedTrustTrainer:
             Dictionary of metrics
         """
         import torch
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+        from sklearn.metrics import (accuracy_score, balanced_accuracy_score, precision_score,
+                                     recall_score, f1_score, roc_auc_score)
         import numpy as np
 
         metrics = {}
@@ -832,6 +845,7 @@ class SupervisedTrustTrainer:
             if len(y_true) > 0:
                 metrics['agent_accuracy'] = accuracy_score(y_true, y_pred)
                 if len(np.unique(y_true)) > 1:
+                    metrics['agent_balanced_accuracy'] = balanced_accuracy_score(y_true, y_pred)
                     metrics['agent_precision'] = precision_score(y_true, y_pred, zero_division=0)
                     metrics['agent_recall'] = recall_score(y_true, y_pred, zero_division=0)
                     metrics['agent_f1'] = f1_score(y_true, y_pred, zero_division=0)
@@ -1141,6 +1155,8 @@ class SupervisedTrustTrainer:
                 # Print overall metrics for agents
                 if 'agent_accuracy' in train_metrics:
                     log_print(f"  Agent Overall: Train Acc={train_metrics['agent_accuracy']:.3f}, Val Acc={val_metrics.get('agent_accuracy', 0):.3f}")
+                    if 'agent_balanced_accuracy' in train_metrics:
+                        log_print(f"                 Train BalAcc={train_metrics['agent_balanced_accuracy']:.3f}, Val BalAcc={val_metrics.get('agent_balanced_accuracy', 0):.3f}")
                     log_print(f"                 Train F1={train_metrics['agent_f1']:.3f}, Val F1={val_metrics.get('agent_f1', 0):.3f}")
 
                 # Print detailed agent metrics (adversarial vs honest)
@@ -1378,6 +1394,10 @@ def main():
                        help='Weight for agent loss (default: 5.0 to balance with multiple tracks)')
     parser.add_argument('--track-loss-weight', type=float, default=1.0,
                        help='Weight for track loss (default: 1.0)')
+    parser.add_argument('--no-class-weights', action='store_true',
+                       help='Disable class-balanced weighting of the agent loss (by default each ego '
+                            'sample is weighted N / (2 * N_class) from the training split, so the '
+                            'unbalanced dataset trains like a balanced one without discarding data)')
     parser.add_argument('--train-ratio', type=float, default=0.8,
                        help='Train/validation split ratio (default: 0.8 = 80%% train, 20%% val)')
     parser.add_argument('--split-seed', type=int, default=42,
@@ -1491,6 +1511,18 @@ def main():
     log_print(f"👷 DataLoader workers: {num_workers}")
     log_print(f"📌 Pin memory: {pin_memory}")
 
+    # Class-balanced agent loss weights from the training split's ego labels (1 = legitimate)
+    agent_class_weights = None
+    num_legit = sum(1 for s in train_data if float(s.agent_labels[0, 0]) >= 0.5)
+    num_adv = len(train_data) - num_legit
+    log_print(f"👥 Training ego samples: {num_adv} adversarial, {num_legit} legitimate")
+    if not args.no_class_weights and num_adv > 0 and num_legit > 0:
+        agent_class_weights = (len(train_data) / (2 * num_adv), len(train_data) / (2 * num_legit))
+        log_print(f"⚖️  Agent class weights: adversarial={agent_class_weights[0]:.3f}, "
+                  f"legitimate={agent_class_weights[1]:.3f}")
+    else:
+        log_print(f"⚖️  Agent class weights: none")
+
     # Create trainer with loss weighting
     log_print(f"⚖️  Loss weights: Agent={args.agent_loss_weight}, Track={args.track_loss_weight}")
     trainer = SupervisedTrustTrainer(
@@ -1498,15 +1530,17 @@ def main():
         device=device,
         learning_rate=args.lr,
         agent_loss_weight=args.agent_loss_weight,
-        track_loss_weight=args.track_loss_weight
+        track_loss_weight=args.track_loss_weight,
+        agent_class_weights=agent_class_weights
     )
 
     # Train model with logging
     history = trainer.train(train_loader, val_loader, epochs=args.epochs, save_path=args.output,
                            patience=args.patience, log_print=log_print)
 
-    # Plot results
-    plot_training_results(history, log_print=log_print)
+    # Plot results (named after the model so parallel training runs don't overwrite each other)
+    plot_training_results(history, save_path=args.output.replace('.pth', '_training_results.png'),
+                          log_print=log_print)
 
     log_print("")
     log_print("=" * 80)

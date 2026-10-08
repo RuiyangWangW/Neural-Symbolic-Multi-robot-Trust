@@ -170,7 +170,7 @@ class SupervisedDataGenerator:
 
         # Sample adversarial_ratio with increment of 0.05
         min_adv, max_adv = self.adversarial_ratio_range
-        adv_steps = int((max_adv - min_adv) / 0.05)
+        adv_steps = int(round((max_adv - min_adv) / 0.05))
         if adv_steps > 0:
             adv_step = random.randint(0, adv_steps)
             adversarial_ratio = round(min_adv + (adv_step * 0.05), 2)
@@ -179,7 +179,7 @@ class SupervisedDataGenerator:
 
         # Sample adversarial_fp_injection_rate with increment of 0.05
         min_fp, max_fp = self.adversarial_fp_injection_rate_range
-        fp_steps = int((max_fp - min_fp) / 0.05)
+        fp_steps = int(round((max_fp - min_fp) / 0.05))
         if fp_steps > 0:
             fp_step = random.randint(0, fp_steps)
             adversarial_fp_injection_rate = round(min_fp + (fp_step * 0.05), 2)
@@ -188,7 +188,7 @@ class SupervisedDataGenerator:
 
         # Sample adversarial_fn_suppression_rate with increment of 0.05
         min_fn, max_fn = self.adversarial_fn_suppression_rate_range
-        fn_steps = int((max_fn - min_fn) / 0.05)
+        fn_steps = int(round((max_fn - min_fn) / 0.05))
         if fn_steps > 0:
             fn_step = random.randint(0, fn_steps)
             adversarial_fn_suppression_rate = round(min_fn + (fn_step * 0.05), 2)
@@ -795,78 +795,31 @@ class SupervisedDataGenerator:
                 continue
 
         log_print(f"🎉 Dataset generation complete!")
-        log_print(f"📈 Total samples before balancing: {len(all_data)}")
+        log_print(f"📈 Total samples: {len(all_data)}")
 
         # ========================================================================
-        # BALANCED SAMPLING: Equal adversarial and legitimate robot samples
+        # CLASS COUNTS: keep ALL samples (no downsampling). Adversarial ego robots are the
+        # minority class; train_supervised_trust.py balances the two classes with per-sample
+        # loss weights instead of discarding legitimate samples.
         # ========================================================================
         log_print(f"\n" + "="*80)
-        log_print("BALANCED SAMPLING")
+        log_print("CLASS COUNTS (all samples kept; class balance is handled by loss weights in training)")
         log_print("="*80)
 
-        # Separate samples by adversarial vs legitimate
-        adversarial_samples = []
-        legitimate_samples = []
-
-        for sample in all_data:
-            # agent_labels: 1.0 = legitimate, 0.0 = adversarial
-            if sample.agent_labels.shape[0] > 0:
-                agent_label = float(sample.agent_labels[0, 0])
-                if agent_label == 0.0:
-                    adversarial_samples.append(sample)
-                else:
-                    legitimate_samples.append(sample)
-            else:
-                # No agent label (shouldn't happen, but keep sample)
-                legitimate_samples.append(sample)
-
-        log_print(f"Adversarial robot samples: {len(adversarial_samples)}")
-        log_print(f"Legitimate robot samples:  {len(legitimate_samples)}")
-
-        # Balance: keep ALL adversarial, sample equal number of legitimate
-        num_adversarial = len(adversarial_samples)
-        num_legitimate = len(legitimate_samples)
-
-        # Import random for shuffling (needed regardless of balancing)
-        import random as random_module
-        random_module.seed(42)  # Reproducible sampling
-
-        if num_adversarial > num_legitimate:
-            # More adversarial samples: sample down to match legitimate count
-            sampled_adversarial = random_module.sample(adversarial_samples, num_legitimate)
-
-            log_print(f"\nBalancing dataset:")
-            log_print(f"  Warning: Cross-validation filtering favored adversarial robots ({num_adversarial} adv vs {num_legitimate} legit)")
-            log_print(f"  Reason: Adversarial robots have more contradicts edges (false positives)")
-            log_print(f"  Sampling {num_legitimate} out of {num_adversarial} adversarial samples")
-            log_print(f"  Keeping all {num_legitimate} legitimate samples")
-            log_print(f"  Final ratio: 50% adversarial, 50% legitimate")
-
-            adversarial_samples = sampled_adversarial
-        elif num_legitimate > num_adversarial:
-            # More legitimate samples: sample down to match adversarial count
-            sampled_legitimate = random_module.sample(legitimate_samples, num_adversarial)
-
-            log_print(f"\nBalancing dataset:")
-            log_print(f"  Keeping all {num_adversarial} adversarial samples")
-            log_print(f"  Sampling {num_adversarial} out of {num_legitimate} legitimate samples")
-            log_print(f"  Final ratio: 50% adversarial, 50% legitimate")
-
-            legitimate_samples = sampled_legitimate
-        else:
-            log_print(f"\nAlready balanced: {num_adversarial} adversarial, {num_legitimate} legitimate")
-
-        # Merge balanced samples
-        all_data = adversarial_samples + legitimate_samples
-        random_module.shuffle(all_data)  # Shuffle to mix adversarial and legitimate
-
-        log_print(f"\nBalanced dataset:")
-        log_print(f"  Total samples: {len(all_data)} (was {len(adversarial_samples) + num_legitimate})")
+        # agent_labels[0]: ego robot, 1.0 = legitimate, 0.0 = adversarial
+        num_adversarial = sum(1 for sample in all_data
+                              if sample.agent_labels.shape[0] > 0 and float(sample.agent_labels[0, 0]) == 0.0)
+        num_legitimate = len(all_data) - num_adversarial
+        log_print(f"Adversarial robot samples: {num_adversarial}")
+        log_print(f"Legitimate robot samples:  {num_legitimate}")
         if len(all_data) > 0:
-            log_print(f"  Adversarial: {len(adversarial_samples)} ({100*len(adversarial_samples)/len(all_data):.1f}%)")
-            log_print(f"  Legitimate:  {len(legitimate_samples)} ({100*len(legitimate_samples)/len(all_data):.1f}%)")
+            log_print(f"Adversarial share: {100 * num_adversarial / len(all_data):.1f}%")
         else:
             log_print(f"  ⚠️  WARNING: No samples generated! Increase episode steps or number of episodes.")
+
+        import random as random_module
+        random_module.seed(42)  # Reproducible shuffle
+        random_module.shuffle(all_data)
         log_print("="*80)
 
         # Calculate statistics
