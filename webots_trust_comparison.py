@@ -607,8 +607,8 @@ def main():
                         help="Path to trained supervised GNN model")
     parser.add_argument("--num-scenarios", type=int, default=100,
                         help="Number of scenarios to test (default: 100)")
-    parser.add_argument("--num-adversarial", type=int, default=1,
-                        help="Number of adversarial robots per scenario (default: 1)")
+    parser.add_argument("--num-adversarial", type=int, default=2,
+                        help="Number of adversarial robots per scenario (default: 2)")
     parser.add_argument("--num-timesteps", type=int, default=100,
                         help="Number of timesteps to simulate per scenario (default: 100)")
     parser.add_argument("--seed", type=int, default=42,
