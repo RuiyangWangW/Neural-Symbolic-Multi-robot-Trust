@@ -56,7 +56,6 @@ class TrustMethodComparison:
                  fov_angle: float = np.pi/3,
                  proximal_range: float = 80.0,
                  allow_fp_codetection: bool = True,
-                 legitimate_mode: str = 'optimal',
                  adversarial_mode: str = 'normal',
                  ):
         """
@@ -80,7 +79,6 @@ class TrustMethodComparison:
                 leaving the environment and the two algorithms using different ranges).
                 Default 80.0 matches generate_supervised_data.py's training-time value.
             allow_fp_codetection: Whether to allow FP codetection (default: True)
-            legitimate_mode: Mode for legitimate robots ('optimal' or 'realistic')
             adversarial_mode: Mode for adversarial robots ('normal', 'optimized', or 'deceptive')
         """
         self.supervised_model_path = Path(supervised_model_path) if supervised_model_path else None
@@ -123,11 +121,10 @@ class TrustMethodComparison:
         self.adversarial_ratio = 0.3
         self.adversarial_fp_injection_rate = 0.5  # Persistent FP injection
         self.adversarial_fn_suppression_rate = 0.0  # Transient FN suppression
-        self.sensor_fp_rate = 0.05  # Transient sensor FPs
-        self.sensor_fn_rate = 0.05  # Transient sensor FNs
+        self.sensor_fp_rate_range = (0.01, 0.05)  # Per-robot natural sensor FP rate range
+        self.sensor_fn_rate_range = (0.01, 0.05)  # Per-robot natural sensor FN rate range
         self.proximal_range = proximal_range
         self.allow_fp_codetection = allow_fp_codetection  # Can be set to True for FP codetection experiments
-        self.legitimate_mode = legitimate_mode
         self.adversarial_mode = adversarial_mode
         self.delta_plus = 3.0  # Corroboration factor (FP-gain coefficient), 'optimized'/'deceptive' modes only
         self.delta_minus = 3.0  # Dilution factor (GT-suppression coefficient), 'optimized'/'deceptive' modes only
@@ -172,10 +169,9 @@ class TrustMethodComparison:
                 fov_angle=self.fov_angle,
                 adversarial_fp_injection_rate=self.adversarial_fp_injection_rate,
                 adversarial_fn_suppression_rate=self.adversarial_fn_suppression_rate,
-                sensor_fp_rate=self.sensor_fp_rate,
-                sensor_fn_rate=self.sensor_fn_rate,
+                sensor_fp_rate_range=self.sensor_fp_rate_range,
+                sensor_fn_rate_range=self.sensor_fn_rate_range,
                 allow_fp_codetection=self.allow_fp_codetection,
-                legitimate_mode=self.legitimate_mode,
                 adversarial_mode=self.adversarial_mode,
                 delta_plus=self.delta_plus,
                 delta_minus=self.delta_minus

@@ -10,10 +10,10 @@ Legitimate and adversarial robots are real LegitimateRobot/AdversarialRobot inst
 The Webots replay data supplies each timestep's TRUE (optimal) object positions - the
 cross-robot-averaged union of what every robot's real camera actually recorded
 (get_ground_truth_object_positions) - exactly like the live ground_truth_objects list
-simulation_environment.py's realistic mode consumes. No real robot's sensor is perfect, so
+simulation_environment.py's robots consume. No real robot's sensor is perfect, so
 every robot (legitimate and adversarial alike) runs its own DetectorSensor over that true
 position set each timestep (_feed_real_detections): is_in_fov gating (SPOT dual-camera +
-occupancy-grid line-of-sight), sensor_fn_rate missed-detection sampling, Gaussian
+occupancy-grid line-of-sight), per-robot sensor_fn_rate missed-detection sampling, Gaussian
 position/velocity noise (noise_std), and transient sensor_fp_* clutter - the same
 realistic-sensor layer applied on top of ground truth in the synthetic pipeline.
 
@@ -62,8 +62,8 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
                  fov_angle: float = np.pi / 4,
                  proximal_range: float = 100.0,
                  noise_std: float = 1.0,
-                 sensor_fp_rate: float = 0.05,
-                 sensor_fn_rate: float = 0.05,
+                 sensor_fp_rate_range: Tuple[float, float] = (0.01, 0.05),
+                 sensor_fn_rate_range: Tuple[float, float] = (0.01, 0.05),
                  random_seed: Optional[int] = None):
         """
         Initialize Webots trust environment.
@@ -92,12 +92,13 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
                 adds on top of each timestep's true (replay) object position - matches
                 detector_sensor.py's convention (velocity noise is noise_std * 0.1), applied
                 identically to legitimate and adversarial robots' own sensors.
-            sensor_fp_rate: Transient sensor false positive rate (DetectorSensor clutter
-                objects, distinct from persistent adversarial FP objects) - same default as
-                LegitimateRobot/AdversarialRobot elsewhere in the codebase.
-            sensor_fn_rate: Sensor false negative rate - probability a real object within
-                is_in_fov is nonetheless missed by the sensor, same default as
-                LegitimateRobot/AdversarialRobot elsewhere in the codebase.
+            sensor_fp_rate_range: (min, max) of the transient sensor false positive rate
+                (DetectorSensor clutter objects, distinct from persistent adversarial FP
+                objects); every robot draws its own rate uniformly from this range - same
+                default as simulation_environment.py.
+            sensor_fn_rate_range: (min, max) of the sensor false negative rate - probability
+                a real object within is_in_fov is nonetheless missed - drawn per robot the
+                same way (independently of its FP rate).
             random_seed: Random seed for reproducibility
         """
         # Initialize base environment
@@ -118,8 +119,8 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
         self.fov_angle = fov_angle
         self.proximal_range = proximal_range
         self.noise_std = noise_std
-        self.sensor_fp_rate = sensor_fp_rate
-        self.sensor_fn_rate = sensor_fn_rate
+        self.sensor_fp_rate_range = tuple(sensor_fp_rate_range)
+        self.sensor_fn_rate_range = tuple(sensor_fn_rate_range)
 
         # Robot trust management (real LegitimateRobot/AdversarialRobot instances)
         self.robots: Dict[str, Robot] = {}
@@ -151,6 +152,12 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
         for robot_name in self.robot_data.keys():
             is_adversarial = robot_name in self.adversarial_robot_ids
 
+            # Webots replay supplies the true detections (see _feed_real_detections); every
+            # robot's own DetectorSensor layers FN/noise/transient-FP imperfection on top,
+            # with this robot's own natural FP/FN rates
+            sensor_fp_rate = random.uniform(*self.sensor_fp_rate_range)
+            sensor_fn_rate = random.uniform(*self.sensor_fn_rate_range)
+
             if is_adversarial:
                 robot = AdversarialRobot(
                     robot_id=robot_name,
@@ -159,8 +166,8 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
                     fov_range=self.fov_range,
                     fov_angle=self.fov_angle,
                     mode='optimized',
-                    sensor_fp_rate=self.sensor_fp_rate,
-                    sensor_fn_rate=self.sensor_fn_rate,
+                    sensor_fp_rate=sensor_fp_rate,
+                    sensor_fn_rate=sensor_fn_rate,
                     delta_plus=self.delta_plus,
                     delta_minus=self.delta_minus,
                 )
@@ -171,13 +178,8 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
                     velocity=np.array([0.0, 0.0, 0.0]),
                     fov_range=self.fov_range,
                     fov_angle=self.fov_angle,
-                    mode='realistic',  # Webots replay supplies the "optimal" true detections
-                                        # (see _feed_real_detections) - mode='realistic' gives
-                                        # this robot its own DetectorSensor to layer FN/noise/
-                                        # transient-FP sensor imperfection on top, same as
-                                        # AdversarialRobot always has one.
-                    sensor_fp_rate=self.sensor_fp_rate,
-                    sensor_fn_rate=self.sensor_fn_rate,
+                    sensor_fp_rate=sensor_fp_rate,
+                    sensor_fn_rate=sensor_fn_rate,
                 )
 
             # SPOT dual-camera FoV + occupancy grid for line-of-sight, not exposed as
@@ -279,13 +281,11 @@ class WebotsTrustEnvironment(WebotsSimulationEnvironment):
         supplies the "optimal" (perfect) detections (the union of what every robot's real
         camera recorded, cross-robot-averaged per object via
         get_ground_truth_object_positions), exactly like the live ground_truth_objects
-        list simulation_environment.py's _generate_realistic_detections consumes. No real
-        robot's sensor is actually optimal, so DetectorSensor.generate_detections is
-        layered on top for every robot (legitimate and adversarial alike, matching how
-        AdversarialRobot always owns a DetectorSensor and LegitimateRobot gets one too here
-        via mode='realistic') to apply:
+        list simulation_environment.py's robots consume. No real robot's sensor is actually
+        optimal, so every robot's own DetectorSensor (legitimate and adversarial alike) is
+        layered on top to apply:
         - is_in_fov gating (SPOT dual-camera + occupancy-grid line-of-sight)
-        - sensor_fn_rate: probabilistic missed detections of real objects
+        - sensor_fn_rate (this robot's own): probabilistic missed detections of real objects
         - Gaussian position/velocity noise (noise_std)
         - transient sensor_fp_* clutter objects near the robot
 

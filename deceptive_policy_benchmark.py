@@ -23,7 +23,7 @@ Test scenarios:
 - Higher FP injection (0.4-0.5) - more persistent false hypotheses
 
 Robot modes:
-- Legitimate: realistic (natural sensor noise)
+- Legitimate: noisy sensor (per-robot natural FP/FN rates)
 - Adversarial: deceptive (MILP-based report/ignore policy, same as optimized;
   lies only applied at object-metrics evaluation time)
 """
@@ -56,8 +56,8 @@ class BenchmarkConfig:
     target_density_multiplier: float
     adversarial_ratio_range: Tuple[float, float]
     adversarial_fp_injection_rate_range: Tuple[float, float]
-    sensor_fp_rate: float = 0.05  # Sensor FP rate (transient)
-    sensor_fn_rate: float = 0.05  # Sensor FN rate (transient)
+    sensor_fp_rate_range: Tuple[float, float] = (0.01, 0.05)  # Per-robot natural sensor FP rate range
+    sensor_fn_rate_range: Tuple[float, float] = (0.01, 0.05)  # Per-robot natural sensor FN rate range
     description: str = ""
 
 
@@ -69,8 +69,8 @@ BENCHMARK_CONFIGS = {
         target_density_multiplier=2.0,
         adversarial_ratio_range=(0.1, 0.3),
         adversarial_fp_injection_rate_range=(0.1, 0.3),
-        sensor_fp_rate=0.05,
-        sensor_fn_rate=0.05,
+        sensor_fp_rate_range=(0.01, 0.05),
+        sensor_fn_rate_range=(0.01, 0.05),
         description="In-sample (training distribution) - Deceptive policy"
     ),
     "higher_adv_ratio": BenchmarkConfig(
@@ -79,8 +79,8 @@ BENCHMARK_CONFIGS = {
         target_density_multiplier=2.0,
         adversarial_ratio_range=(0.4, 0.5),  # HIGHER
         adversarial_fp_injection_rate_range=(0.1, 0.3),
-        sensor_fp_rate=0.05,
-        sensor_fn_rate=0.05,
+        sensor_fp_rate_range=(0.01, 0.05),
+        sensor_fn_rate_range=(0.01, 0.05),
         description="Higher adversarial ratio (0.4-0.5) - Deceptive policy"
     ),
     "higher_fp_injection": BenchmarkConfig(
@@ -89,8 +89,8 @@ BENCHMARK_CONFIGS = {
         target_density_multiplier=2.0,
         adversarial_ratio_range=(0.1, 0.3),
         adversarial_fp_injection_rate_range=(0.4, 0.5),  # HIGHER (more persistent FP hypotheses)
-        sensor_fp_rate=0.05,
-        sensor_fn_rate=0.05,
+        sensor_fp_rate_range=(0.01, 0.05),
+        sensor_fn_rate_range=(0.01, 0.05),
         description="Higher adversarial FP injection rate (0.4-0.5) - Deceptive policy"
     ),
 }
@@ -104,7 +104,6 @@ FOV_RANGE = 50.0
 FOV_ANGLE = np.pi / 3
 
 # Robot modes
-LEGITIMATE_MODE = 'realistic'  # Natural sensor noise
 ADVERSARIAL_MODE = 'deceptive'  # Policy-based strategic attacks + trust manipulation
 
 METHOD_ORDER = ["baseline", "bayesian", "paper", "supervised"]
@@ -173,10 +172,9 @@ def sample_scenario_parameters(
         "adversarial_ratio": adversarial_ratio,
         "adversarial_fp_injection_rate": adversarial_fp_injection_rate,
         "adversarial_fn_suppression_rate": 0.0,  # Not used in deceptive mode (policy-based instead)
-        "sensor_fp_rate": config.sensor_fp_rate,
-        "sensor_fn_rate": config.sensor_fn_rate,
+        "sensor_fp_rate_range": list(config.sensor_fp_rate_range),
+        "sensor_fn_rate_range": list(config.sensor_fn_rate_range),
         "random_seed": simulation_seed,
-        "legitimate_mode": LEGITIMATE_MODE,
         "adversarial_mode": ADVERSARIAL_MODE,
     }
 
@@ -210,14 +208,13 @@ def run_scenario(
         fov_angle=FOV_ANGLE,
         proximal_range=PROXIMAL_RANGE,
         allow_fp_codetection=True,  # Allow adversarial robots to co-detect FPs
-        legitimate_mode=scenario.get("legitimate_mode", LEGITIMATE_MODE),
         adversarial_mode=scenario.get("adversarial_mode", ADVERSARIAL_MODE),
     )
     comparison.adversarial_ratio = scenario["adversarial_ratio"]
     comparison.adversarial_fp_injection_rate = scenario["adversarial_fp_injection_rate"]
     comparison.adversarial_fn_suppression_rate = scenario["adversarial_fn_suppression_rate"]
-    comparison.sensor_fp_rate = scenario["sensor_fp_rate"]
-    comparison.sensor_fn_rate = scenario["sensor_fn_rate"]
+    comparison.sensor_fp_rate_range = tuple(scenario["sensor_fp_rate_range"])
+    comparison.sensor_fn_rate_range = tuple(scenario["sensor_fn_rate_range"])
 
     # Note: eta_f and eta_r are no longer used (legacy parameters)
     # Deceptive mode now uses objective-driven policy
@@ -252,13 +249,13 @@ def run_benchmark(
     print(f"Running {config.name.upper()} Benchmark (Deceptive Policy)")
     print(f"{'=' * 80}")
     print(f"Description: {config.description}")
-    print(f"Robot modes: Legitimate={LEGITIMATE_MODE}, Adversarial={ADVERSARIAL_MODE}")
+    print(f"Robot modes: Legitimate=noisy sensor, Adversarial={ADVERSARIAL_MODE}")
     print(f"Adversarial trust manipulation: GT objects (0.0-0.2), FP objects (0.8-1.0)")
     print(f"Parameter ranges:")
     print(f"  Robot density: {config.robot_density_range}")
     print(f"  Adversarial ratio: {config.adversarial_ratio_range}")
     print(f"  Adversarial FP injection rate: {config.adversarial_fp_injection_rate_range} (persistent)")
-    print(f"  Sensor FP/FN rates: {config.sensor_fp_rate}/{config.sensor_fn_rate} (transient)")
+    print(f"  Sensor FP/FN rate ranges (per robot): {config.sensor_fp_rate_range}/{config.sensor_fn_rate_range}")
     print(f"Running {num_scenarios} scenarios...")
     print(f"{'=' * 80}\n")
 
@@ -324,7 +321,7 @@ def save_results(
             "num_scenarios": len(results),
             "base_seed": base_seed,
             "robot_modes": {
-                "legitimate": LEGITIMATE_MODE,
+                "legitimate": "noisy_sensor",
                 "adversarial": ADVERSARIAL_MODE
             },
             "adversarial_lie": adversarial_lie,
@@ -336,8 +333,8 @@ def save_results(
                 "robot_density": config.robot_density_range,
                 "adversarial_ratio": config.adversarial_ratio_range,
                 "adversarial_fp_injection_rate": config.adversarial_fp_injection_rate_range,
-                "sensor_fp_rate": config.sensor_fp_rate,
-                "sensor_fn_rate": config.sensor_fn_rate,
+                "sensor_fp_rate_range": config.sensor_fp_rate_range,
+                "sensor_fn_rate_range": config.sensor_fn_rate_range,
             },
             "simulation_constants": {
                 "world_size": WORLD_SIZE,
@@ -460,7 +457,7 @@ def main():
     print(f"{'=' * 80}")
     print(f"Base seed: {base_seed} (use --seed {base_seed} to reproduce)")
     print(f"Robot modes:")
-    print(f"  Legitimate: {LEGITIMATE_MODE} (natural sensor noise)")
+    print(f"  Legitimate: noisy sensor (per-robot natural FP/FN rates)")
     print(f"  Adversarial: {ADVERSARIAL_MODE} (policy-based attacks + trust manipulation)")
     print(f"Adversarial trust manipulation:")
     print(f"  GT objects: lie low (0.0-0.2) - make them seem less credible")

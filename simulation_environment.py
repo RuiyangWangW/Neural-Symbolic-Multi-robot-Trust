@@ -57,12 +57,11 @@ class SimulationEnvironment:
                  fov_angle: float = np.pi/3,
                  adversarial_fp_injection_rate: float = 0.5,
                  adversarial_fn_suppression_rate: float = 0.0,
-                 sensor_fp_rate: float = 0.05,
-                 sensor_fn_rate: float = 0.05,
+                 sensor_fp_rate_range: Tuple[float, float] = (0.01, 0.05),
+                 sensor_fn_rate_range: Tuple[float, float] = (0.01, 0.05),
                  allow_fp_codetection: bool = False,
                  num_robots: Optional[int] = None,
                  num_targets: Optional[int] = None,
-                 legitimate_mode: str = 'optimal',
                  adversarial_mode: str = 'normal',
                  delta_plus: float = 3.0,
                  delta_minus: float = 3.0):
@@ -80,10 +79,11 @@ class SimulationEnvironment:
             adversarial_fp_injection_rate: Rate determining number of persistent adversarial FP objects
                                           (num_fp_objects = rate × num_gt_objects)
             adversarial_fn_suppression_rate: Rate of transient adversarial FN suppression (only for 'normal' mode)
-            sensor_fp_rate: Sensor false positive rate (transient, for realistic detectors)
-            sensor_fn_rate: Sensor false negative rate (transient, for realistic detectors)
+            sensor_fp_rate_range: (min, max) of the natural sensor FP rate; every robot
+                (legitimate and adversarial) draws its own rate uniformly from this range
+            sensor_fn_rate_range: (min, max) of the natural sensor FN rate, drawn per robot
+                the same way (independently of its FP rate)
             allow_fp_codetection: If True, allows adversarial robots to co-detect FP objects (default: False)
-            legitimate_mode: Mode for legitimate robots ('optimal' or 'realistic')
             adversarial_mode: Mode for adversarial robots ('normal', 'optimized', or 'deceptive')
             delta_plus: Corroboration factor (FP-gain coefficient) in the 'optimized'/'deceptive'
                 MILP cost-benefit objective. Higher values push adversarial robots to report
@@ -121,10 +121,9 @@ class SimulationEnvironment:
         self.fov_angle = fov_angle
         self.adversarial_fp_injection_rate = adversarial_fp_injection_rate
         self.adversarial_fn_suppression_rate = adversarial_fn_suppression_rate
-        self.sensor_fp_rate = sensor_fp_rate
-        self.sensor_fn_rate = sensor_fn_rate
+        self.sensor_fp_rate_range = tuple(sensor_fp_rate_range)
+        self.sensor_fn_rate_range = tuple(sensor_fn_rate_range)
         self.allow_fp_codetection = allow_fp_codetection
-        self.legitimate_mode = legitimate_mode
         self.adversarial_mode = adversarial_mode
         self.delta_plus = delta_plus
         self.delta_minus = delta_minus
@@ -200,6 +199,10 @@ class SimulationEnvironment:
                 ])
                 attempts += 1
 
+            # Every robot's detector is noisy, with its own natural FP/FN rates
+            sensor_fp_rate = random.uniform(*self.sensor_fp_rate_range)
+            sensor_fn_rate = random.uniform(*self.sensor_fn_rate_range)
+
             # Create robot with specialized type
             is_adversarial = (i in adversarial_ids)
             if is_adversarial:
@@ -212,8 +215,8 @@ class SimulationEnvironment:
                     mode=self.adversarial_mode,
                     adversarial_fp_injection_rate=self.adversarial_fp_injection_rate,
                     adversarial_fn_suppression_rate=self.adversarial_fn_suppression_rate,
-                    sensor_fp_rate=self.sensor_fp_rate,
-                    sensor_fn_rate=self.sensor_fn_rate,
+                    sensor_fp_rate=sensor_fp_rate,
+                    sensor_fn_rate=sensor_fn_rate,
                     delta_plus=self.delta_plus,
                     delta_minus=self.delta_minus
                 )
@@ -226,9 +229,8 @@ class SimulationEnvironment:
                     velocity=np.array([0.0, 0.0, 0.0]),
                     fov_range=self.fov_range,
                     fov_angle=self.fov_angle,
-                    mode=self.legitimate_mode,
-                    sensor_fp_rate=self.sensor_fp_rate,
-                    sensor_fn_rate=self.sensor_fn_rate
+                    sensor_fp_rate=sensor_fp_rate,
+                    sensor_fn_rate=sensor_fn_rate
                 )
 
             # Set additional attributes for patrol behavior

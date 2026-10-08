@@ -3,7 +3,7 @@
 Robot Type Definitions for Multi-Robot Trust Simulation
 
 This module defines different robot types with explicit behavior modes:
-- Legitimate Robots: Optimal vs Realistic nominal detectors
+- Legitimate Robots: noisy (DetectorSensor) nominal detectors, reported unmanipulated
 - Adversarial Robots: Normal, Optimized, and Deceptive modes
 """
 
@@ -17,11 +17,8 @@ from detector_sensor import DetectorSensor
 
 class LegitimateRobot(Robot):
     """
-    Legitimate robot with configurable detection modes.
-
-    Modes:
-    - 'optimal': Perfect detector (no FP/FN) - used for data collection
-    - 'realistic': Natural noisy detector with small FP/FN rates (uses DetectorSensor)
+    Legitimate robot with a noisy detector (DetectorSensor): natural FP/FN detections and
+    measurement noise, reported without manipulation.
     """
 
     def __init__(self,
@@ -30,7 +27,6 @@ class LegitimateRobot(Robot):
                  velocity: np.ndarray,
                  fov_range: float,
                  fov_angle: float,
-                 mode: str = 'optimal',
                  sensor_fp_rate: float = 0.05,
                  sensor_fn_rate: float = 0.05):
         """
@@ -42,24 +38,18 @@ class LegitimateRobot(Robot):
             velocity: Initial velocity [vx, vy, vz]
             fov_range: Field of view range
             fov_angle: Field of view angle (radians)
-            mode: Detection mode ('optimal' or 'realistic')
-            sensor_fp_rate: Sensor false positive rate (only for 'realistic' mode, transient)
-            sensor_fn_rate: Sensor false negative rate (only for 'realistic' mode, transient)
+            sensor_fp_rate: This robot's natural (transient) false positive rate
+            sensor_fn_rate: This robot's natural false negative rate
         """
         super().__init__(robot_id, position, velocity, fov_range=fov_range, fov_angle=fov_angle)
 
         self.is_adversarial = False
-        self.mode = mode
 
-        # For realistic mode: use DetectorSensor class
-        if mode == 'realistic':
-            self.detector_sensor = DetectorSensor(
-                robot_id=robot_id,
-                sensor_fp_rate=sensor_fp_rate,
-                sensor_fn_rate=sensor_fn_rate
-            )
-        else:
-            self.detector_sensor = None  # Perfect detector has no sensor noise
+        self.detector_sensor = DetectorSensor(
+            robot_id=robot_id,
+            sensor_fp_rate=sensor_fp_rate,
+            sensor_fn_rate=sensor_fn_rate
+        )
 
         # Local information state: I_i(t) = (Z_i^nat(t), {(x_j(t), A_j(t), Z_j(t))}_{r_j in N_i(t)})
         self.neighbor_information: Dict[int, Dict] = {}  # neighbor_id -> {position, fov_range, fov_angle, orientation, tracks}
@@ -104,76 +94,20 @@ class LegitimateRobot(Robot):
                           noise_std: float = 0.0,
                           world_size: Tuple[float, float] = (100.0, 100.0)) -> List[Track]:
         """
-        Generate detections based on the robot's mode.
+        Generate this timestep's detections with the robot's noisy DetectorSensor.
+
+        - Populates current_timestep_tracks with detected GT and sensor FP objects
+        - Inherits trust from all_tracks if object was seen before
+        - Sets reported_tracks = current_timestep_tracks (no manipulation)
 
         Args:
             ground_truth_objects: List of ground truth objects in the environment
             time: Current simulation time
-            noise_std: Standard deviation for position noise (only for realistic mode)
+            noise_std: Standard deviation for position noise
             world_size: Size of the simulation world (for FP generation)
 
         Returns:
             List of Track objects representing detections
-        """
-        if self.mode == 'optimal':
-            return self._generate_optimal_detections(ground_truth_objects, time)
-        elif self.mode == 'realistic':
-            return self._generate_realistic_detections(ground_truth_objects, time, noise_std, world_size)
-        else:
-            raise ValueError(f"Unknown legitimate robot mode: {self.mode}")
-
-    def _generate_optimal_detections(self,
-                                    ground_truth_objects: List,
-                                    time: float) -> List[Track]:
-        """
-        Optimal nominal detector: Perfect detections with no FP/FN.
-
-        NEW ARCHITECTURE:
-        - Populates current_timestep_tracks with raw sensor detections
-        - Inherits trust from all_tracks if object was seen before
-        - Sets reported_tracks = current_timestep_tracks (no manipulation)
-        """
-        # Clear timestep-specific tracks
-        self.clear_timestep_specific_tracks()
-
-        detections = []
-
-        for gt_obj in ground_truth_objects:
-            if self.is_in_fov(gt_obj.position):
-                object_id = f"gt_obj_{gt_obj.id}"
-
-                # Perfect detection - no noise
-                noisy_pos = gt_obj.position.copy()
-                noisy_vel = gt_obj.velocity.copy()
-
-                # Add to current_timestep_tracks (automatically inherits trust from all_tracks)
-                track = self.add_sensor_detection(
-                    object_id=object_id,
-                    position=noisy_pos,
-                    velocity=noisy_vel,
-                    timestamp=time
-                )
-
-                detections.append(track)
-
-        # Legitimate robot: reported_tracks = current_timestep_tracks
-        self.set_reported_tracks_from_current()
-
-        return detections
-
-    def _generate_realistic_detections(self,
-                                      ground_truth_objects: List,
-                                      time: float,
-                                      noise_std: float,
-                                      world_size: Tuple[float, float]) -> List[Track]:
-        """
-        Realistic nominal detector: Natural noisy detector with small FP/FN rates.
-
-        NEW ARCHITECTURE:
-        - Uses DetectorSensor to model realistic sensor behavior
-        - Populates current_timestep_tracks with detected GT and sensor FP objects
-        - Inherits trust from all_tracks if object was seen before
-        - Sets reported_tracks = current_timestep_tracks (no manipulation)
         """
         # Clear timestep-specific tracks
         self.clear_timestep_specific_tracks()

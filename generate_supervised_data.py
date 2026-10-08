@@ -64,13 +64,12 @@ class SupervisedDataGenerator:
                  world_size: Tuple[float, float] = (100.0, 100.0),
                  adversarial_fp_injection_rate: Union[float, Tuple[float, float]] = 0.5,
                  adversarial_fn_suppression_rate: Union[float, Tuple[float, float]] = 0.0,
-                 sensor_fp_rate: float = 0.05,
-                 sensor_fn_rate: float = 0.05,
+                 sensor_fp_rate: Union[float, Tuple[float, float]] = (0.01, 0.05),
+                 sensor_fn_rate: Union[float, Tuple[float, float]] = (0.01, 0.05),
                  proximal_range: float = 80.0,
                  fov_range: float = 50.0,
                  fov_angle: float = np.pi/3,
                  max_steps_per_episode: int = 100,
-                 legitimate_mode: str = 'optimal',
                  adversarial_mode: str = 'normal',
                  optimized_mode_probability: float = 0.5):
         """
@@ -83,8 +82,10 @@ class SupervisedDataGenerator:
             world_size: Size of simulation world (tuple) or range ((min_x, min_y), (max_x, max_y))
             adversarial_fp_injection_rate: Rate of persistent adversarial FP injection (float) or range (min, max)
             adversarial_fn_suppression_rate: Rate of adversarial FN suppression (float) or range (min, max)
-            sensor_fp_rate: Transient sensor FP rate (fixed)
-            sensor_fn_rate: Transient sensor FN rate (fixed)
+            sensor_fp_rate: Natural sensor FP rate range (min, max) (or fixed float); every robot
+                (legitimate and adversarial) draws its own rate uniformly from it
+            sensor_fn_rate: Natural sensor FN rate range (min, max) (or fixed float), drawn per
+                robot the same way (independently of its FP rate)
             proximal_range: Proximal sensing range (fixed value)
             fov_range: Field of view range (kept constant)
             fov_angle: Field of view angle (kept constant)
@@ -113,14 +114,15 @@ class SupervisedDataGenerator:
         self.adversarial_fn_suppression_rate_range = (adversarial_fn_suppression_rate
                                                       if isinstance(adversarial_fn_suppression_rate, tuple)
                                                       else (adversarial_fn_suppression_rate, adversarial_fn_suppression_rate))
-        self.sensor_fp_rate = sensor_fp_rate  # Fixed value
-        self.sensor_fn_rate = sensor_fn_rate  # Fixed value
+        self.sensor_fp_rate_range = (tuple(sensor_fp_rate) if isinstance(sensor_fp_rate, (tuple, list))
+                                     else (sensor_fp_rate, sensor_fp_rate))
+        self.sensor_fn_rate_range = (tuple(sensor_fn_rate) if isinstance(sensor_fn_rate, (tuple, list))
+                                     else (sensor_fn_rate, sensor_fn_rate))
         self.proximal_range = proximal_range  # Fixed value, no range
         self.fov_range = fov_range
         self.fov_angle = fov_angle
 
-        # Robot modes (FIXED for training data consistency)
-        self.legitimate_mode = legitimate_mode  # Should be 'optimal'
+        # Robot modes (legitimate robots always use a noisy DetectorSensor)
         self.adversarial_mode = adversarial_mode  # Base mode (e.g. 'normal')
         self.optimized_mode_probability = optimized_mode_probability  # Per-episode chance of 'optimized' instead
 
@@ -211,8 +213,8 @@ class SupervisedDataGenerator:
             'adversarial_ratio': adversarial_ratio,
             'adversarial_fp_injection_rate': adversarial_fp_injection_rate,
             'adversarial_fn_suppression_rate': adversarial_fn_suppression_rate,
-            'sensor_fp_rate': self.sensor_fp_rate,
-            'sensor_fn_rate': self.sensor_fn_rate,
+            'sensor_fp_rate_range': self.sensor_fp_rate_range,
+            'sensor_fn_rate_range': self.sensor_fn_rate_range,
             'world_size': self.world_size,
             'proximal_range': self.proximal_range,  # Fixed value
             'adversarial_mode': episode_adversarial_mode
@@ -232,15 +234,18 @@ class SupervisedDataGenerator:
             adversarial_ratio=params['adversarial_ratio'],
             adversarial_fp_injection_rate=params['adversarial_fp_injection_rate'],
             adversarial_fn_suppression_rate=params['adversarial_fn_suppression_rate'],
-            sensor_fp_rate=params['sensor_fp_rate'],
-            sensor_fn_rate=params['sensor_fn_rate'],
+            sensor_fp_rate_range=params['sensor_fp_rate_range'],
+            sensor_fn_rate_range=params['sensor_fn_rate_range'],
             proximal_range=params['proximal_range'],
             fov_range=self.fov_range,
             fov_angle=self.fov_angle,
             allow_fp_codetection=True,
-            legitimate_mode=self.legitimate_mode,  # 'optimal' for training
             adversarial_mode=params['adversarial_mode']  # sampled per-episode
         )
+
+        # Record the natural sensor noise each robot drew for this episode
+        params['robot_sensor_fp_rates'] = [r.detector_sensor.sensor_fp_rate for r in self.sim_env.robots]
+        params['robot_sensor_fn_rates'] = [r.detector_sensor.sensor_fn_rate for r in self.sim_env.robots]
 
         # Update ego graph builder with fixed proximal range
         self.ego_graph_builder = EgoGraphBuilder(proximal_range=params['proximal_range'])
@@ -748,16 +753,16 @@ class SupervisedDataGenerator:
         log_print(f"   - Adversarial ratio: {self.adversarial_ratio_range}")
         log_print(f"   - Adversarial FP injection rate: {self.adversarial_fp_injection_rate_range}")
         log_print(f"   - Adversarial FN suppression rate: {self.adversarial_fn_suppression_rate_range}")
-        log_print(f"   - Sensor FP rate (fixed): {self.sensor_fp_rate}")
-        log_print(f"   - Sensor FN rate (fixed): {self.sensor_fn_rate}")
+        log_print(f"   - Sensor FP rate range (per robot): {self.sensor_fp_rate_range}")
+        log_print(f"   - Sensor FN rate range (per robot): {self.sensor_fn_rate_range}")
         log_print(f"   - World size (square): {self.world_size[0]} x {self.world_size[1]}")
         log_print(f"   - Proximal range (fixed): {self.proximal_range}")
         if self.optimized_mode_probability > 0:
-            log_print(f"   - Robot modes: Legitimate={self.legitimate_mode}, "
+            log_print(f"   - Robot modes: Legitimate=noisy sensor, "
                       f"Adversarial={self.adversarial_mode} ({(1-self.optimized_mode_probability)*100:.0f}%) / "
                       f"optimized ({self.optimized_mode_probability*100:.0f}%)")
         else:
-            log_print(f"   - Robot modes: Legitimate={self.legitimate_mode}, Adversarial={self.adversarial_mode}")
+            log_print(f"   - Robot modes: Legitimate=noisy sensor, Adversarial={self.adversarial_mode}")
         log_print(f"⏱️  Max steps per episode: {self.max_steps_per_episode}")
         log_print(f"📊 Sampling strategy:")
         log_print(f"   - Step interval: every {step_interval} steps")
@@ -923,15 +928,15 @@ class SupervisedDataGenerator:
                     'max': max(p['adversarial_fn_suppression_rate'] for p in all_episode_params),
                     'avg': np.mean([p['adversarial_fn_suppression_rate'] for p in all_episode_params])
                 },
-                'sensor_fp_rate': {
-                    'min': min(p['sensor_fp_rate'] for p in all_episode_params),
-                    'max': max(p['sensor_fp_rate'] for p in all_episode_params),
-                    'avg': np.mean([p['sensor_fp_rate'] for p in all_episode_params])
+                'robot_sensor_fp_rate': {
+                    'min': min(r for p in all_episode_params for r in p['robot_sensor_fp_rates']),
+                    'max': max(r for p in all_episode_params for r in p['robot_sensor_fp_rates']),
+                    'avg': np.mean([r for p in all_episode_params for r in p['robot_sensor_fp_rates']])
                 },
-                'sensor_fn_rate': {
-                    'min': min(p['sensor_fn_rate'] for p in all_episode_params),
-                    'max': max(p['sensor_fn_rate'] for p in all_episode_params),
-                    'avg': np.mean([p['sensor_fn_rate'] for p in all_episode_params])
+                'robot_sensor_fn_rate': {
+                    'min': min(r for p in all_episode_params for r in p['robot_sensor_fn_rates']),
+                    'max': max(r for p in all_episode_params for r in p['robot_sensor_fn_rates']),
+                    'avg': np.mean([r for p in all_episode_params for r in p['robot_sensor_fn_rates']])
                 },
                 'world_size': {
                     'min': min(p['world_size'][0] for p in all_episode_params),  # Use x dimension (same as y for square)
@@ -972,11 +977,10 @@ class SupervisedDataGenerator:
                 'adversarial_ratio': self.adversarial_ratio_range,
                 'adversarial_fp_injection_rate': self.adversarial_fp_injection_rate_range,
                 'adversarial_fn_suppression_rate': self.adversarial_fn_suppression_rate_range,
-                'sensor_fp_rate': self.sensor_fp_rate,  # Fixed value
-                'sensor_fn_rate': self.sensor_fn_rate,  # Fixed value
+                'sensor_fp_rate': self.sensor_fp_rate_range,  # Per-robot sampling range
+                'sensor_fn_rate': self.sensor_fn_rate_range,  # Per-robot sampling range
                 'world_size': self.world_size,
                 'proximal_range': self.proximal_range,  # Fixed value
-                'legitimate_mode': self.legitimate_mode,  # Fixed value
                 'adversarial_mode': self.adversarial_mode,  # Base mode
                 'optimized_mode_probability': self.optimized_mode_probability  # Per-episode chance of 'optimized'
             },
@@ -1036,10 +1040,12 @@ def main():
                        help='Adversarial FP injection rate: single value or range "min,max" (default: 0.1,0.3)')
     parser.add_argument('--adversarial-fn-suppression-rate', type=str, default='0.0,0.3',
                        help='Adversarial FN suppression rate: single value or range "min,max" (default: 0.0,0.3)')
-    parser.add_argument('--sensor-fp-rate', type=float, default=0.05,
-                       help='Sensor FP rate (fixed, default: 0.05)')
-    parser.add_argument('--sensor-fn-rate', type=float, default=0.05,
-                       help='Sensor FN rate (fixed, default: 0.05)')
+    parser.add_argument('--sensor-fp-rate-range', type=str, default='0.01,0.05',
+                       help='Per-robot natural sensor FP rate range "min,max" - every robot draws its '
+                            'own rate uniformly from it (single value = fixed; default: 0.01,0.05)')
+    parser.add_argument('--sensor-fn-rate-range', type=str, default='0.01,0.05',
+                       help='Per-robot natural sensor FN rate range "min,max", drawn per robot '
+                            'independently of its FP rate (single value = fixed; default: 0.01,0.05)')
     parser.add_argument('--world-size', type=float, default=100.0,
                        help='Side length of the square world (fixed, default: 100.0)')
     parser.add_argument('--proximal-range', type=float, default=80.0,
@@ -1062,6 +1068,8 @@ def main():
     adversarial_ratio_range = parse_range(args.adversarial_ratio)
     adversarial_fp_injection_rate_range = parse_range(args.adversarial_fp_injection_rate)
     adversarial_fn_suppression_rate_range = parse_range(args.adversarial_fn_suppression_rate)
+    sensor_fp_rate_range = parse_range(args.sensor_fp_rate_range)
+    sensor_fn_rate_range = parse_range(args.sensor_fn_rate_range)
     world_size_value = float(args.world_size)
     world_size = (world_size_value, world_size_value)
 
@@ -1074,15 +1082,15 @@ def main():
     print(f"   - Adversarial ratio: {adversarial_ratio_range}")
     print(f"   - Adversarial FP injection rate: {adversarial_fp_injection_rate_range}")
     print(f"   - Adversarial FN suppression rate: {adversarial_fn_suppression_rate_range}")
-    print(f"   - Sensor FP rate (fixed): {args.sensor_fp_rate}")
-    print(f"   - Sensor FN rate (fixed): {args.sensor_fn_rate}")
+    print(f"   - Sensor FP rate range (per robot): {sensor_fp_rate_range}")
+    print(f"   - Sensor FN rate range (per robot): {sensor_fn_rate_range}")
     print(f"   - World size (square): {world_size_value} x {world_size_value}")
     print(f"   - Proximal range (fixed): {args.proximal_range}")
     if args.optimized_mode_probability > 0:
-        print(f"   - Robot modes: Legitimate=optimal, Adversarial=normal "
+        print(f"   - Robot modes: Legitimate=noisy sensor, Adversarial=normal "
               f"({(1-args.optimized_mode_probability)*100:.0f}%) / optimized ({args.optimized_mode_probability*100:.0f}%)")
     else:
-        print(f"   - Robot modes: Legitimate=optimal, Adversarial=normal")
+        print(f"   - Robot modes: Legitimate=noisy sensor, Adversarial=normal")
 
     # Create data generator
     generator = SupervisedDataGenerator(
@@ -1092,11 +1100,10 @@ def main():
         world_size=world_size,
         adversarial_fp_injection_rate=adversarial_fp_injection_rate_range,
         adversarial_fn_suppression_rate=adversarial_fn_suppression_rate_range,
-        sensor_fp_rate=args.sensor_fp_rate,
-        sensor_fn_rate=args.sensor_fn_rate,
+        sensor_fp_rate=sensor_fp_rate_range,
+        sensor_fn_rate=sensor_fn_rate_range,
         proximal_range=args.proximal_range,
         max_steps_per_episode=args.steps,
-        legitimate_mode='optimal',  # Fixed for training data consistency
         adversarial_mode='normal',  # Base mode for training data consistency
         optimized_mode_probability=args.optimized_mode_probability
     )

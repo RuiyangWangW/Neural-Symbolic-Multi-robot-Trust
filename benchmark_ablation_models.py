@@ -44,7 +44,6 @@ from optimized_policy_benchmark import (
     FOV_RANGE,
     FOV_ANGLE,
     PROXIMAL_RANGE,
-    LEGITIMATE_MODE,
     ADVERSARIAL_MODE,
 )
 
@@ -139,14 +138,13 @@ def run_scenario(scenario: Dict, variants: List[str], models_dir: Path,
         fov_angle=FOV_ANGLE,
         proximal_range=PROXIMAL_RANGE,
         allow_fp_codetection=True,
-        legitimate_mode=scenario.get("legitimate_mode", LEGITIMATE_MODE),
         adversarial_mode=scenario.get("adversarial_mode", ADVERSARIAL_MODE),
     )
     comparison.adversarial_ratio = scenario["adversarial_ratio"]
     comparison.adversarial_fp_injection_rate = scenario["adversarial_fp_injection_rate"]
     comparison.adversarial_fn_suppression_rate = scenario["adversarial_fn_suppression_rate"]
-    comparison.sensor_fp_rate = scenario["sensor_fp_rate"]
-    comparison.sensor_fn_rate = scenario["sensor_fn_rate"]
+    comparison.sensor_fp_rate_range = tuple(scenario["sensor_fp_rate_range"])
+    comparison.sensor_fn_rate_range = tuple(scenario["sensor_fn_rate_range"])
     comparison.delta_plus = scenario["delta_plus"]
     comparison.delta_minus = scenario["delta_minus"]
 

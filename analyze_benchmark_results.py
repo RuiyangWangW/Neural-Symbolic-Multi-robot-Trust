@@ -69,9 +69,9 @@ def extract_metrics_dataframe(results: Dict, method: str = "supervised") -> pd.D
             "adversarial_ratio": params["adversarial_ratio"],
             "adversarial_fp_injection_rate": params.get("adversarial_fp_injection_rate", params.get("false_positive_rate", 0.0)),
             "adversarial_fn_suppression_rate": params.get("adversarial_fn_suppression_rate", params.get("false_negative_rate", 0.0)),
-            "sensor_fp_rate": params.get("sensor_fp_rate", 0.05),
-            "sensor_fn_rate": params.get("sensor_fn_rate", 0.05),
-            "legitimate_mode": params.get("legitimate_mode", "optimal"),
+            # Per-robot sensor noise range (older result files stored one fixed rate)
+            "sensor_fp_rate": str(params.get("sensor_fp_rate_range", params.get("sensor_fp_rate", 0.05))),
+            "sensor_fn_rate": str(params.get("sensor_fn_rate_range", params.get("sensor_fn_rate", 0.05))),
             "adversarial_mode": params.get("adversarial_mode", "normal"),
             "random_seed": params["random_seed"],
 

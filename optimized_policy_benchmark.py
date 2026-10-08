@@ -26,7 +26,7 @@ training distribution and "conservative"/"moderate" are out-of-distribution in t
 - higher_adv_ratio_aggressive: higher adversarial ratio (0.4-0.5), delta_plus=delta_minus=3.0
 
 Robot modes:
-- Legitimate: realistic (natural sensor noise)
+- Legitimate: noisy sensor (per-robot natural FP/FN rates)
 - Adversarial: optimized (MILP-based per-object report/ignore policy)
 """
 
@@ -60,8 +60,8 @@ class BenchmarkConfig:
     adversarial_fp_injection_rate_range: Tuple[float, float]
     delta_plus: float  # MILP FP-gain coefficient (see module docstring)
     delta_minus: float  # MILP GT-suppression coefficient (see module docstring)
-    sensor_fp_rate: float = 0.05  # Sensor FP rate (transient)
-    sensor_fn_rate: float = 0.05  # Sensor FN rate (transient)
+    sensor_fp_rate_range: Tuple[float, float] = (0.01, 0.05)  # Per-robot natural sensor FP rate range
+    sensor_fn_rate_range: Tuple[float, float] = (0.01, 0.05)  # Per-robot natural sensor FN rate range
     description: str = ""
 
 
@@ -76,8 +76,8 @@ BENCHMARK_CONFIGS = {
         adversarial_fp_injection_rate_range=(0.1, 0.3),
         delta_plus=1.0,
         delta_minus=1.0,
-        sensor_fp_rate=0.05,
-        sensor_fn_rate=0.05,
+        sensor_fp_rate_range=(0.01, 0.05),
+        sensor_fn_rate_range=(0.01, 0.05),
         description="In-sample parameter ranges, delta_plus=delta_minus=1.0 - Optimized policy"
     ),
     "moderate": BenchmarkConfig(
@@ -88,8 +88,8 @@ BENCHMARK_CONFIGS = {
         adversarial_fp_injection_rate_range=(0.1, 0.3),
         delta_plus=2.0,
         delta_minus=2.0,
-        sensor_fp_rate=0.05,
-        sensor_fn_rate=0.05,
+        sensor_fp_rate_range=(0.01, 0.05),
+        sensor_fn_rate_range=(0.01, 0.05),
         description="In-sample parameter ranges, delta_plus=delta_minus=2.0 - Optimized policy"
     ),
     "aggressive": BenchmarkConfig(
@@ -100,8 +100,8 @@ BENCHMARK_CONFIGS = {
         adversarial_fp_injection_rate_range=(0.1, 0.3),
         delta_plus=3.0,
         delta_minus=3.0,
-        sensor_fp_rate=0.05,
-        sensor_fn_rate=0.05,
+        sensor_fp_rate_range=(0.01, 0.05),
+        sensor_fn_rate_range=(0.01, 0.05),
         description="In-sample parameter ranges, delta_plus=delta_minus=3.0 (matches training) - Optimized policy"
     ),
     "higher_adv_ratio_aggressive": BenchmarkConfig(
@@ -112,8 +112,8 @@ BENCHMARK_CONFIGS = {
         adversarial_fp_injection_rate_range=(0.1, 0.3),
         delta_plus=3.0,
         delta_minus=3.0,
-        sensor_fp_rate=0.05,
-        sensor_fn_rate=0.05,
+        sensor_fp_rate_range=(0.01, 0.05),
+        sensor_fn_rate_range=(0.01, 0.05),
         description="Higher adversarial ratio (0.4-0.5), delta_plus=delta_minus=3.0 - Optimized policy"
     ),
 }
@@ -127,7 +127,6 @@ FOV_RANGE = 50.0
 FOV_ANGLE = np.pi / 3
 
 # Robot modes
-LEGITIMATE_MODE = 'realistic'  # Natural sensor noise
 ADVERSARIAL_MODE = 'optimized'  # Policy-based strategic attacks
 
 METHOD_ORDER = ["baseline", "bayesian", "paper", "supervised"]
@@ -198,10 +197,9 @@ def sample_scenario_parameters(
         "adversarial_fn_suppression_rate": 0.0,  # Not used in optimized mode (policy-based instead)
         "delta_plus": config.delta_plus,
         "delta_minus": config.delta_minus,
-        "sensor_fp_rate": config.sensor_fp_rate,
-        "sensor_fn_rate": config.sensor_fn_rate,
+        "sensor_fp_rate_range": list(config.sensor_fp_rate_range),
+        "sensor_fn_rate_range": list(config.sensor_fn_rate_range),
         "random_seed": simulation_seed,
-        "legitimate_mode": LEGITIMATE_MODE,
         "adversarial_mode": ADVERSARIAL_MODE,
     }
 
@@ -234,14 +232,13 @@ def run_scenario(
         fov_angle=FOV_ANGLE,
         proximal_range=PROXIMAL_RANGE,
         allow_fp_codetection=True,  # Allow adversarial robots to co-detect FPs
-        legitimate_mode=scenario.get("legitimate_mode", LEGITIMATE_MODE),
         adversarial_mode=scenario.get("adversarial_mode", ADVERSARIAL_MODE),
     )
     comparison.adversarial_ratio = scenario["adversarial_ratio"]
     comparison.adversarial_fp_injection_rate = scenario["adversarial_fp_injection_rate"]
     comparison.adversarial_fn_suppression_rate = scenario["adversarial_fn_suppression_rate"]
-    comparison.sensor_fp_rate = scenario["sensor_fp_rate"]
-    comparison.sensor_fn_rate = scenario["sensor_fn_rate"]
+    comparison.sensor_fp_rate_range = tuple(scenario["sensor_fp_rate_range"])
+    comparison.sensor_fn_rate_range = tuple(scenario["sensor_fn_rate_range"])
     comparison.delta_plus = scenario["delta_plus"]
     comparison.delta_minus = scenario["delta_minus"]
 
@@ -275,12 +272,12 @@ def run_benchmark(
     print(f"Running {config.name.upper()} Benchmark (Optimized Policy)")
     print(f"{'=' * 80}")
     print(f"Description: {config.description}")
-    print(f"Robot modes: Legitimate={LEGITIMATE_MODE}, Adversarial={ADVERSARIAL_MODE}")
+    print(f"Robot modes: Legitimate=noisy sensor, Adversarial={ADVERSARIAL_MODE}")
     print(f"Parameter ranges:")
     print(f"  Robot density: {config.robot_density_range}")
     print(f"  Adversarial ratio: {config.adversarial_ratio_range}")
     print(f"  Adversarial FP injection rate: {config.adversarial_fp_injection_rate_range} (persistent)")
-    print(f"  Sensor FP/FN rates: {config.sensor_fp_rate}/{config.sensor_fn_rate} (transient)")
+    print(f"  Sensor FP/FN rate ranges (per robot): {config.sensor_fp_rate_range}/{config.sensor_fn_rate_range}")
     print(f"  delta_plus/delta_minus: {config.delta_plus}/{config.delta_minus}")
     print(f"Running {num_scenarios} scenarios...")
     print(f"{'=' * 80}\n")
@@ -347,7 +344,7 @@ def save_results(
             "num_scenarios": len(results),
             "base_seed": base_seed,
             "robot_modes": {
-                "legitimate": LEGITIMATE_MODE,
+                "legitimate": "noisy_sensor",
                 "adversarial": ADVERSARIAL_MODE
             },
             "adversarial_lie": adversarial_lie,
@@ -355,8 +352,8 @@ def save_results(
                 "robot_density": config.robot_density_range,
                 "adversarial_ratio": config.adversarial_ratio_range,
                 "adversarial_fp_injection_rate": config.adversarial_fp_injection_rate_range,
-                "sensor_fp_rate": config.sensor_fp_rate,
-                "sensor_fn_rate": config.sensor_fn_rate,
+                "sensor_fp_rate_range": config.sensor_fp_rate_range,
+                "sensor_fn_rate_range": config.sensor_fn_rate_range,
                 "delta_plus": config.delta_plus,
                 "delta_minus": config.delta_minus,
             },
@@ -478,7 +475,7 @@ def main():
     print(f"{'=' * 80}")
     print(f"Base seed: {base_seed} (use --seed {base_seed} to reproduce)")
     print(f"Robot modes:")
-    print(f"  Legitimate: {LEGITIMATE_MODE} (natural sensor noise)")
+    print(f"  Legitimate: noisy sensor (per-robot natural FP/FN rates)")
     print(f"  Adversarial: {ADVERSARIAL_MODE} (policy-based strategic attacks)")
     if args.adversarial_lie:
         print(f"  Adversarial lies: ENABLED (track trust manipulation)")
