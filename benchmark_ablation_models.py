@@ -213,8 +213,8 @@ def main():
     # scenarios/seed/threshold -> identical numbers).
     parser.add_argument('--num-scenarios', type=int, default=100,
                         help='Number of aggressive scenarios to run (default: 100)')
-    parser.add_argument('--threshold', type=float, default=0.3,
-                        help='Trust threshold for binary classification (default: 0.3, '
+    parser.add_argument('--threshold', type=float, default=0.5,
+                        help='Trust threshold for binary classification (default: 0.5, '
                              'consistent across all benchmarks)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Base random seed for reproducibility (default: random). Pass the '
