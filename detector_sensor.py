@@ -49,6 +49,8 @@ class DetectorSensor:
         # Track transient sensor FP objects (appear and disappear randomly)
         self.natural_fp_objects: List[Dict] = []
         self.next_natural_fp_id = 0
+        self.fp_lifetime_steps = 10  # natural FPs disappear after this many timesteps
+        self.step_count = 0  # timesteps seen (one _update_natural_fp_objects call per step)
 
     def generate_detections(self,
                            robot_position: np.ndarray,
@@ -144,11 +146,12 @@ class DetectorSensor:
             robot_fov_angle: Robot's field of view angle
             world_size: Size of the simulation world
         """
-        # Remove old FP objects (they disappear after some time - transient)
-        fp_lifetime = 10.0  # seconds
+        # Remove old FP objects (they disappear after fp_lifetime_steps timesteps -
+        # counted in steps, not simulation time, so the lifetime is the same whatever dt is)
+        self.step_count += 1
         self.natural_fp_objects = [
             fp for fp in self.natural_fp_objects
-            if time - fp['spawn_time'] < fp_lifetime
+            if self.step_count - fp['spawn_step'] < self.fp_lifetime_steps
         ]
 
         # Potentially create new natural FP objects: at most one per timestep, with
@@ -176,7 +179,8 @@ class DetectorSensor:
                 'id': self.next_natural_fp_id,
                 'position': fp_position,
                 'velocity': fp_velocity,
-                'spawn_time': time
+                'spawn_time': time,
+                'spawn_step': self.step_count
             }
 
             self.natural_fp_objects.append(fp_obj)
@@ -209,3 +213,4 @@ class DetectorSensor:
         """Reset the sensor state (clear all transient FP objects)."""
         self.natural_fp_objects.clear()
         self.next_natural_fp_id = 0
+        self.step_count = 0
